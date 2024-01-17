@@ -316,7 +316,7 @@ class Decoder(eqx.Module):
             encoder_output: Float[Array, "frame_seq_len attention_size"],
             enable_dropout: bool = False,
             key: Optional[jax.random.PRNGKey] = None
-    ) -> Float[Array, "midi_voccab_size"]: # Probability distribution over the midi events
+    ) -> (Float[Array, "midi_voccab_size"], Float[Array, "midi_voccab_size"]): # Probability distribution over the midi events
         transformer_key, decoder_key = jax.random.split(key, 2)
 
         for layer in self.decoder_layers:
@@ -331,10 +331,10 @@ class Decoder(eqx.Module):
 
         # We take the first token in the last decoder layer to mean the next output token to produce
         first_token_last_layer = decoder_output[..., 0, :]
-        pooled = self.decoder_pooling(first_token_last_layer, key=decoder_key)
-        pooled = jax.nn.softmax(pooled)
+        logits = self.decoder_pooling(first_token_last_layer, key=decoder_key)
+        probabilities = jax.nn.softmax(logits)
 
-        return pooled
+        return logits, probabilities
 
 class OutputSequenceGenerator(eqx.Module):
     """
@@ -380,8 +380,8 @@ class OutputSequenceGenerator(eqx.Module):
             self,
             input_frames: Float[Array, "frame_seq_len frame_size"],
             generated_output: Integer[Array, "midi_seq_len"], # Index of midi event in the vocabulary
-            enable_dropout: bool = False,
             key: Optional[jax.random.PRNGKey] = None,
+            enable_dropout: bool = False,
     ) -> Float[Array, "midi_voccab_size"]: # Probability distribution over the midi events:
         encoder_key, decoder_key = jax.random.split(key, num=2)
 
@@ -393,11 +393,11 @@ class OutputSequenceGenerator(eqx.Module):
 
         midi_embeddings_so_far = jax.vmap(self.midi_embedding)(generated_output)
 
-        next_token_prob = self.decoder(
+        logits, next_token_prob = self.decoder(
             decoder_output=midi_embeddings_so_far, # generate midi embeddings
             encoder_output=encoder_output,
             enable_dropout=enable_dropout,
             key=decoder_key,
         )
 
-        return next_token_prob
+        return logits, next_token_prob
