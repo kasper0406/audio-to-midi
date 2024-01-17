@@ -36,21 +36,35 @@ class MidiVocabulary(eqx.Module):
                 # Velocity: Float
         
         Enumarate in the following way:
-          0: EOS
+          0: SEQUENCE_START
+          1: SEQUENCE_END
           1: (ATTACK, 0)
           2: (RELEASE, 0)
           3: (ATTACK, 1)
           4: (RELEASE, 1)
           ...
         
-        For a total voccab size of 1 + 2 * 88 = 177
+        For a total voccab size of 2 + 2 * 88 = 178
     """
 
     @classmethod
-    def voccab_size():
-        return 177
+    def voccab_size(cls):
+        return 178
 
-    # TODO: Implement this
+    embedding: eqx.nn.Embedding
+
+    def __init__(
+            self,
+            output_size: int,
+            key: Optional[jax.random.PRNGKey] = None,
+    ):
+        self.embedding = eqx.nn.Embedding(
+            num_embeddings=self.voccab_size(),
+            embedding_size=output_size,
+            key=key)
+
+    def __call__(self, idx: int):
+        return self.embedding(jnp.array(idx, dtype=jnp.int8))
 
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
@@ -110,7 +124,7 @@ class AttentionBlock(eqx.Module):
     attention: eqx.nn.MultiheadAttention
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
-    num_heads: int = eqx.field(static=True)
+    # num_heads: int = eqx.field(static=True)
 
     def __init__(
             self,
@@ -135,8 +149,8 @@ class AttentionBlock(eqx.Module):
     def __call__(
             self,
             inputs: Float[Array, "seq_len attention_size"],
-            mask: Optional[Integer[Array, "seq_len"]], # The mask on the attention inputs to not leak future information
             encoder_output: Optional[Float[Array, "seq_len attention_size"]],
+            mask: Optional[Integer[Array, "seq_len"]] = None, # The mask on the attention inputs to not leak future information
             enable_dropout: bool = False,
             key: Optional[jax.random.PRNGKey] = None
     ) -> Float[Array, "seq_len attention_size"]:
@@ -188,10 +202,10 @@ class TransformerLayer(eqx.Module):
     def __call__(
             self,
             inputs: Float[Array, "seq_len attention_size"],
-            mask: Optional[Integer[Array, "seq_len"]],
             encoder_output: Optional[Float[Array, "seq_len attention_size"]],
+            mask: Optional[Integer[Array, "seq_len"]] = None,
             enable_dropout: bool = False,
-            key=Optional[jax.random.PRNGKey] = None,
+            key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
         attention_key, feed_forward_key = jax.random.split(key)
         
@@ -243,7 +257,7 @@ class Encoder(eqx.Module):
             enable_dropout: bool = False,
             key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        transformer_key = jax.random.split(key)
+        transformer_key, = jax.random.split(key, num=1)
 
         embeddings = jax.vmap(self.frame_embedding)(input_frames)
 
@@ -276,7 +290,7 @@ class Decoder(eqx.Module):
             num_heads: int,
             dropout_rate: float,
             key: Optional[jax.random.PRNGKey] = None):
-        transformer_key, pooling_key = self.jax.split(key, num=2)
+        transformer_key, pooling_key = jax.random.split(key, num=2)
 
         self.decoder_layers = []
         layer_keys = jax.random.split(transformer_key, num_layers)
@@ -289,7 +303,10 @@ class Decoder(eqx.Module):
                 key=layer_key
             ))
 
-        self.decoder_pooling = eqx.nn.Linear(attention_size, MidiVocabulary.voccab_size(), key=pooling_key)
+        self.decoder_pooling = eqx.nn.Linear(
+            in_features=attention_size,
+            out_features=MidiVocabulary.voccab_size(),
+            key=pooling_key)
 
     # TODO: Distinguish between the two input/output sequence lengths
     # TODO: Consider a different attention_size for midi and frame embeddings
@@ -312,8 +329,10 @@ class Decoder(eqx.Module):
                 key=layer_key,
                 )
 
-        pooled = self.decoder_pooling(decoder_output, key=decoder_key)
-        pooled = jnp.softmax(pooled)
+        # We take the first token in the last decoder layer to mean the next output token to produce
+        first_token_last_layer = decoder_output[..., 0, :]
+        pooled = self.decoder_pooling(first_token_last_layer, key=decoder_key)
+        pooled = jax.nn.softmax(pooled)
 
         return pooled
 
@@ -327,12 +346,14 @@ class OutputSequenceGenerator(eqx.Module):
     encoder: Encoder
     decoder: Decoder
 
+    midi_embedding: MidiVocabulary
+
     def __init__(
             self,
             conf: Dict[str, any],
             key: Optional[jax.random.PRNGKey] = None,
     ):
-        encoder_key, decoder_key = jax.random.split(key, 2)
+        encoder_key, decoder_key, midi_embedding_key = jax.random.split(key, 3)
 
         self.encoder = Encoder(
             frame_size=conf["frame_size"],
@@ -353,11 +374,15 @@ class OutputSequenceGenerator(eqx.Module):
             key=decoder_key
         )
 
+        self.midi_embedding = MidiVocabulary(conf["attention_size"], midi_embedding_key)
+
     def __call__(
             self,
             input_frames: Float[Array, "frame_seq_len frame_size"],
             generated_output: Integer[Array, "midi_seq_len"], # Index of midi event in the vocabulary
-    ):
+            enable_dropout: bool = False,
+            key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "midi_voccab_size"]: # Probability distribution over the midi events:
         encoder_key, decoder_key = jax.random.split(key, num=2)
 
         encoder_output = self.encoder(
@@ -366,8 +391,10 @@ class OutputSequenceGenerator(eqx.Module):
             key=encoder_key
         )
 
+        midi_embeddings_so_far = jax.vmap(self.midi_embedding)(generated_output)
+
         next_token_prob = self.decoder(
-            decoder_output=TODO, # generate midi embeddings
+            decoder_output=midi_embeddings_so_far, # generate midi embeddings
             encoder_output=encoder_output,
             enable_dropout=enable_dropout,
             key=decoder_key,
