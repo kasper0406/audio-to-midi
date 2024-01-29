@@ -4,6 +4,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
+import orbax.checkpoint as ocp
 import torch
 from jaxtyping import Array, Float, PRNGKeyArray
 
@@ -53,12 +54,18 @@ def train(
     tx,
     data_loader,
     state: optax.OptState,
+    checkpoint_manager: ocp.CheckpointManager,
     key: jax.random.PRNGKey,
     num_steps: int = 10000,
     print_every: int = 1000,
 ):
     losses = []
-    for step, batch in zip(range(num_steps), data_loader):
+    start_step = (
+        checkpoint_manager.latest_step() + 1
+        if checkpoint_manager.latest_step() is not None
+        else 0
+    )
+    for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         loss, model, state, key = compute_training_step(
             model,
             batch["position_encoding"],
@@ -68,9 +75,13 @@ def train(
             tx,
         )
 
+        checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
+
         losses.append(loss)
         if step % print_every == 0:
-            print(f"Step {step}/{num_steps}, Loss: {loss}")
+            print(
+                f"Step {step}/{num_steps}, Loss: {loss}, Latest checkpoint step: {checkpoint_manager.latest_step()}"
+            )
 
     return model, state, losses
 
@@ -125,6 +136,18 @@ def main():
     input_size = 512  # Internal dimension of the network
     output_size = 1024  # Number of possible frames (this is probably too high)
 
+    batch_size = 64
+    learning_rate = 1e-3
+    num_steps = 1000
+    checkpoint_every = 50
+    checkpoints_to_keep = 3
+
+    path = "/Volumes/git/ml/models/audio-to-midi/positional_encoding_models/"
+    checkpoint_options = ocp.CheckpointManagerOptions(
+        max_to_keep=checkpoints_to_keep, save_interval_steps=checkpoint_every
+    )
+    checkpoint_manager = ocp.CheckpointManager(path, options=checkpoint_options)
+
     key = jax.random.PRNGKey(1234)
     model_init_key, inference_key, training_key, dataset_loader_key = jax.random.split(
         key, num=4
@@ -132,9 +155,6 @@ def main():
     position_model = PositionEncodingRecovery(
         input_size=input_size, output_size=output_size, key=model_init_key
     )
-
-    batch_size = 64
-    learning_rate = 1e-3
 
     tx = optax.adam(learning_rate=learning_rate)
     tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
@@ -148,15 +168,27 @@ def main():
     )
     dataloader_iter = iter(dataloader)
 
+    step_to_restore = checkpoint_manager.latest_step()
+    if step_to_restore is not None:
+        print(f"Restoring saved model at step {step_to_restore}")
+        position_model = checkpoint_manager.restore(
+            step_to_restore,
+            args=ocp.args.StandardRestore(position_model),
+        )
+
     print("Starting training...")
-    trained_model, state, losses = train(
+    position_model, state, losses = train(
         position_model,
         tx,
         dataloader_iter,
         state,
-        print_every=50,
+        checkpoint_manager,
+        print_every=25,
+        num_steps=num_steps,
         key=training_key,
     )
+
+    checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
