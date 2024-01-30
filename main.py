@@ -9,7 +9,8 @@ from dataset import audio_to_midi_dataset_loader
 from model import OutputSequenceGenerator
 
 config = {
-    "frame_size": 464,
+    "frame_size": 232,  # 464,
+    "max_frame_sequence_length": 256,
     "attention_size": 128,
     "intermediate_size": 512,
     "num_heads": 2,
@@ -18,20 +19,29 @@ config = {
 }
 
 
+@eqx.filter_jit
 @eqx.filter_value_and_grad
 def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    logits, _ = jax.vmap(model, in_axes=(0, 0, 0))(
+    midi_logits, _, position_logits, _ = jax.vmap(model, in_axes=(0, 0, 0))(
         audio_frames, outputs_so_far, batched_keys
     )
-    return jnp.mean(
-        optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits, labels=expected_next_output
-        )
+
+    expected_next_midi, expected_next_position = expected_next_output
+    midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=midi_logits, labels=expected_next_midi
+    )
+    # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
+    # TODO: Also consider if this can be represented in some other way
+    position_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=position_logits, labels=expected_next_position
     )
 
+    return jnp.mean(midi_event_loss + position_loss)
 
+
+@eqx.filter_jit
 def compute_training_step(
     model, audio_frames, outputs_so_far, next_output, opt_state, key, tx
 ):
@@ -83,12 +93,14 @@ model_init_key, inference_key, training_key, dataset_loader_key = jax.random.spl
 )
 audio_to_midi = OutputSequenceGenerator(config, model_init_key)
 
-# _, next_token_probabilities = audio_to_midi(
+# _, midi_probs, _, position_probs = audio_to_midi(
 #     input_frames=jnp.zeros(shape=(10, config["frame_size"]), dtype=jnp.float16),
-#     generated_output=jnp.zeros(1, dtype=jnp.int16),
+#     generated_output=jnp.zeros(shape=(1, 2), dtype=jnp.int16),
 #     enable_dropout=False,
-#     key=inference_key)
-# print("Next token probs:", next_token_probabilities)
+#     key=inference_key,
+# )
+# print("Midi probs:", midi_probs)
+# print("Position probs:", position_probs)
 
 batch_size = 2
 learning_rate = 1e-5
@@ -97,17 +109,19 @@ tx = optax.adam(learning_rate=learning_rate)
 tx = optax.chain(optax.clip_by_global_norm(1.0), tx)  # TODO: Investigate clip by RMS
 state = tx.init(audio_to_midi)
 
-
-# loss, grads = compute_loss(
-#     functools.partial(audio_to_midi, enable_dropout=False),
-#     audio_frames=empty_audio_frames_batch,
-#     outputs_so_far=generated_sequence_batch,
-#     expected_next_output=expected_next_output_batch,
-#     key=inference_key)
-# print("Loss:", loss)
-
 print("Setting up dataset loader...")
 frame_loader = audio_to_midi_dataset_loader(dataset_loader_key, batch_size=batch_size)
+
+# example_batch = next(frame_loader)
+# print("Example batch", example_batch)
+# loss, grads = compute_loss(
+#     functools.partial(audio_to_midi, enable_dropout=False),
+#     audio_frames=example_batch["audio_frames"],
+#     outputs_so_far=example_batch["seen_events"],
+#     expected_next_output=example_batch["next_event"],
+#     key=inference_key,
+# )
+# print("Loss:", loss)
 
 print("Starting training...")
 trained_model, state, losses = train(
