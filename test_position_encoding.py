@@ -1,11 +1,12 @@
-import random
+import queue
+import threading
+from functools import partial
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
-import torch
 from jaxtyping import Array, Float, PRNGKeyArray
 
 
@@ -86,6 +87,7 @@ def train(
     return model, state, losses
 
 
+@partial(jax.jit, static_argnames=["model_dimension"])
 def compute_position_encoding(
     position: int, model_dimension: int
 ) -> Float[Array, "model_dimension"]:
@@ -106,39 +108,64 @@ def compute_position_encoding(
     return combined
 
 
-class TrainingDatasetLoader(torch.utils.data.IterableDataset):
-    def __init__(self, input_size: int, output_size: int):
-        super(TrainingDatasetLoader).__init__()
+@partial(jax.jit, static_argnames=["batch_size", "input_size"])
+def compute_position_encoding_batch(
+    batch_size: int, input_size: int, output_size: int, key: jax.random.PRNGKey
+) -> Float[Array, "batch_size model_dimension"]:
+    positions = jax.random.randint(
+        key, shape=(batch_size,), minval=0, maxval=output_size
+    )
+    encodings = jax.vmap(compute_position_encoding, (0, None))(positions, input_size)
+    return jnp.array(positions), encodings
+
+
+class TrainingDatasetLoader:
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        batch_size: int,
+        prefetch_count: int,
+        num_workers: int,
+        key: jax.random.PRNGKey,
+    ):
         self.input_size = input_size
         self.output_size = output_size
+        self.batch_size = batch_size
+        self.queue = queue.Queue(prefetch_count + 1)
+
+        worker_keys = jax.random.split(key, num=num_workers)
+        for worker_id in range(num_workers):
+            # TODO: Consider closing these?
+            threading.Thread(
+                target=partial(self._generate_batch, key=worker_keys[worker_id]),
+                daemon=True,
+            ).start()
 
     def __iter__(self):
         while True:
-            position = random.randint(0, self.output_size - 1)
+            positions, encodings = self.queue.get()
             yield {
-                "position_encoding": compute_position_encoding(
-                    position, self.input_size
-                ),
-                "position": position,
+                "position_encoding": encodings,
+                "position": positions,
             }
 
-    @classmethod
-    def collate(cls, samples):
-        return {
-            "position_encoding": jnp.array(
-                [sample["position_encoding"] for sample in samples]
-            ),
-            "position": jnp.array([sample["position"] for sample in samples]),
-        }
+    def _generate_batch(self, key: jax.random.PRNGKey):
+        while True:
+            key, batch_key = jax.random.split(key, num=2)
+            batch = compute_position_encoding_batch(
+                self.batch_size, self.input_size, self.output_size, batch_key
+            )
+            self.queue.put(batch)
 
 
 def main():
     input_size = 512  # Internal dimension of the network
     output_size = 1024  # Number of possible frames (this is probably too high)
 
-    batch_size = 64
-    learning_rate = 1e-3
-    num_steps = 1000
+    batch_size = 128
+    learning_rate = 1e-4
+    num_steps = 10000
     checkpoint_every = 50
     checkpoints_to_keep = 3
 
@@ -160,11 +187,13 @@ def main():
     tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
     state = tx.init(position_model)
 
-    dataloader = torch.utils.data.DataLoader(
-        TrainingDatasetLoader(input_size, output_size),
+    dataloader = TrainingDatasetLoader(
+        input_size,
+        output_size,
         batch_size=batch_size,
+        prefetch_count=10,
         num_workers=2,
-        collate_fn=TrainingDatasetLoader.collate,
+        key=dataset_loader_key,
     )
     dataloader_iter = iter(dataloader)
 
