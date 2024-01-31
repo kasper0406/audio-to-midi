@@ -20,12 +20,13 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
         audio_frames, outputs_so_far, batched_keys
     )
 
-    expected_next_midi, expected_next_position = expected_next_output
+    expected_next_midi = expected_next_output[:, 0]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
     )
     # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
     # TODO: Also consider if this can be represented in some other way
+    expected_next_position = expected_next_output[:, 1]
     position_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=position_logits, labels=expected_next_position
     )
@@ -92,15 +93,16 @@ def train(
 
 def main():
     current_directory = Path(__file__).resolve().parent
+    dataset_dir = "/Volumes/git/ml/datasets/midi-to-sound/v0"
 
-    batch_size = 2
+    batch_size = 128
     learning_rate = 1e-3
-    num_steps = 10000
+    num_steps = 1000
 
-    checkpoint_every = 2
+    checkpoint_every = 50
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 20
-    dataset_num_workers = 4
+    dataset_prefetch_count = 25
+    dataset_num_workers = 10
 
     model_config = {
         "frame_size": 232,  # 464,
@@ -117,6 +119,7 @@ def main():
         key, num=4
     )
 
+    # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
@@ -135,7 +138,7 @@ def main():
 
     print("Setting up dataset loader...")
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir="/Volumes/git/ml/datasets/midi-to-sound/v0",
+        dataset_dir=dataset_dir,
         batch_size=batch_size,
         prefetch_count=dataset_prefetch_count,
         num_workers=dataset_num_workers,
@@ -151,7 +154,7 @@ def main():
         state,
         checkpoint_manager,
         num_steps=num_steps,
-        print_every=5,
+        print_every=1,
         key=training_key,
     )
 
@@ -159,4 +162,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     main()

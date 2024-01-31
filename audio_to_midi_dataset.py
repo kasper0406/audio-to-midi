@@ -3,17 +3,19 @@ import glob
 import queue
 import random
 import threading
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+import numpy as np_on_cpu
 from jaxtyping import Array, Float
 from numpy.typing import NDArray
 from pydub import AudioSegment
 
 
+@lru_cache(maxsize=None)
 def load_audio_and_normalize(file: str) -> (int, NDArray[jnp.float32]):
     """Loads an audio file and returns the sample rate along with the normalized samples."""
     SAMPLE_RATE = 44100.0
@@ -45,8 +47,13 @@ def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
 
+@lru_cache()
+def is_metal_runtime():
+    return jax.lib.xla_bridge.default_backend() == "METAL"
+
+
 @partial(jax.jit, static_argnames=["sample_rate", "fft_duration"])
-def fft_audio(
+def fft_audio_jax(
     sample_rate: int, samples: NDArray[jnp.float32], fft_duration=20
 ) -> (Float, NDArray[jnp.float32]):
     """Computes the fft of the audio samples
@@ -65,11 +72,43 @@ def fft_audio(
     data = padded_data.reshape(
         (int(padded_data.shape[0] / samples_per_fft), samples_per_fft)
     )
-
     fft = jnp.fft.fft(data)
+    transposed_reals = jnp.transpose(jnp.real(fft))
+
     # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
     # return features
-    return float(samples_per_fft / sample_rate), fft
+    return float(samples_per_fft / sample_rate), transposed_reals
+
+
+# The XLA METAL backend does not support complex numbers, so we maintain a custom CPU version
+def fft_audio_cpu(
+    sample_rate: int, samples: NDArray[jnp.float32], fft_duration=20
+) -> (Float, NDArray[jnp.float32]):
+    """Computes the fft of the audio samples
+    Returns a tuple of the frame duration in seconds, and the complex FFT components
+
+    Args:
+        fft_duration: The duration in ms to compute the fft for. It will be rounded to the next
+                      power of 2 samples
+    """
+    samples_per_fft = next_power_of_2(int(sample_rate * (fft_duration / 1000)))
+
+    num_padding_symbols = samples_per_fft - (samples.shape[0] % samples_per_fft)
+    if num_padding_symbols == samples_per_fft:
+        num_padding_symbols = 0
+    padded_data = jnp.pad(samples, (0, num_padding_symbols), constant_values=0)
+    data = padded_data.reshape(
+        (int(padded_data.shape[0] / samples_per_fft), samples_per_fft)
+    )
+    fft = np_on_cpu.fft.fft(data)
+    transposed_reals = jnp.transpose(np_on_cpu.real(fft))
+
+    # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
+    # return features
+    return float(samples_per_fft / sample_rate), transposed_reals
+
+
+fft_audio = fft_audio_jax if not is_metal_runtime() else fft_audio_cpu
 
 
 @partial(jax.jit, static_argnames=["duration_per_frame", "high_freq_cutoff"])
@@ -79,9 +118,8 @@ def cleanup_fft_and_low_pass(
     high_freq_cutoff: Float = 10000,
 ):
     # Drop phase information and drop high-frequencies above the `high_freq_cut_off` wavelength
-    transposed_reals = jnp.transpose(jnp.real(frames))
     frequencies_to_include = int(high_freq_cutoff * duration_per_frame)
-    processed_frequencies = transposed_reals[0:frequencies_to_include, :]
+    processed_frequencies = frames[0:frequencies_to_include, :]
     return processed_frequencies, duration_per_frame
 
 
@@ -307,14 +345,14 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         dataset_dir="/Volumes/git/ml/datasets/midi-to-sound/v0",
-        batch_size=64,
+        batch_size=16,
         prefetch_count=20,
-        num_workers=4,
+        num_workers=10,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)
 
-    loaded_batch = next(dataset_loader_iter)
-    print("Audio frames shape:", loaded_batch["audio_frames"].shape)
-    print("Seen events shape:", loaded_batch["seen_events"].shape)
-    print("Next event shape:", loaded_batch["next_event"].shape)
+    for num, loaded_batch in zip(range(0, 100), dataset_loader_iter):
+        print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
+        print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
+        print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
