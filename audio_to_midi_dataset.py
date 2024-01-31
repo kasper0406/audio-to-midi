@@ -1,12 +1,15 @@
 import csv
 import glob
+import queue
 import random
+import threading
 from functools import partial
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
+from jaxtyping import Array, Float
 from numpy.typing import NDArray
 from pydub import AudioSegment
 
@@ -45,7 +48,7 @@ def next_power_of_2(x):
 @partial(jax.jit, static_argnames=["sample_rate", "fft_duration"])
 def fft_audio(
     sample_rate: int, samples: NDArray[jnp.float32], fft_duration=20
-) -> (int, NDArray[jnp.float32]):
+) -> (Float, NDArray[jnp.float32]):
     """Computes the fft of the audio samples
     Returns a tuple of the frame duration in seconds, and the complex FFT components
 
@@ -66,51 +69,20 @@ def fft_audio(
     fft = jnp.fft.fft(data)
     # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
     # return features
-    return (samples_per_fft / sample_rate, fft)
+    return float(samples_per_fft / sample_rate), fft
 
 
-def cleanup_fft_and_low_pass(duration_per_frame, frames, high_freq_cutoff=10000):
+@partial(jax.jit, static_argnames=["duration_per_frame", "high_freq_cutoff"])
+def cleanup_fft_and_low_pass(
+    frames: Float[Array, "frame_count frame_size"],
+    duration_per_frame: Float,
+    high_freq_cutoff: Float = 10000,
+):
     # Drop phase information and drop high-frequencies above the `high_freq_cut_off` wavelength
     transposed_reals = jnp.transpose(jnp.real(frames))
     frequencies_to_include = int(high_freq_cutoff * duration_per_frame)
     processed_frequencies = transposed_reals[0:frequencies_to_include, :]
-    return duration_per_frame, processed_frequencies
-
-
-def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
-    time_indices = jnp.linspace(
-        0, float(samples.size) / float(sample_rate), samples.size
-    )
-
-    fig, ax = plt.subplots()
-    ax.plot(time_indices, samples)
-
-    ax.set(
-        xlabel="time (s)",
-        ylabel="amplitude",
-        title="Normalized audio signal in time-domain",
-    )
-    ax.grid()
-
-
-def plot_frequency_domain_audio(
-    duration_per_frame: float, frames: NDArray[jnp.float32]
-):
-    fig, ax = plt.subplots()
-
-    # TODO(knielsen): Extract this so it can be used for training, as it is probably better signal?
-    # transposed_reals = jnp.transpose(jnp.real(frames))
-    # transformed_data = transposed_reals[0:int(transposed_reals.shape[0] / 2), :]
-    X = jnp.linspace(0.0, duration_per_frame * frames.shape[1], frames.shape[1])
-    Y = jnp.linspace(0.0, frames.shape[0] / duration_per_frame, frames.shape[0])
-    ax.pcolor(X, Y, frames)
-
-    ax.set(
-        xlabel="Time [s]",
-        ylabel="Frequency [Hz]",
-        title="Audio signal in frequency-domain",
-    )
-    ax.grid()
+    return processed_frequencies, duration_per_frame
 
 
 def load_sample_names(dataset_dir: str):
@@ -132,8 +104,8 @@ def audio_features_from_sample(dataset_dir: str, sample: str, key: jax.random.PR
     perturbed_samples = perturb_audio_sample(samples, key)
 
     duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
-    duration_per_frame, frames = cleanup_fft_and_low_pass(
-        duration_per_frame, frequency_domain
+    frames, duration_per_frame = cleanup_fft_and_low_pass(
+        frequency_domain, float(duration_per_frame)
     )
     return frames, sample_rate, duration_per_frame
 
@@ -166,7 +138,7 @@ def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
     return sorted(events)
 
 
-def audio_to_midi_dataset_loader(
+def audio_to_midi_dataset_generator(
     key: jax.random.PRNGKey,
     batch_size: int = 128,
     dataset_dir: str = "/Volumes/git/ml/datasets/midi-to-sound/v0",
@@ -231,6 +203,74 @@ def audio_to_midi_dataset_loader(
         }
 
 
+class AudioToMidiDatasetLoader:
+    def __init__(
+        self,
+        dataset_dir: str,
+        batch_size: int,
+        prefetch_count: int,
+        num_workers: int,
+        key: jax.random.PRNGKey,
+    ):
+        self.dataset_dir = dataset_dir
+        self.batch_size = batch_size
+        self.queue = queue.Queue(prefetch_count + 1)
+
+        worker_keys = jax.random.split(key, num=num_workers)
+        for worker_id in range(num_workers):
+            threading.Thread(
+                target=partial(self._generate_batch, key=worker_keys[worker_id]),
+                daemon=True,
+            ).start()
+
+    def __iter__(self):
+        while True:
+            yield self.queue.get()
+
+    def _generate_batch(self, key: jax.random.PRNGKey):
+        batch_generator = audio_to_midi_dataset_generator(
+            key, self.batch_size, self.dataset_dir
+        )
+        while True:
+            self.queue.put(next(batch_generator))
+
+
+def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
+    time_indices = jnp.linspace(
+        0, float(samples.size) / float(sample_rate), samples.size
+    )
+
+    fig, ax = plt.subplots()
+    ax.plot(time_indices, samples)
+
+    ax.set(
+        xlabel="time (s)",
+        ylabel="amplitude",
+        title="Normalized audio signal in time-domain",
+    )
+    ax.grid()
+
+
+def plot_frequency_domain_audio(
+    duration_per_frame: float, frames: NDArray[jnp.float32]
+):
+    fig, ax = plt.subplots()
+
+    # TODO(knielsen): Extract this so it can be used for training, as it is probably better signal?
+    # transposed_reals = jnp.transpose(jnp.real(frames))
+    # transformed_data = transposed_reals[0:int(transposed_reals.shape[0] / 2), :]
+    X = jnp.linspace(0.0, duration_per_frame * frames.shape[1], frames.shape[1])
+    Y = jnp.linspace(0.0, frames.shape[0] / duration_per_frame, frames.shape[0])
+    ax.pcolor(X, Y, frames)
+
+    ax.set(
+        xlabel="Time [s]",
+        ylabel="Frequency [Hz]",
+        title="Audio signal in frequency-domain",
+    )
+    ax.grid()
+
+
 if __name__ == "__main__":
     key = jax.random.PRNGKey(4)
 
@@ -265,9 +305,16 @@ if __name__ == "__main__":
 
     # play(audio_segment)
 
-    dataset_loader = audio_to_midi_dataset_loader(key, batch_size=4)
+    dataset_loader = AudioToMidiDatasetLoader(
+        dataset_dir="/Volumes/git/ml/datasets/midi-to-sound/v0",
+        batch_size=64,
+        prefetch_count=20,
+        num_workers=4,
+        key=key,
+    )
+    dataset_loader_iter = iter(dataset_loader)
 
-    loaded_batch = next(dataset_loader)
+    loaded_batch = next(dataset_loader_iter)
     print("Audio frames shape:", loaded_batch["audio_frames"].shape)
     print("Seen events shape:", loaded_batch["seen_events"].shape)
     print("Next event shape:", loaded_batch["next_event"].shape)
