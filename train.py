@@ -95,14 +95,14 @@ def main():
     current_directory = Path(__file__).resolve().parent
     dataset_dir = "/Volumes/git/ml/datasets/midi-to-sound/v0"
 
-    batch_size = 128
+    batch_size = 64
     learning_rate = 1e-3
-    num_steps = 1000
+    num_steps = 10000
 
     checkpoint_every = 50
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 25
-    dataset_num_workers = 10
+    dataset_prefetch_count = 200
+    dataset_num_workers = 40
 
     model_config = {
         "frame_size": 232,  # 464,
@@ -129,6 +129,14 @@ def main():
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_path, options=checkpoint_options
     )
+
+    step_to_restore = checkpoint_manager.latest_step()
+    if step_to_restore is not None:
+        print(f"Restoring saved model at step {step_to_restore}")
+        audio_to_midi = checkpoint_manager.restore(
+            step_to_restore,
+            args=ocp.args.StandardRestore(audio_to_midi),
+        )
 
     tx = optax.adam(learning_rate=learning_rate)
     tx = optax.chain(
