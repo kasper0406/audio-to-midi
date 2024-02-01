@@ -94,10 +94,24 @@ def load_sample_names(dataset_dir: str):
     return list(audio_names)
 
 
+@partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
+def pad_or_trim(
+    sample_rate: float,
+    samples: Float[Array, "num_samples"],
+    fixed_duration_in_seconds: float = 5,
+):
+    """Trim the audio to exactly 5 seconds in duration. Padding with empty audio if shorter, truncating if longer"""
+    desired_sample_count = int(sample_rate * fixed_duration_in_seconds)
+    return jnp.pad(samples, (0, max(0, desired_sample_count - samples.shape[0])))[
+        0:desired_sample_count
+    ]
+
+
 def audio_features_from_sample(
     sample_rate: float, samples: Float[Array, "num_samples"], key: jax.random.PRNGKey
 ):
-    perturbed_samples = perturb_audio_sample(samples, key)
+    padded_and_trimmed_samples = pad_or_trim(sample_rate, samples)
+    perturbed_samples = perturb_audio_sample(padded_and_trimmed_samples, key)
 
     duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
     frames, duration_per_frame = cleanup_fft_and_low_pass(
