@@ -3,32 +3,25 @@ import glob
 import queue
 import random
 import threading
-from functools import lru_cache, partial
+from functools import partial
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-import numpy as np_on_cpu
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
-from pydub import AudioSegment
+
+import parallel_audio_reader
 
 
-@lru_cache(maxsize=None)
-def load_audio_and_normalize(file: str) -> (int, NDArray[jnp.float32]):
-    """Loads an audio file and returns the sample rate along with the normalized samples."""
-    SAMPLE_RATE = 44100.0
-    audio = AudioSegment.from_file(file, "aac")
-    resampled_audio = audio.set_frame_rate(
-        SAMPLE_RATE
-    )  # Resample to the frequency we operate in
-
-    left_channel_samples = resampled_audio.split_to_mono()[0].get_array_of_samples()
-    sample_array = jnp.array(left_channel_samples).T.astype(jnp.float32)
+@jax.jit
+def normalize_audio(
+    samples: Float[Array, "num_samples"],
+) -> Float[Array, "num_samples"]:
+    sample_array = jnp.array(samples).T.astype(jnp.float32)
     normalized_samples = sample_array / jnp.max(jnp.abs(sample_array))
-
-    return SAMPLE_RATE, normalized_samples
+    return normalized_samples
 
 
 @jax.jit
@@ -47,14 +40,9 @@ def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
 
-@lru_cache()
-def is_metal_runtime():
-    return jax.lib.xla_bridge.default_backend() == "METAL"
-
-
-@partial(jax.jit, static_argnames=["sample_rate", "fft_duration"])
-def fft_audio_jax(
-    sample_rate: int, samples: NDArray[jnp.float32], fft_duration=20
+@partial(jax.jit, static_argnames=["sample_rate", "desired_fft_duration"])
+def fft_audio(
+    sample_rate: int, samples: NDArray[jnp.float32], desired_fft_duration=20
 ) -> (Float, NDArray[jnp.float32]):
     """Computes the fft of the audio samples
     Returns a tuple of the frame duration in seconds, and the complex FFT components
@@ -63,7 +51,7 @@ def fft_audio_jax(
         fft_duration: The duration in ms to compute the fft for. It will be rounded to the next
                       power of 2 samples
     """
-    samples_per_fft = next_power_of_2(int(sample_rate * (fft_duration / 1000)))
+    samples_per_fft = next_power_of_2(int(sample_rate * (desired_fft_duration / 1000)))
 
     num_padding_symbols = samples_per_fft - (samples.shape[0] % samples_per_fft)
     if num_padding_symbols == samples_per_fft:
@@ -78,37 +66,6 @@ def fft_audio_jax(
     # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
     # return features
     return float(samples_per_fft / sample_rate), transposed_reals
-
-
-# The XLA METAL backend does not support complex numbers, so we maintain a custom CPU version
-def fft_audio_cpu(
-    sample_rate: int, samples: NDArray[jnp.float32], fft_duration=20
-) -> (Float, NDArray[jnp.float32]):
-    """Computes the fft of the audio samples
-    Returns a tuple of the frame duration in seconds, and the complex FFT components
-
-    Args:
-        fft_duration: The duration in ms to compute the fft for. It will be rounded to the next
-                      power of 2 samples
-    """
-    samples_per_fft = next_power_of_2(int(sample_rate * (fft_duration / 1000)))
-
-    num_padding_symbols = samples_per_fft - (samples.shape[0] % samples_per_fft)
-    if num_padding_symbols == samples_per_fft:
-        num_padding_symbols = 0
-    padded_data = jnp.pad(samples, (0, num_padding_symbols), constant_values=0)
-    data = padded_data.reshape(
-        (int(padded_data.shape[0] / samples_per_fft), samples_per_fft)
-    )
-    fft = np_on_cpu.fft.fft(data)
-    transposed_reals = jnp.transpose(np_on_cpu.real(fft))
-
-    # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
-    # return features
-    return float(samples_per_fft / sample_rate), transposed_reals
-
-
-fft_audio = fft_audio_jax if not is_metal_runtime() else fft_audio_cpu
 
 
 @partial(jax.jit, static_argnames=["duration_per_frame", "high_freq_cutoff"])
@@ -137,8 +94,9 @@ def load_sample_names(dataset_dir: str):
     return list(audio_names)
 
 
-def audio_features_from_sample(dataset_dir: str, sample: str, key: jax.random.PRNGKey):
-    sample_rate, samples = load_audio_and_normalize(f"{dataset_dir}/{sample}.aac")
+def audio_features_from_sample(
+    sample_rate: float, samples: Float[Array, "num_samples"], key: jax.random.PRNGKey
+):
     perturbed_samples = perturb_audio_sample(samples, key)
 
     duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
@@ -166,8 +124,8 @@ def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
 
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
-            events.append((attack_time, 2 + 88 + (key - 55)))  # Attack
-            events.append((attack_time + duration, 2 + (key - 55)))  # Release
+            events.append((attack_time, 2 + 88 + (key - 21)))  # Attack
+            events.append((attack_time + duration, 2 + (key - 21)))  # Release
 
             max_event_timestamp = max(max_event_timestamp, attack_time + duration)
 
@@ -178,40 +136,49 @@ def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
 
 def audio_to_midi_dataset_generator(
     key: jax.random.PRNGKey,
-    batch_size: int = 128,
-    dataset_dir: str = "/Volumes/git/ml/datasets/midi-to-sound/v0",
+    batch_size: int,
+    sample_rate: float,
+    all_midi_events: list[(int, int)],
+    all_audio_samples: Float[Array, "num_files samples"],
 ):
-    samples = load_sample_names(dataset_dir)
-    midi_events_by_sample = list(
-        map(lambda sample: events_from_sample(dataset_dir, sample), samples)
-    )
+    assert (
+        len(all_midi_events) == all_audio_samples.shape[0]
+    ), "The number of loaded files should be equal!"
+    file_count = len(all_midi_events)
 
     while True:
         batch_frames = []
         batch_seen_events = []
         batch_next_event = []
 
-        while len(batch_frames) < batch_size:
-            key, sample_key = jax.random.split(key, num=2)
+        key, indexes_key, sample_key = jax.random.split(key, num=3)
+        indexes = jax.random.randint(
+            indexes_key,
+            shape=(batch_size,),
+            minval=0,
+            maxval=file_count,
+            dtype=jnp.int16,
+        )
+        sample_keys = jax.random.split(sample_key, num=batch_size)
+        selected_samples = all_audio_samples[indexes]
 
-            sample_index = random.randint(0, len(samples) - 1)
-            sample = samples[sample_index]
-            midi_events = midi_events_by_sample[sample_index]
+        selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
+            audio_features_from_sample, in_axes=(None, 0, 0), out_axes=(0, None, None)
+        )(sample_rate, selected_samples, sample_keys)
 
-            (
-                audio_frames,
-                sample_rate,
-                duration_per_frame_in_secs,
-            ) = audio_features_from_sample(dataset_dir, sample, sample_key)
+        for idx, sample_index in enumerate(indexes):
+            midi_events = all_midi_events[sample_index]
+            audio_frames = selected_audio_frames[idx]
 
             def position_to_frame_index(position_in_seconds: float) -> int:
                 return int(position_in_seconds / (duration_per_frame_in_secs))
 
             # Pick a split inside the events to predict
             midi_event_split = random.randint(1, len(midi_events) - 1)
-            seen_midi_events = midi_events[:midi_event_split]
+            seen_midi_events = midi_events[0:midi_event_split]
             next_event_to_predict = midi_events[midi_event_split]
 
+            # TODO: Consider avoiding a transpose here
             batch_frames.append(jnp.transpose(audio_frames))
             # Tuple of (midi event nr, position in frame index)
             batch_seen_events.append(
@@ -238,13 +205,14 @@ def audio_to_midi_dataset_generator(
             "audio_frames": jnp.stack(batch_frames, axis=0),
             "seen_events": jnp.array(padded_batch_seen_events),
             "next_event": jnp.array(batch_next_event),
+            "duration_per_frame_in_secs": duration_per_frame_in_secs,
         }
 
 
 class AudioToMidiDatasetLoader:
     def __init__(
         self,
-        dataset_dir: str,
+        dataset_dir: Path,
         batch_size: int,
         prefetch_count: int,
         num_workers: int,
@@ -253,6 +221,22 @@ class AudioToMidiDatasetLoader:
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
         self.queue = queue.Queue(prefetch_count + 1)
+
+        all_sample_names = load_sample_names(dataset_dir)
+        self.all_midi_events = list(
+            map(
+                lambda sample: events_from_sample(dataset_dir, sample), all_sample_names
+            )
+        )
+
+        self.sample_rate = 44100.0
+        all_audio_samples = jnp.array(
+            parallel_audio_reader.load_audio_files(
+                self.sample_rate,
+                [dataset_dir / f"{name}.aac" for name in all_sample_names],
+            )
+        )
+        self.all_audio_samples = jax.vmap(normalize_audio)(all_audio_samples)
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
@@ -267,7 +251,11 @@ class AudioToMidiDatasetLoader:
 
     def _generate_batch(self, key: jax.random.PRNGKey):
         batch_generator = audio_to_midi_dataset_generator(
-            key, self.batch_size, self.dataset_dir
+            key,
+            self.batch_size,
+            self.sample_rate,
+            self.all_midi_events,
+            self.all_audio_samples,
         )
         while True:
             self.queue.put(next(batch_generator))
@@ -292,21 +280,39 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 def plot_frequency_domain_audio(
     duration_per_frame: float, frames: NDArray[jnp.float32]
 ):
-    fig, ax = plt.subplots()
+    fig, ax1 = plt.subplots()
 
     # TODO(knielsen): Extract this so it can be used for training, as it is probably better signal?
     # transposed_reals = jnp.transpose(jnp.real(frames))
     # transformed_data = transposed_reals[0:int(transposed_reals.shape[0] / 2), :]
-    X = jnp.linspace(0.0, duration_per_frame * frames.shape[1], frames.shape[1])
-    Y = jnp.linspace(0.0, frames.shape[0] / duration_per_frame, frames.shape[0])
-    ax.pcolor(X, Y, frames)
+    X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
+    Y = jnp.linspace(0.0, frames.shape[1] / duration_per_frame, frames.shape[1])
+    ax1.pcolor(X, Y, jnp.transpose(frames))
 
-    ax.set(
+    ax1.set(
         xlabel="Time [s]",
         ylabel="Frequency [Hz]",
         title="Audio signal in frequency-domain",
     )
-    ax.grid()
+
+    ax2 = ax1.twiny()
+    ax2.set_xlim(0, frames.shape[0])
+    ax2.set_xlabel("Frame count")
+
+
+def visualize_sample(
+    frames: Float[Array, "num_samples"],
+    seen_events: Integer[Array, "seen_array_length 2"],
+    next_event: Integer[Array, "2"],
+    duration_per_frame_in_secs: float,
+):
+    print("Frames shape:", frames.shape)
+    print("Duration per frame:", duration_per_frame_in_secs)
+    print(f"Seen events: {seen_events}")
+    print(f"Next event: {next_event}")
+    plot_frequency_domain_audio(duration_per_frame_in_secs, frames)
+
+    plt.show()
 
 
 if __name__ == "__main__":
@@ -344,8 +350,8 @@ if __name__ == "__main__":
     # play(audio_segment)
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir="/Volumes/git/ml/datasets/midi-to-sound/v0",
-        batch_size=16,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
+        batch_size=128,
         prefetch_count=20,
         num_workers=10,
         key=key,
@@ -356,3 +362,11 @@ if __name__ == "__main__":
         print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
+
+        batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
+        visualize_sample(
+            loaded_batch["audio_frames"][batch_idx],
+            loaded_batch["seen_events"][batch_idx],
+            loaded_batch["next_event"][batch_idx],
+            loaded_batch["duration_per_frame_in_secs"],
+        )

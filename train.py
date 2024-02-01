@@ -93,9 +93,9 @@ def train(
 
 def main():
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = "/Volumes/git/ml/datasets/midi-to-sound/v0"
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
-    batch_size = 64
+    batch_size = 128
     learning_rate = 1e-3
     num_steps = 10000
 
