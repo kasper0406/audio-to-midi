@@ -62,6 +62,7 @@ def train(
     data_loader,
     state: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
+    device_mesh: [],
     num_steps: int = 10000,
     print_every: int = 1000,
     key: Optional[jax.random.PRNGKey] = None,
@@ -73,9 +74,7 @@ def train(
         else 0
     )
 
-    num_devices = len(jax.devices())
-    devices = mesh_utils.create_device_mesh((num_devices,))
-    batch_mesh = Mesh(devices, ("batch",))
+    batch_mesh = Mesh(device_mesh, ("batch",))
     batch_sharding = NamedSharding(
         batch_mesh,
         PartitionSpec(
@@ -114,7 +113,7 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 128 * num_devices
+    batch_size = 4 * num_devices
     learning_rate = 1e-3
     num_steps = 10000
 
@@ -142,7 +141,8 @@ def main():
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
 
     # Replicate the model on all JAX devices
-    mesh_replicate_everywhere = Mesh(jax.devices(), axis_names=("_"))
+    device_mesh = mesh_utils.create_device_mesh((num_devices,))
+    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
     replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
     audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
 
@@ -186,8 +186,9 @@ def main():
         dataset_loader_iter,
         state,
         checkpoint_manager,
+        device_mesh=device_mesh,
         num_steps=num_steps,
-        print_every=50,
+        print_every=1,
         key=training_key,
     )
 
