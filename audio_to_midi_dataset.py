@@ -1,5 +1,6 @@
 import csv
 import glob
+import os
 import queue
 import random
 import threading
@@ -7,7 +8,9 @@ from functools import partial
 from pathlib import Path
 
 import jax
+import jax.experimental.mesh_utils as mesh_utils
 import jax.numpy as jnp
+import jax.sharding as sharding
 import matplotlib.pyplot as plt
 from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
@@ -65,19 +68,7 @@ def fft_audio(
 
     # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
     # return features
-    return float(samples_per_fft / sample_rate), transposed_reals
-
-
-@partial(jax.jit, static_argnames=["duration_per_frame", "high_freq_cutoff"])
-def cleanup_fft_and_low_pass(
-    frames: Float[Array, "frame_count frame_size"],
-    duration_per_frame: Float,
-    high_freq_cutoff: Float = 10000,
-):
-    # Drop phase information and drop high-frequencies above the `high_freq_cut_off` wavelength
-    frequencies_to_include = int(high_freq_cutoff * duration_per_frame)
-    processed_frequencies = frames[0:frequencies_to_include, :]
-    return processed_frequencies, duration_per_frame
+    return jnp.float32(samples_per_fft / sample_rate), transposed_reals
 
 
 def load_sample_names(dataset_dir: str):
@@ -107,17 +98,19 @@ def pad_or_trim(
     ]
 
 
+@partial(jax.jit, static_argnames=["sample_rate"])
 def audio_features_from_sample(
     sample_rate: float, samples: Float[Array, "num_samples"], key: jax.random.PRNGKey
 ):
     padded_and_trimmed_samples = pad_or_trim(sample_rate, samples)
     perturbed_samples = perturb_audio_sample(padded_and_trimmed_samples, key)
-
     duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
-    frames, duration_per_frame = cleanup_fft_and_low_pass(
-        frequency_domain, float(duration_per_frame)
+
+    return (
+        frequency_domain,
+        sample_rate,
+        duration_per_frame,
     )
-    return frames, sample_rate, duration_per_frame
 
 
 def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
@@ -160,6 +153,10 @@ def audio_to_midi_dataset_generator(
     ), "The number of loaded files should be equal!"
     file_count = len(all_midi_events)
 
+    num_devices = len(jax.devices())
+    devices = mesh_utils.create_device_mesh((num_devices, 1))
+    shard = sharding.PositionalSharding(devices)
+
     while True:
         batch_frames = []
         batch_seen_events = []
@@ -174,13 +171,18 @@ def audio_to_midi_dataset_generator(
             dtype=jnp.int16,
         )
         sample_keys = jax.random.split(sample_key, num=batch_size)
-        selected_samples = all_audio_samples[indexes]
+        selected_samples = jax.device_put(all_audio_samples[indexes], shard)
 
         selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
             audio_features_from_sample, in_axes=(None, 0, 0), out_axes=(0, None, None)
         )(sample_rate, selected_samples, sample_keys)
 
+        # Select only the lowest 10_000 Hz frequencies
+        cutoff_frame = int(10_000 * duration_per_frame_in_secs)
+        selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
+
         for idx, sample_index in enumerate(indexes):
+            # TODO: Consider translating these to numpy arrays outside so we can sample faster using jax and no sequential loops
             midi_events = all_midi_events[sample_index]
             audio_frames = selected_audio_frames[idx]
 
@@ -330,6 +332,9 @@ def visualize_sample(
 
 
 if __name__ == "__main__":
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    jax.config.update("jax_threefry_partitionable", True)
+
     key = jax.random.PRNGKey(4)
 
     # sample_rate, samples = load_audio_and_normalize(
@@ -362,6 +367,8 @@ if __name__ == "__main__":
     # from pydub.playback import play
 
     # play(audio_segment)
+
+    # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
         dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),

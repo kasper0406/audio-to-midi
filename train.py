@@ -3,9 +3,11 @@ from typing import Optional
 
 import equinox as eqx
 import jax
+import jax.experimental.mesh_utils as mesh_utils
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator
@@ -71,12 +73,27 @@ def train(
         else 0
     )
 
+    num_devices = len(jax.devices())
+    devices = mesh_utils.create_device_mesh((num_devices,))
+    batch_mesh = Mesh(devices, ("batch",))
+    batch_sharding = NamedSharding(
+        batch_mesh,
+        PartitionSpec(
+            "batch",
+        ),
+    )
+
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
+        (audio_frames, seen_events, next_event) = jax.device_put(
+            (batch["audio_frames"], batch["seen_events"], batch["next_event"]),
+            batch_sharding,
+        )
+
         loss, model, state, key = compute_training_step(
             model,
-            batch["audio_frames"],
-            batch["seen_events"],
-            batch["next_event"],
+            audio_frames,
+            seen_events,
+            next_event,
             state,
             key,
             tx,
@@ -95,14 +112,16 @@ def main():
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
-    batch_size = 128
+    num_devices = len(jax.devices())
+
+    batch_size = 128 * num_devices
     learning_rate = 1e-3
     num_steps = 10000
 
-    checkpoint_every = 50
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 200
-    dataset_num_workers = 40
+    dataset_prefetch_count = 25
+    dataset_num_workers = 10
 
     model_config = {
         "frame_size": 232,  # 464,
@@ -121,6 +140,11 @@ def main():
 
     # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
+
+    # Replicate the model on all JAX devices
+    mesh_replicate_everywhere = Mesh(jax.devices(), axis_names=("_"))
+    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
@@ -142,6 +166,7 @@ def main():
     tx = optax.chain(
         optax.clip_by_global_norm(1.0), tx
     )  # TODO: Investigate clip by RMS
+    # state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
     state = tx.init(audio_to_midi)
 
     print("Setting up dataset loader...")
@@ -162,7 +187,7 @@ def main():
         state,
         checkpoint_manager,
         num_steps=num_steps,
-        print_every=1,
+        print_every=50,
         key=training_key,
     )
 
@@ -170,5 +195,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    jax.config.update("jax_threefry_partitionable", True)
+
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     main()
