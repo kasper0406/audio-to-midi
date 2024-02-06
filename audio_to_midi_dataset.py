@@ -1,6 +1,5 @@
 import csv
 import glob
-import os
 import queue
 import random
 import threading
@@ -114,13 +113,12 @@ def audio_features_from_sample(
 
 
 def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
-    events = []
     max_event_timestamp = 0.0
 
     SEQUENCE_START = 0
     SEQUENCE_END = 1
-    events.append((0.0, SEQUENCE_START))
 
+    events = []
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
@@ -136,9 +134,11 @@ def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
 
             max_event_timestamp = max(max_event_timestamp, attack_time + duration)
 
-    events.append((max_event_timestamp, SEQUENCE_END))
-
-    return sorted(events)
+    # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
+    # TODO: Find a nicer way...
+    return (
+        [(0.0, SEQUENCE_START)] + sorted(events) + [(max_event_timestamp, SEQUENCE_END)]
+    )
 
 
 def audio_to_midi_dataset_generator(
@@ -158,10 +158,6 @@ def audio_to_midi_dataset_generator(
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        batch_frames = []
-        batch_seen_events = []
-        batch_next_event = []
-
         key, indexes_key, sample_key = jax.random.split(key, num=3)
         indexes = jax.random.randint(
             indexes_key,
@@ -181,21 +177,20 @@ def audio_to_midi_dataset_generator(
         cutoff_frame = int(10_000 * duration_per_frame_in_secs)
         selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
 
-        for idx, sample_index in enumerate(indexes):
+        def position_to_frame_index(position_in_seconds: float) -> int:
+            return int(position_in_seconds / (duration_per_frame_in_secs))
+
+        batch_seen_events = []
+        batch_next_event = []
+        for sample_index in indexes:
             # TODO: Consider translating these to numpy arrays outside so we can sample faster using jax and no sequential loops
             midi_events = all_midi_events[sample_index]
-            audio_frames = selected_audio_frames[idx]
-
-            def position_to_frame_index(position_in_seconds: float) -> int:
-                return int(position_in_seconds / (duration_per_frame_in_secs))
 
             # Pick a split inside the events to predict
             midi_event_split = random.randint(1, len(midi_events) - 1)
             seen_midi_events = midi_events[0:midi_event_split]
             next_event_to_predict = midi_events[midi_event_split]
 
-            # TODO: Consider avoiding a transpose here
-            batch_frames.append(jnp.transpose(audio_frames))
             # Tuple of (midi event nr, position in frame index)
             batch_seen_events.append(
                 [
@@ -218,7 +213,7 @@ def audio_to_midi_dataset_generator(
         ]
 
         yield {
-            "audio_frames": jnp.stack(batch_frames, axis=0),
+            "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),
             "seen_events": jnp.array(padded_batch_seen_events),
             "next_event": jnp.array(batch_next_event),
             "duration_per_frame_in_secs": duration_per_frame_in_secs,
@@ -332,7 +327,7 @@ def visualize_sample(
 
 
 if __name__ == "__main__":
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     jax.config.update("jax_threefry_partitionable", True)
 
     key = jax.random.PRNGKey(4)
