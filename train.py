@@ -28,13 +28,14 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )
     # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
     # TODO: Also consider if this can be represented in some other way
-    expected_next_position = expected_next_output[:, 1]
-    position_loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits=position_logits, labels=expected_next_position
-    )
+    # expected_next_position = expected_next_output[:, 1]
+    # position_loss = optax.softmax_cross_entropy_with_integer_labels(
+    #     logits=position_logits, labels=expected_next_position
+    # )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + 0.3 * position_loss)
+    # return jnp.mean(midi_event_loss + 0.3 * position_loss)
+    return jnp.mean(midi_event_loss)
 
 
 @eqx.filter_jit
@@ -107,35 +108,34 @@ def train(
     return model, state, losses
 
 
+model_config = {
+    "frame_size": 232,  # 464,
+    "max_frame_sequence_length": 256,
+    "attention_size": 128,
+    "intermediate_size": 512,
+    "num_heads": 2,
+    "num_layers": 4,
+    "dropout_rate": 0.05,
+}
+
+
 def main():
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
     num_devices = len(jax.devices())
 
-    batch_size = 4 * num_devices
+    batch_size = 8 * num_devices
     learning_rate = 1e-3
     num_steps = 10000
 
-    checkpoint_every = 1000
+    checkpoint_every = 100
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 25
-    dataset_num_workers = 10
-
-    model_config = {
-        "frame_size": 232,  # 464,
-        "max_frame_sequence_length": 256,
-        "attention_size": 128,
-        "intermediate_size": 512,
-        "num_heads": 2,
-        "num_layers": 2,
-        "dropout_rate": 0.05,
-    }
+    dataset_prefetch_count = 10
+    dataset_num_workers = 2
 
     key = jax.random.PRNGKey(1234)
-    model_init_key, inference_key, training_key, dataset_loader_key = jax.random.split(
-        key, num=4
-    )
+    model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
 
     # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)

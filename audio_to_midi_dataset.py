@@ -32,9 +32,10 @@ def perturb_audio_sample(
     """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
     1. Add gausian noise
     """
-    sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
-    gaussian_noise = sigma * jax.random.normal(key, samples.shape)
-    return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
+    # sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
+    # gaussian_noise = sigma * jax.random.normal(key, samples.shape)
+    # return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
+    return samples
 
 
 def next_power_of_2(x):
@@ -80,7 +81,8 @@ def load_sample_names(dataset_dir: str):
     if audio_names != label_names:
         raise "Did not find the same set of labels and samples!"
 
-    return list(audio_names)
+    # Test, for now just return the first sample
+    return [sorted(list(audio_names))[0]]
 
 
 @partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
@@ -219,7 +221,7 @@ def audio_to_midi_dataset_generator(
         seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
         seen_events = selected_midi_events.at[~seen_event_mask].set(jnp.array([-1, 0]))
         # We can get rid of events that are -1 for all samples in the batch
-        seen_events = seen_events[:, 0 : jnp.max(midi_event_counts)]
+        seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
 
         yield {
             "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),

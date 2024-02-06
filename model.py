@@ -217,7 +217,7 @@ class AttentionBlock(eqx.Module):
     ) -> Float[Array, "seq_len attention_size"]:
         mask = None
         if input_mask is not None:
-            mask = mask = self.make_self_attention_mask(
+            mask = self.make_self_attention_mask(
                 input_mask,
                 encoder_output.shape[0]
                 if encoder_output is not None
@@ -257,7 +257,7 @@ class AttentionBlock(eqx.Module):
                 jnp.ones(key_value_sequence_length, dtype=jnp.int32), axis=-2
             ),
         )
-        return mask.astype(jnp.float32)
+        return mask.astype(jnp.bool_)
 
 
 class TransformerLayer(eqx.Module):
@@ -266,7 +266,8 @@ class TransformerLayer(eqx.Module):
     2. Feed-Forward NN to process the attention output in a non-linear fashion
     """
 
-    attention_block: AttentionBlock
+    self_attention_block: AttentionBlock
+    encoder_attention_block: AttentionBlock
     feed_forward_block: FeedForwardBlock
 
     def __init__(
@@ -279,7 +280,14 @@ class TransformerLayer(eqx.Module):
     ):
         attention_key, feed_forward_key = jax.random.split(key)
 
-        self.attention_block = AttentionBlock(
+        self.self_attention_block = AttentionBlock(
+            attention_size=attention_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            key=attention_key,
+        )
+        # TODO: Do not allocate this when we are in the encoder, as it does not do anything
+        self.encoder_attention_block = AttentionBlock(
             attention_size=attention_size,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
@@ -300,16 +308,23 @@ class TransformerLayer(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        attention_key, feed_forward_key = jax.random.split(key)
-
-        attention_output = self.attention_block(
-            inputs, encoder_output, mask, enable_dropout, key=attention_key
+        self_attention_key, encoder_attention_key, feed_forward_key = jax.random.split(
+            key, num=3
         )
+
+        output = self.self_attention_block(
+            inputs, None, mask, enable_dropout, key=self_attention_key
+        )
+
+        if encoder_output is not None:
+            output = self.encoder_attention_block(
+                output, encoder_output, mask, enable_dropout, key=encoder_attention_key
+            )
 
         seq_len = inputs.shape[0]
         feed_forward_keys = jax.random.split(feed_forward_key, num=seq_len)
         output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-            attention_output, enable_dropout, feed_forward_keys
+            output, enable_dropout, feed_forward_keys
         )
         return output
 
@@ -426,7 +441,6 @@ class Decoder(eqx.Module):
             key=pooling_key,
         )
 
-    # TODO: Distinguish between the two input/output sequence lengths
     # TODO: Consider a different attention_size for midi and frame embeddings
     def __call__(
         self,
