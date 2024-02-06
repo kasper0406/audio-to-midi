@@ -1,7 +1,6 @@
 import csv
 import glob
 import queue
-import random
 import threading
 from functools import partial
 from pathlib import Path
@@ -112,7 +111,12 @@ def audio_features_from_sample(
     )
 
 
-def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
+def events_from_sample(
+    dataset_dir: str, sample: str
+) -> Float[Array, "max_number_of_events 2"]:
+    """
+    Returns a numpy array with tuples of (timestamp in seconds, midi event id)
+    """
     max_event_timestamp = 0.0
 
     SEQUENCE_START = 0
@@ -136,7 +140,8 @@ def events_from_sample(dataset_dir: str, sample: str) -> [(float, int)]:
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
-    return (
+    # TODO: Should the max sequence event timestamp here instead be the length of the audio sequence!?
+    return jnp.array(
         [(0.0, SEQUENCE_START)] + sorted(events) + [(max_event_timestamp, SEQUENCE_END)]
     )
 
@@ -158,7 +163,7 @@ def audio_to_midi_dataset_generator(
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        key, indexes_key, sample_key = jax.random.split(key, num=3)
+        key, indexes_key, sample_key, midi_split_key = jax.random.split(key, num=4)
         indexes = jax.random.randint(
             indexes_key,
             shape=(batch_size,),
@@ -177,45 +182,49 @@ def audio_to_midi_dataset_generator(
         cutoff_frame = int(10_000 * duration_per_frame_in_secs)
         selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
 
-        def position_to_frame_index(position_in_seconds: float) -> int:
-            return int(position_in_seconds / (duration_per_frame_in_secs))
-
-        batch_seen_events = []
-        batch_next_event = []
-        for sample_index in indexes:
-            # TODO: Consider translating these to numpy arrays outside so we can sample faster using jax and no sequential loops
-            midi_events = all_midi_events[sample_index]
-
-            # Pick a split inside the events to predict
-            midi_event_split = random.randint(1, len(midi_events) - 1)
-            seen_midi_events = midi_events[0:midi_event_split]
-            next_event_to_predict = midi_events[midi_event_split]
-
-            # Tuple of (midi event nr, position in frame index)
-            batch_seen_events.append(
-                [
-                    (event[1], position_to_frame_index(event[0]))
-                    for event in seen_midi_events
-                ]
-            )
-            batch_next_event.append(
-                (
-                    next_event_to_predict[1],
-                    position_to_frame_index(next_event_to_predict[0]),
-                )
+        @jax.jit
+        def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
+            # TODO: There is an ugly swap of position and time here! I should fix this
+            return jnp.array(
+                [event[1], jnp.int16(event[0] / duration_per_frame_in_secs)],
+                dtype=jnp.int16,
             )
 
-        # TODO: Make this nicer
-        max_seen_events_length = max(len(sublist) for sublist in batch_seen_events)
-        padded_batch_seen_events = [
-            sublist + [(-1, 0)] * (max_seen_events_length - len(sublist))
-            for sublist in batch_seen_events
+        selected_midi_events = all_midi_events[indexes]
+        # Express midi event position in terms of frames
+        # TODO: Consider doing this outside the loop
+        selected_midi_events = jnp.apply_along_axis(
+            position_to_frame_index, 2, selected_midi_events
+        )
+
+        midi_event_counts = jnp.count_nonzero(
+            selected_midi_events != -1, axis=(1)
+        )[
+            :, 0
+        ]  # Count along the event id dimension and exclude any padded events with value -1, and pick any split pointing to the index to split _before_
+        picked_midi_splits = jax.random.randint(
+            midi_split_key,
+            midi_event_counts.shape,
+            minval=jnp.ones(
+                midi_event_counts.shape
+            ),  # We use ones for min value to make sure we do not pick the start of sequence
+            maxval=midi_event_counts,
+        )
+
+        next_events = selected_midi_events[
+            jnp.arange(selected_midi_events.shape[0]), picked_midi_splits
         ]
+
+        event_indices = jnp.arange(selected_midi_events.shape[1])
+        seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
+        seen_events = selected_midi_events.at[~seen_event_mask].set(jnp.array([-1, 0]))
+        # We can get rid of events that are -1 for all samples in the batch
+        seen_events = seen_events[:, 0 : jnp.max(midi_event_counts)]
 
         yield {
             "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),
-            "seen_events": jnp.array(padded_batch_seen_events),
-            "next_event": jnp.array(batch_next_event),
+            "seen_events": seen_events,
+            "next_event": next_events,
             "duration_per_frame_in_secs": duration_per_frame_in_secs,
         }
 
@@ -234,11 +243,23 @@ class AudioToMidiDatasetLoader:
         self.queue = queue.Queue(prefetch_count + 1)
 
         all_sample_names = load_sample_names(dataset_dir)
-        self.all_midi_events = list(
+
+        unpadded_midi_events = list(
             map(
                 lambda sample: events_from_sample(dataset_dir, sample), all_sample_names
             )
         )
+        max_events_length = max([events.shape[0] for events in unpadded_midi_events])
+        padded_midi_events = [
+            jnp.pad(
+                events,
+                ((0, max_events_length - events.shape[0])),
+                "constant",
+                constant_values=(-1, 0),
+            )
+            for events in unpadded_midi_events
+        ]
+        self.all_midi_events = jnp.stack(padded_midi_events, axis=0)
 
         self.sample_rate = 44100.0
         all_audio_samples = jnp.array(
@@ -369,7 +390,7 @@ if __name__ == "__main__":
         dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
         batch_size=128,
         prefetch_count=20,
-        num_workers=10,
+        num_workers=4,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)
@@ -379,10 +400,10 @@ if __name__ == "__main__":
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
 
-        batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
-        visualize_sample(
-            loaded_batch["audio_frames"][batch_idx],
-            loaded_batch["seen_events"][batch_idx],
-            loaded_batch["next_event"][batch_idx],
-            loaded_batch["duration_per_frame_in_secs"],
-        )
+        # batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
+        # visualize_sample(
+        #     loaded_batch["audio_frames"][batch_idx],
+        #     loaded_batch["seen_events"][batch_idx],
+        #     loaded_batch["next_event"][batch_idx],
+        #     loaded_batch["duration_per_frame_in_secs"],
+        # )
