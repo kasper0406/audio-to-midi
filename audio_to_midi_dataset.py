@@ -66,7 +66,7 @@ def fft_audio(
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
-    compression_factor = 100
+    compression_factor = 200
     compressed_amplitudes = (
         jnp.sign(transposed_amplitudes)
         * jnp.log1p(compression_factor * jnp.abs(transposed_amplitudes))
@@ -123,6 +123,12 @@ def audio_features_from_sample(
     )
 
 
+# TODO: Clean this up
+MAX_EVENT_TIMESTAMP = 5.0
+SEQUENCE_START = 1
+SEQUENCE_END = 0
+
+
 def events_from_sample(
     dataset_dir: str, sample: str
 ) -> Float[Array, "max_number_of_events 2"]:
@@ -130,9 +136,6 @@ def events_from_sample(
     Returns a numpy array with tuples of (timestamp in seconds, midi event id)
     """
     max_event_timestamp = 0.0
-
-    SEQUENCE_START = 0
-    SEQUENCE_END = 1
 
     events = []
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
@@ -145,17 +148,99 @@ def events_from_sample(
 
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
-            events.append((attack_time, 2 + 88 + (key - 21)))  # Attack
-            events.append((attack_time + duration, 2 + (key - 21)))  # Release
+            if attack_time < MAX_EVENT_TIMESTAMP:
+                events.append((attack_time, 2 + 88 + (key - 21)))  # Attack
+            if attack_time + duration < MAX_EVENT_TIMESTAMP:
+                events.append((attack_time + duration, 2 + (key - 21)))  # Release
 
             max_event_timestamp = max(max_event_timestamp, attack_time + duration)
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
-    # TODO: Should the max sequence event timestamp here instead be the length of the audio sequence!?
-    return jnp.array(
-        [(0.0, SEQUENCE_START)] + sorted(events) + [(max_event_timestamp, SEQUENCE_END)]
+    return jnp.array([(0.0, SEQUENCE_START)] + sorted(events) + [(0.0, SEQUENCE_END)])
+
+
+@partial(jax.jit, static_argnames=["sample_rate"])
+def time_shift_audio_and_events(
+    sample_rate: float,
+    samples: Float[Array, "num_samples"],
+    midi_events: Float[Array, "num_events 2"],
+    key: jax.random.PRNGKey,
+):
+    """
+    In order to introduce more diversity in the training data, we will offset the audio signal and media event
+    by a randomly picked amount
+    """
+    offset_amounts_in_seconds = jax.random.uniform(
+        key, minval=-2.0, maxval=2.0, dtype=jnp.float16
+    )[jnp.newaxis]
+
+    # Handle audio samples
+    frames_to_roll = sample_rate * offset_amounts_in_seconds
+    audio_frame_positions = jnp.arange(samples.shape[0])
+    frame_mask = audio_frame_positions < jnp.absolute(frames_to_roll)
+    frame_mask = jnp.roll(
+        frame_mask, shift=jnp.min(frames_to_roll, 0)
+    )  # Flip the mask if `frames_to_roll`` is negative
+    samples = jnp.roll(samples, shift=frames_to_roll)
+    samples = jnp.select(
+        [~frame_mask, audio_frame_positions >= 0],
+        [samples, jnp.zeros(audio_frame_positions.shape)],
+        0,
     )
+
+    # Handle midi events
+    # jax.debug.print("Original events = {midi_events}", midi_events=midi_events)
+
+    positions = jnp.arange(midi_events.shape[0])
+    updated_midi_event_times = midi_events[:, 0] + offset_amounts_in_seconds
+    end_of_sequence = jnp.where(midi_events[:, 1] == SEQUENCE_END, size=1)[0]
+    positions_to_update = (
+        (positions > 0)
+        & (positions < end_of_sequence)
+        & (updated_midi_event_times > 0.0)
+        & (updated_midi_event_times < MAX_EVENT_TIMESTAMP)
+    )
+    first_to_keep = jnp.where(positions_to_update == True, size=1)[0]
+    num_to_keep = jnp.sum(positions_to_update)
+
+    # Skip all the events that will be prior to time 0.0 (minus the first because it is start of sequence)
+    updated_midi_event_times = jnp.roll(
+        updated_midi_event_times, first_to_keep - 1, axis=0
+    )
+
+    # jax.debug.print("Mask = {mask}", mask=positions_to_update)
+
+    # Construct a blank input that will contain start of sequence, end of sequence and padding
+    # Values from this array will be selected outside of the mask
+    blank_input = jnp.tile(jnp.array([-1, -1]), (midi_events.shape[0], 1))
+    blank_input = blank_input.at[0, :].set(jnp.array([0.0, SEQUENCE_END]))
+    blank_input = jnp.roll(
+        blank_input, num_to_keep + 1, axis=0
+    )  # +1 due to start of sequence
+    blank_input = blank_input.at[0, :].set(jnp.array([0.0, SEQUENCE_START]))
+
+    # jax.debug.print("Blank input = {blank_input}", blank_input=blank_input)
+
+    # Apply the mask picking `updated_midi_event_timestamps` inside `positions_to_update` and from `blank_input` outside
+    midi_events = midi_events.at[:, 0].set(
+        jnp.select(
+            [positions_to_update, positions >= 0],
+            [updated_midi_event_times, blank_input[:, 0]],
+            1,
+        )
+    )
+    midi_events = midi_events.at[:, 1].set(
+        jnp.select(
+            [positions_to_update, positions >= 0],
+            [midi_events[:, 1], blank_input[:, 1]],
+            1,
+        )
+    )
+
+    # jax.debug.print("Updated events = {updated_events}", updated_events=midi_events)
+
+    return samples, midi_events
 
 
 def audio_to_midi_dataset_generator(
@@ -175,7 +260,9 @@ def audio_to_midi_dataset_generator(
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        key, indexes_key, sample_key, midi_split_key = jax.random.split(key, num=4)
+        key, indexes_key, sample_key, midi_split_key, time_shift_key = jax.random.split(
+            key, num=5
+        )
         indexes = jax.random.randint(
             indexes_key,
             shape=(batch_size,),
@@ -185,6 +272,12 @@ def audio_to_midi_dataset_generator(
         )
         sample_keys = jax.random.split(sample_key, num=batch_size)
         selected_samples = jax.device_put(all_audio_samples[indexes], shard)
+        selected_midi_events = all_midi_events[indexes]
+
+        timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
+        selected_samples, selected_midi_events = jax.vmap(
+            time_shift_audio_and_events, (None, 0, 0, 0)
+        )(sample_rate, selected_samples, selected_midi_events, timeshift_keys)
 
         selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
             audio_features_from_sample, in_axes=(None, 0, 0), out_axes=(0, None, None)
@@ -202,7 +295,6 @@ def audio_to_midi_dataset_generator(
                 dtype=jnp.int32,
             )
 
-        selected_midi_events = all_midi_events[indexes]
         # Express midi event position in terms of frames
         # TODO: Consider doing this outside the loop
         selected_midi_events = jnp.apply_along_axis(
@@ -269,7 +361,7 @@ class AudioToMidiDatasetLoader:
                 events,
                 ((0, max_events_length - events.shape[0])),
                 "constant",
-                constant_values=(-1, 0),
+                constant_values=(-1, -1),
             )
             for events in unpadded_midi_events
         ]
@@ -402,9 +494,9 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
-        batch_size=128,
-        prefetch_count=20,
-        num_workers=4,
+        batch_size=1,
+        prefetch_count=1,
+        num_workers=1,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)

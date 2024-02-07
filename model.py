@@ -62,8 +62,8 @@ class MidiVocabulary(eqx.Module):
     to maintain as little context as possible in the model.
 
     Enumarate in the following way:
-      0: SEQUENCE_START
-      1: SEQUENCE_END
+      0: SEQUENCE_END
+      1: SEQUENCE_START
       2: (RELEASE, 0)
       3: (RELEASE, 1)
       ...
