@@ -92,7 +92,6 @@ def load_sample_names(dataset_dir: str):
     if audio_names != label_names:
         raise "Did not find the same set of labels and samples!"
 
-    # Test, for now just return the first sample
     return list(audio_names)
 
 
