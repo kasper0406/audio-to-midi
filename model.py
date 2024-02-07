@@ -267,7 +267,7 @@ class TransformerLayer(eqx.Module):
     """
 
     self_attention_block: AttentionBlock
-    encoder_attention_block: AttentionBlock
+    encoder_attention_block: Optional[AttentionBlock]
     feed_forward_block: FeedForwardBlock
 
     def __init__(
@@ -276,23 +276,29 @@ class TransformerLayer(eqx.Module):
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
-        key: Optional[jax.random.PRNGKey],
+        allocate_encoder_attention: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
     ):
-        attention_key, feed_forward_key = jax.random.split(key)
+        self_attention_key, encoder_attention_key, feed_forward_key = jax.random.split(
+            key, num=3
+        )
 
         self.self_attention_block = AttentionBlock(
             attention_size=attention_size,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
-            key=attention_key,
+            key=self_attention_key,
         )
-        # TODO: Do not allocate this when we are in the encoder, as it does not do anything
-        self.encoder_attention_block = AttentionBlock(
-            attention_size=attention_size,
-            num_heads=num_heads,
-            dropout_rate=dropout_rate,
-            key=attention_key,
-        )
+
+        self.encoder_attention_block = None
+        if allocate_encoder_attention:
+            self.encoder_attention_block = AttentionBlock(
+                attention_size=attention_size,
+                num_heads=num_heads,
+                dropout_rate=dropout_rate,
+                key=encoder_attention_key,
+            )
+
         self.feed_forward_block = FeedForwardBlock(
             attention_size=attention_size,
             intermediate_size=intermediate_size,
@@ -365,6 +371,7 @@ class Encoder(eqx.Module):
                     intermediate_size=intermediate_size,
                     num_heads=num_heads,
                     dropout_rate=dropout_rate,
+                    allocate_encoder_attention=False,
                     key=layer_key,
                 )
             )
@@ -387,7 +394,7 @@ class Encoder(eqx.Module):
             encoder_output = layer(
                 inputs=encoder_output,
                 mask=None,  # TODO: Implement masking
-                encoder_output=encoder_output,
+                encoder_output=None,
                 enable_dropout=enable_dropout,
                 key=layer_key,
             )
@@ -425,6 +432,7 @@ class Decoder(eqx.Module):
                     intermediate_size=intermediate_size,
                     num_heads=num_heads,
                     dropout_rate=dropout_rate,
+                    allocate_encoder_attention=True,
                     key=layer_key,
                 )
             )

@@ -28,14 +28,13 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )
     # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
     # TODO: Also consider if this can be represented in some other way
-    # expected_next_position = expected_next_output[:, 1]
-    # position_loss = optax.softmax_cross_entropy_with_integer_labels(
-    #     logits=position_logits, labels=expected_next_position
-    # )
+    expected_next_position = expected_next_output[:, 1]
+    position_loss = optax.softmax_cross_entropy_with_integer_labels(
+        logits=position_logits, labels=expected_next_position
+    )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    # return jnp.mean(midi_event_loss + 0.3 * position_loss)
-    return jnp.mean(midi_event_loss)
+    return jnp.mean(midi_event_loss + 0.3 * position_loss)
 
 
 @eqx.filter_jit
@@ -125,8 +124,8 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 8 * num_devices
-    learning_rate = 1e-3
+    batch_size = 16 * num_devices
+    learning_rate = 1e-4
     num_steps = 10000
 
     checkpoint_every = 100

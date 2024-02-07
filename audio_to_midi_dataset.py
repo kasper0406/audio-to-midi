@@ -1,6 +1,7 @@
 import csv
 import glob
 import queue
+import random
 import threading
 from functools import partial
 from pathlib import Path
@@ -32,10 +33,9 @@ def perturb_audio_sample(
     """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
     1. Add gausian noise
     """
-    # sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
-    # gaussian_noise = sigma * jax.random.normal(key, samples.shape)
-    # return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
-    return samples
+    sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
+    gaussian_noise = sigma * jax.random.normal(key, samples.shape)
+    return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
 
 
 def next_power_of_2(x):
@@ -63,11 +63,22 @@ def fft_audio(
         (int(padded_data.shape[0] / samples_per_fft), samples_per_fft)
     )
     fft = jnp.fft.fft(data)
-    transposed_reals = jnp.transpose(jnp.real(fft))
+    transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
-    # features = jnp.reshape(jnp.stack((fft.real, fft.imag), axis=2), (fft.shape[0], 2 * fft.shape[1]))
-    # return features
-    return jnp.float32(samples_per_fft / sample_rate), transposed_reals
+    # Do a logaritmic compression to emulate human hearing
+    compression_factor = 100
+    compressed_amplitudes = (
+        jnp.sign(transposed_amplitudes)
+        * jnp.log1p(compression_factor * jnp.abs(transposed_amplitudes))
+        / jnp.log1p(compression_factor)
+    )
+
+    # Normalize the coefficients to give them 0 mean and unit variance
+    standardized_amplitudes = (
+        compressed_amplitudes - jnp.mean(compressed_amplitudes)
+    ) / jnp.var(compressed_amplitudes)
+
+    return jnp.float32(samples_per_fft / sample_rate), standardized_amplitudes
 
 
 def load_sample_names(dataset_dir: str):
@@ -82,7 +93,7 @@ def load_sample_names(dataset_dir: str):
         raise "Did not find the same set of labels and samples!"
 
     # Test, for now just return the first sample
-    return [sorted(list(audio_names))[0]]
+    return list(audio_names)
 
 
 @partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
@@ -171,7 +182,7 @@ def audio_to_midi_dataset_generator(
             shape=(batch_size,),
             minval=0,
             maxval=file_count,
-            dtype=jnp.int16,
+            dtype=jnp.int32,
         )
         sample_keys = jax.random.split(sample_key, num=batch_size)
         selected_samples = jax.device_put(all_audio_samples[indexes], shard)
@@ -188,8 +199,8 @@ def audio_to_midi_dataset_generator(
         def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
             # TODO: There is an ugly swap of position and time here! I should fix this
             return jnp.array(
-                [event[1], jnp.int16(event[0] / duration_per_frame_in_secs)],
-                dtype=jnp.int16,
+                [event[1], jnp.int32(event[0] / duration_per_frame_in_secs)],
+                dtype=jnp.int32,
             )
 
         selected_midi_events = all_midi_events[indexes]
@@ -220,8 +231,10 @@ def audio_to_midi_dataset_generator(
         event_indices = jnp.arange(selected_midi_events.shape[1])
         seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
         seen_events = selected_midi_events.at[~seen_event_mask].set(jnp.array([-1, 0]))
+
         # We can get rid of events that are -1 for all samples in the batch
-        seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
+        # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
+        # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
 
         yield {
             "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),
@@ -402,10 +415,10 @@ if __name__ == "__main__":
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
 
-        # batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
-        # visualize_sample(
-        #     loaded_batch["audio_frames"][batch_idx],
-        #     loaded_batch["seen_events"][batch_idx],
-        #     loaded_batch["next_event"][batch_idx],
-        #     loaded_batch["duration_per_frame_in_secs"],
-        # )
+        batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
+        visualize_sample(
+            loaded_batch["audio_frames"][batch_idx],
+            loaded_batch["seen_events"][batch_idx],
+            loaded_batch["next_event"][batch_idx],
+            loaded_batch["duration_per_frame_in_secs"],
+        )
