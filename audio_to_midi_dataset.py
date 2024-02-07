@@ -92,7 +92,7 @@ def load_sample_names(dataset_dir: str):
     if audio_names != label_names:
         raise "Did not find the same set of labels and samples!"
 
-    return list(audio_names)
+    return list(sorted(audio_names))
 
 
 @partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
@@ -112,8 +112,7 @@ def pad_or_trim(
 def audio_features_from_sample(
     sample_rate: float, samples: Float[Array, "num_samples"], key: jax.random.PRNGKey
 ):
-    padded_and_trimmed_samples = pad_or_trim(sample_rate, samples)
-    perturbed_samples = perturb_audio_sample(padded_and_trimmed_samples, key)
+    perturbed_samples = perturb_audio_sample(samples, key)
     duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
 
     return (
@@ -171,21 +170,21 @@ def time_shift_audio_and_events(
     In order to introduce more diversity in the training data, we will offset the audio signal and media event
     by a randomly picked amount
     """
-    offset_amounts_in_seconds = jax.random.uniform(
-        key, minval=-2.0, maxval=2.0, dtype=jnp.float16
-    )[jnp.newaxis]
+    offset_amounts_in_seconds = jnp.float32(
+        jax.random.uniform(key, shape=(1,), minval=-2.0, maxval=2.0, dtype=jnp.float32)
+    )
 
     # Handle audio samples
-    frames_to_roll = sample_rate * offset_amounts_in_seconds
+    frames_to_roll = jnp.int32(sample_rate * offset_amounts_in_seconds)
     audio_frame_positions = jnp.arange(samples.shape[0])
     frame_mask = audio_frame_positions < jnp.absolute(frames_to_roll)
     frame_mask = jnp.roll(
-        frame_mask, shift=jnp.min(frames_to_roll, 0)
+        frame_mask, shift=jnp.min(jnp.array([frames_to_roll, jnp.zeros(1)]))
     )  # Flip the mask if `frames_to_roll`` is negative
     samples = jnp.roll(samples, shift=frames_to_roll)
     samples = jnp.select(
-        [~frame_mask, audio_frame_positions >= 0],
-        [samples, jnp.zeros(audio_frame_positions.shape)],
+        [~frame_mask],
+        [samples],
         0,
     )
 
@@ -206,8 +205,9 @@ def time_shift_audio_and_events(
 
     # Skip all the events that will be prior to time 0.0 (minus the first because it is start of sequence)
     updated_midi_event_times = jnp.roll(
-        updated_midi_event_times, first_to_keep - 1, axis=0
+        updated_midi_event_times, -first_to_keep + 1, axis=0
     )
+    positions_to_update = jnp.roll(positions_to_update, -first_to_keep + 1, axis=0)
 
     # jax.debug.print("Mask = {mask}", mask=positions_to_update)
 
@@ -273,6 +273,11 @@ def audio_to_midi_dataset_generator(
         sample_keys = jax.random.split(sample_key, num=batch_size)
         selected_samples = jax.device_put(all_audio_samples[indexes], shard)
         selected_midi_events = all_midi_events[indexes]
+
+        # TODO: Re-structure these transformations in a nicer way
+        selected_samples = jax.vmap(pad_or_trim, (None, 0))(
+            sample_rate, selected_samples
+        )
 
         timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
         selected_samples, selected_midi_events = jax.vmap(
@@ -457,7 +462,7 @@ if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     jax.config.update("jax_threefry_partitionable", True)
 
-    key = jax.random.PRNGKey(4)
+    key = jax.random.PRNGKey(42)
 
     # sample_rate, samples = load_audio_and_normalize(
     #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
