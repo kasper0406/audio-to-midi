@@ -330,7 +330,7 @@ def audio_to_midi_dataset_generator(
         event_indices = jnp.arange(selected_midi_events.shape[1])
         seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
         seen_events = selected_midi_events.at[~seen_event_mask].set(
-            jnp.array([BLANK_MIDI_EVENT, 0])
+            jnp.array([0, BLANK_MIDI_EVENT])
         )
 
         # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
@@ -373,7 +373,7 @@ class AudioToMidiDatasetLoader:
                 events,
                 ((0, max_events_length - events.shape[0])),
                 "constant",
-                constant_values=(BLANK_MIDI_EVENT, 0),
+                constant_values=(0, BLANK_MIDI_EVENT),
             )
             for events in unpadded_midi_events
         ]

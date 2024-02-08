@@ -71,13 +71,11 @@ def main():
     print("Infering midi events...")
     last_event = (0, SEQUENCE_START)
     seen_events = jnp.array([last_event])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+
+    # Inference result should not change appending padding events!
+    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
 
     infer_limit = 50
     i = 0

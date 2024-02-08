@@ -223,6 +223,7 @@ class AttentionBlock(eqx.Module):
                 encoder_output.shape[0]
                 if encoder_output is not None
                 else inputs.shape[0],
+                encoder_output is None,
             )
 
         attention_key, dropout_key = jax.random.split(key)
@@ -249,14 +250,18 @@ class AttentionBlock(eqx.Module):
         self,
         input_mask: Integer[Array, " q_seq"],
         key_value_sequence_length: int,
+        # TODO: Consider a nicer way of doing this
+        mask_key_values: bool,  # If inputs are used as kv sequences, we need to mask those too!
     ) -> Float[Array, "q_seq kv_seq"]:
         """Create self-attention mask from sequence-level mask."""
 
+        kv_mask = jnp.ones(key_value_sequence_length, dtype=jnp.int32)
+        if mask_key_values:
+            kv_mask = input_mask
+
         mask = jnp.multiply(
             jnp.expand_dims(input_mask, axis=-1),
-            jnp.expand_dims(
-                jnp.ones(key_value_sequence_length, dtype=jnp.int32), axis=-2
-            ),
+            jnp.expand_dims(kv_mask, axis=-2),
         )
         return mask.astype(jnp.bool_)
 
@@ -574,7 +579,7 @@ class OutputSequenceGenerator(eqx.Module):
         mask = jnp.asarray(generated_output[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
         midi_logits, midi_probs, position_logits, position_probs = self.decoder(
-            decoder_output=midi_embeddings_so_far,  # generate midi embeddings
+            decoder_output=midi_embeddings_so_far,
             encoder_output=encoder_output,
             mask=mask,
             enable_dropout=enable_dropout,
