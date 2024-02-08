@@ -110,10 +110,9 @@ def pad_or_trim(
 
 @partial(jax.jit, static_argnames=["sample_rate"])
 def audio_features_from_sample(
-    sample_rate: float, samples: Float[Array, "num_samples"], key: jax.random.PRNGKey
+    sample_rate: float, samples: Float[Array, "num_samples"]
 ):
-    perturbed_samples = perturb_audio_sample(samples, key)
-    duration_per_frame, frequency_domain = fft_audio(sample_rate, perturbed_samples)
+    duration_per_frame, frequency_domain = fft_audio(sample_rate, samples)
 
     return (
         frequency_domain,
@@ -285,9 +284,13 @@ def audio_to_midi_dataset_generator(
             time_shift_audio_and_events, (None, 0, 0, 0)
         )(sample_rate, selected_samples, selected_midi_events, timeshift_keys)
 
+        perturbed_samples = jax.vmap(perturb_audio_sample, (0, 0))(
+            selected_samples, sample_keys
+        )
+
         selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
-            audio_features_from_sample, in_axes=(None, 0, 0), out_axes=(0, None, None)
-        )(sample_rate, selected_samples, sample_keys)
+            audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
+        )(sample_rate, perturbed_samples)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame_in_secs)
@@ -343,6 +346,8 @@ def audio_to_midi_dataset_generator(
 
 
 class AudioToMidiDatasetLoader:
+    SAMPLE_RATE = 44100.0
+
     def __init__(
         self,
         dataset_dir: Path,
@@ -374,10 +379,9 @@ class AudioToMidiDatasetLoader:
         ]
         self.all_midi_events = jnp.stack(padded_midi_events, axis=0)
 
-        self.sample_rate = 44100.0
         all_audio_samples = jnp.array(
             parallel_audio_reader.load_audio_files(
-                self.sample_rate,
+                self.SAMPLE_RATE,
                 [dataset_dir / f"{name}.aac" for name in all_sample_names],
             )
         )
@@ -398,12 +402,32 @@ class AudioToMidiDatasetLoader:
         batch_generator = audio_to_midi_dataset_generator(
             key,
             self.batch_size,
-            self.sample_rate,
+            self.SAMPLE_RATE,
             self.all_midi_events,
             self.all_audio_samples,
         )
         while True:
             self.queue.put(next(batch_generator))
+
+    @classmethod
+    def load_audio_frames(cls, file_path: Path):
+        audio_samples = jnp.array(
+            parallel_audio_reader.load_audio_files(
+                cls.SAMPLE_RATE,
+                [file_path],
+            )[0]
+        )
+        normalized_audio = normalize_audio(audio_samples)
+        padded_or_trimmed = pad_or_trim(cls.SAMPLE_RATE, normalized_audio)
+        frames, sample_rate, duration_per_frame = audio_features_from_sample(
+            cls.SAMPLE_RATE, padded_or_trimmed
+        )
+
+        # Select only the lowest 10_000 Hz frequencies
+        cutoff_frame = int(10_000 * duration_per_frame)
+        frames = frames[0:cutoff_frame, :]
+
+        return jnp.transpose(frames), sample_rate, duration_per_frame
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):

@@ -160,5 +160,5 @@ cython_debug/
 #.idea/
 
 # Trained model state
-positional_encoding_models/
-audio_to_midi_checkpoints/
+positional_encoding_models*
+audio_to_midi_checkpoints*

@@ -3,22 +3,26 @@ from pathlib import Path
 import equinox as eqx
 import jax
 import jax.experimental.mesh_utils as mesh_utils
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample
+from audio_to_midi_dataset import (
+    SEQUENCE_END,
+    SEQUENCE_START,
+    AudioToMidiDatasetLoader,
+    plot_frequency_domain_audio,
+)
 from model import OutputSequenceGenerator
 from train import model_config
 
 
 @eqx.filter_jit
 def infer(model, audio_frames, outputs_so_far, key):
-    batch_size = audio_frames.shape[0]
-    batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, midi_probs, position_logits, position_probs = jax.vmap(
-        model, in_axes=(0, 0, 0)
-    )(audio_frames, outputs_so_far, batched_keys)
-
+    midi_logits, midi_probs, position_logits, position_probs = model(
+        audio_frames, outputs_so_far, key
+    )
     return midi_logits, midi_probs, position_logits, position_probs
 
 
@@ -51,37 +55,56 @@ def main():
             args=ocp.args.StandardRestore(audio_to_midi),
         )
 
-    print("Setting up dataset loader...")
-    dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=dataset_dir,
-        batch_size=1,
-        prefetch_count=1,
-        num_workers=1,
-        key=dataset_loader_key,
-    )
-    dataset_loader_iter = iter(dataset_loader)
-
-    sample_batch = next(dataset_loader_iter)
-    visualize_sample(
-        sample_batch["audio_frames"][0],
-        sample_batch["seen_events"][0],
-        sample_batch["next_event"][0],
-        sample_batch["duration_per_frame_in_secs"],
+    print("Loading audio file...")
+    # TODO: Handle files that are longer than 5 seconds
+    # TODO: Support loading a file from a CLI argument
+    (
+        frames,
+        sample_rate,
+        duration_per_frame,
+    ) = AudioToMidiDatasetLoader.load_audio_frames(
+        dataset_dir / "piano_BechsteinFelt_48.aac"
     )
 
-    print("Actual seen events", sample_batch["seen_events"].shape)
-    # seen_events = jnp.zeros(shape=(1, 1, 2))
-    # print("Faked seen events", seen_events.shape)
+    plot_frequency_domain_audio(duration_per_frame, frames)
 
-    midi_logits, midi_probs, _, _ = infer(
-        audio_to_midi,
-        sample_batch["audio_frames"],
-        sample_batch["seen_events"],
-        inference_key,
-    )
+    print("Infering midi events...")
+    last_event = (0, SEQUENCE_START)
+    seen_events = jnp.array([last_event])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
+    # seen_events = jnp.vstack([seen_events, jnp.array([-1, 0])])
 
-    print("Midi logits", midi_logits)
-    print("Midi probs", midi_probs)
+    infer_limit = 50
+    i = 0
+    while last_event[1] != SEQUENCE_END and i < infer_limit:
+        print(f"Seen events: {seen_events}")
+        _, midi_probs, _, position_probs = infer(
+            audio_to_midi,
+            frames,
+            seen_events,
+            inference_key,
+        )
+
+        midi_event = jnp.argmax(midi_probs)
+        position = jnp.argmax(position_probs)
+        last_event = (position, midi_event)
+
+        print(f"{position}\t{midi_event}")
+
+        seen_events = jnp.vstack(
+            (seen_events, jnp.array([last_event])), dtype=jnp.int16
+        )
+        i += 1
+
+    if i == infer_limit:
+        print("HIT INFERENCE LIMIT!!!")
+
+    plt.show()
 
 
 if __name__ == "__main__":
@@ -90,3 +113,5 @@ if __name__ == "__main__":
 
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     main()
+
+    # https://github.com/microsoft/vscode/issues/174295 - ¯\_(ツ)_/¯
