@@ -14,11 +14,21 @@ from model import OutputSequenceGenerator
 
 
 @eqx.filter_jit
+def single_position_loss(probs, expected):
+    """
+    Some kind of loss function that will promote having approximately correct positions
+    """
+    x = jnp.arange(probs.shape[0])
+    expectation = jnp.exp(-0.5 * jnp.abs(x - expected))
+    return optax.cosine_distance(probs, expectation)
+
+
+@eqx.filter_jit
 @eqx.filter_value_and_grad
 def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, position_logits, _ = jax.vmap(model, in_axes=(0, 0, 0))(
+    midi_logits, _, _, position_probs = jax.vmap(model, in_axes=(0, 0, 0))(
         audio_frames, outputs_so_far, batched_keys
     )
 
@@ -26,15 +36,14 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
     )
-    # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
-    # TODO: Also consider if this can be represented in some other way
+    # TODO: Consider if this can be represented in some other way
     expected_next_position = expected_next_output[:, 0]
-    position_loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits=position_logits, labels=expected_next_position
+    position_loss = jnp.sum(
+        jax.vmap(single_position_loss, (0, 0))(position_probs, expected_next_position)
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + 0.3 * position_loss)
+    return jnp.mean(midi_event_loss + position_loss)
 
 
 @eqx.filter_jit
