@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer, PRNGKeyArray
 
 import position_encoding
+from audio_to_midi_dataset import BLANK_MIDI_EVENT
 
 
 class FrameEmbedding(eqx.Module):
@@ -107,8 +108,8 @@ class MidiVocabulary(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        midi_embedding = self.embedding(midi_pair[0])
-        position_embedding = self.position_embeddings[midi_pair[1], :]
+        midi_embedding = self.embedding(midi_pair[1])
+        position_embedding = self.position_embeddings[midi_pair[0], :]
         combined = self.layernorm(midi_embedding + position_embedding)
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
@@ -548,7 +549,7 @@ class OutputSequenceGenerator(eqx.Module):
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
         generated_output: Integer[
-            Array, "midi_seq_len 2"  # Pair of (midi_event, input_frame_position)
+            Array, "midi_seq_len 2"  # Pair of (input_frame_position, midi_event)
         ],  # Index of midi event in the vocabulary
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
@@ -569,8 +570,8 @@ class OutputSequenceGenerator(eqx.Module):
             )
         )(generated_output)
 
-        # Mask out all events with id of -1 as those are just padding entries
-        mask = jnp.asarray(generated_output[:, 0] != -1, dtype=jnp.int32)
+        # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
+        mask = jnp.asarray(generated_output[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
         midi_logits, midi_probs, position_logits, position_probs = self.decoder(
             decoder_output=midi_embeddings_so_far,  # generate midi embeddings

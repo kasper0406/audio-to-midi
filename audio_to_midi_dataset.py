@@ -126,6 +126,7 @@ def audio_features_from_sample(
 MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1
 SEQUENCE_END = 0
+BLANK_MIDI_EVENT = -1
 
 
 def events_from_sample(
@@ -213,7 +214,9 @@ def time_shift_audio_and_events(
 
     # Construct a blank input that will contain start of sequence, end of sequence and padding
     # Values from this array will be selected outside of the mask
-    blank_input = jnp.tile(jnp.array([-1, -1]), (midi_events.shape[0], 1))
+    blank_input = jnp.tile(
+        jnp.array([0.0, BLANK_MIDI_EVENT]), (midi_events.shape[0], 1)
+    )
     blank_input = blank_input.at[0, :].set(jnp.array([0.0, SEQUENCE_END]))
     blank_input = jnp.roll(
         blank_input, num_to_keep + 1, axis=0
@@ -227,14 +230,12 @@ def time_shift_audio_and_events(
         jnp.select(
             [positions_to_update, positions >= 0],
             [updated_midi_event_times, blank_input[:, 0]],
-            1,
         )
     )
     midi_events = midi_events.at[:, 1].set(
         jnp.select(
             [positions_to_update, positions >= 0],
             [midi_events[:, 1], blank_input[:, 1]],
-            1,
         )
     )
 
@@ -294,9 +295,8 @@ def audio_to_midi_dataset_generator(
 
         @jax.jit
         def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
-            # TODO: There is an ugly swap of position and time here! I should fix this
             return jnp.array(
-                [event[1], jnp.int32(event[0] / duration_per_frame_in_secs)],
+                [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
                 dtype=jnp.int32,
             )
 
@@ -307,10 +307,10 @@ def audio_to_midi_dataset_generator(
         )
 
         midi_event_counts = jnp.count_nonzero(
-            selected_midi_events != -1, axis=(1)
+            selected_midi_events != BLANK_MIDI_EVENT, axis=(1)
         )[
-            :, 0
-        ]  # Count along the event id dimension and exclude any padded events with value -1, and pick any split pointing to the index to split _before_
+            :, 1
+        ]  # Count along the event id dimension and exclude any padded events with value BLANK_MIDI_EVENT, and pick any split pointing to the index to split _before_
         picked_midi_splits = jax.random.randint(
             midi_split_key,
             midi_event_counts.shape,
@@ -326,9 +326,11 @@ def audio_to_midi_dataset_generator(
 
         event_indices = jnp.arange(selected_midi_events.shape[1])
         seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
-        seen_events = selected_midi_events.at[~seen_event_mask].set(jnp.array([-1, 0]))
+        seen_events = selected_midi_events.at[~seen_event_mask].set(
+            jnp.array([BLANK_MIDI_EVENT, 0])
+        )
 
-        # We can get rid of events that are -1 for all samples in the batch
+        # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
         # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
         # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
 
@@ -366,7 +368,7 @@ class AudioToMidiDatasetLoader:
                 events,
                 ((0, max_events_length - events.shape[0])),
                 "constant",
-                constant_values=(-1, -1),
+                constant_values=(BLANK_MIDI_EVENT, 0),
             )
             for events in unpadded_midi_events
         ]

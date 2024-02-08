@@ -22,13 +22,13 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
         audio_frames, outputs_so_far, batched_keys
     )
 
-    expected_next_midi = expected_next_output[:, 0]
+    expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
     )
     # TODO: Consider using `softmax_cross_entropy` here and assign some probability density to nearby positions to give a bit of slack
     # TODO: Also consider if this can be represented in some other way
-    expected_next_position = expected_next_output[:, 1]
+    expected_next_position = expected_next_output[:, 0]
     position_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=position_logits, labels=expected_next_position
     )
