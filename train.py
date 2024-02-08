@@ -38,8 +38,8 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )
     # TODO: Consider if this can be represented in some other way
     expected_next_position = expected_next_output[:, 0]
-    position_loss = jnp.sum(
-        jax.vmap(single_position_loss, (0, 0))(position_probs, expected_next_position)
+    position_loss = jax.vmap(single_position_loss, (0, 0))(
+        position_probs, expected_next_position
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
