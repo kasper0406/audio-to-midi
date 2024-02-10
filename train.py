@@ -19,7 +19,7 @@ def single_position_loss(probs, expected):
     Some kind of loss function that will promote having approximately correct positions
     """
     x = jnp.arange(probs.shape[0])
-    expectation = jnp.exp(-0.5 * jnp.abs(x - expected))
+    expectation = jnp.exp(-0.5 * jnp.square(x - expected))
     return optax.cosine_distance(probs, expectation)
 
 

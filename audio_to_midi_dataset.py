@@ -243,6 +243,33 @@ def time_shift_audio_and_events(
     return samples, midi_events
 
 
+@partial(jax.jit, static_argnames=["duration_per_frame"])
+def perturb_midi_event_positions(
+    midi_events: Float[Array, "num_events 2"], duration_per_frame: float
+):
+    """
+    It is unlikely that we will have positions inferred completely correctly all the time, for two main reasons:
+     1. Miliseconds of precision could be a bit skewed in training data and there may be a bit of variability between sampled instruments etc
+     2. In the training objectibe function because of 1 we predict with a prob dist around the dataset position
+    We will pick the new positions using a Gaussian prob distribution around the desired location, and make sure events
+    maintain the same order as in the training dataset by taking the commulative max
+    """
+    pertubation = (
+        jax.random.normal(key, shape=(midi_events.shape[0],)) * duration_per_frame * 2
+    )
+    pertubation = pertubation + midi_events[:, 0]
+    # Make sure the new perturbated event positions are monotonically increasing
+    pertubation = jax.lax.cummax(pertubation)
+
+    # Do not alter special events
+    special_events = max(SEQUENCE_START, SEQUENCE_END, BLANK_MIDI_EVENT)
+    adjusted_event_positions = jnp.select(
+        [midi_events[:, 1] > special_events], [pertubation], midi_events[:, 0]
+    )
+
+    return midi_events.at[:, 0].set(adjusted_event_positions)
+
+
 def audio_to_midi_dataset_generator(
     key: jax.random.PRNGKey,
     batch_size: int,
@@ -291,6 +318,10 @@ def audio_to_midi_dataset_generator(
         selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
             audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
         )(sample_rate, perturbed_samples)
+
+        selected_midi_events = jax.vmap(perturb_midi_event_positions, (0, None))(
+            selected_midi_events, float(duration_per_frame_in_secs)
+        )
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame_in_secs)

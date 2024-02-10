@@ -90,6 +90,10 @@ def main():
 
         midi_event = jnp.argmax(midi_probs)
         position = jnp.argmax(position_probs)
+
+        # Make sure the position is always monotonically increasing
+        position = max(last_event[0], position)
+
         last_event = (position, midi_event)
 
         print(f"{position}\t{midi_event}")
