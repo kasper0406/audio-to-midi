@@ -245,7 +245,9 @@ def time_shift_audio_and_events(
 
 @partial(jax.jit, static_argnames=["duration_per_frame"])
 def perturb_midi_event_positions(
-    midi_events: Float[Array, "num_events 2"], duration_per_frame: float
+    key: jax.random.PRNGKey,
+    midi_events: Float[Array, "num_events 2"],
+    duration_per_frame: float,
 ):
     """
     It is unlikely that we will have positions inferred completely correctly all the time, for two main reasons:
@@ -287,9 +289,14 @@ def audio_to_midi_dataset_generator(
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        key, indexes_key, sample_key, midi_split_key, time_shift_key = jax.random.split(
-            key, num=5
-        )
+        (
+            key,
+            indexes_key,
+            sample_key,
+            midi_split_key,
+            time_shift_key,
+            position_pertubation_key,
+        ) = jax.random.split(key, num=6)
         indexes = jax.random.randint(
             indexes_key,
             shape=(batch_size,),
@@ -319,8 +326,13 @@ def audio_to_midi_dataset_generator(
             audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
         )(sample_rate, perturbed_samples)
 
-        selected_midi_events = jax.vmap(perturb_midi_event_positions, (0, None))(
-            selected_midi_events, float(duration_per_frame_in_secs)
+        position_pertubation_keys = jax.random.split(
+            position_pertubation_key, num=selected_samples.shape[0]
+        )
+        selected_midi_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
+            position_pertubation_keys,
+            selected_midi_events,
+            float(duration_per_frame_in_secs),
         )
 
         # Select only the lowest 10_000 Hz frequencies
