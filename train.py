@@ -20,7 +20,8 @@ def single_position_loss(probs, expected):
     """
     x = jnp.arange(probs.shape[0])
     expectation = jnp.exp(-0.5 * jnp.square(x - expected))
-    return optax.cosine_distance(probs, expectation)
+    # return optax.cosine_distance(probs, expectation)
+    return optax.kl_divergence(jnp.log(probs), expectation)
 
 
 @eqx.filter_jit
@@ -43,7 +44,7 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + position_loss)
+    return jnp.mean(midi_event_loss + 0.1 * position_loss)
 
 
 @eqx.filter_jit
@@ -134,7 +135,7 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 16 * num_devices
-    learning_rate = 1e-4
+    learning_rate = 5 * 1e-4
     num_steps = 10000
 
     checkpoint_every = 100

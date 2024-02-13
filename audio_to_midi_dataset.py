@@ -326,15 +326,6 @@ def audio_to_midi_dataset_generator(
             audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
         )(sample_rate, perturbed_samples)
 
-        position_pertubation_keys = jax.random.split(
-            position_pertubation_key, num=selected_samples.shape[0]
-        )
-        selected_midi_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
-            position_pertubation_keys,
-            selected_midi_events,
-            float(duration_per_frame_in_secs),
-        )
-
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame_in_secs)
         selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
@@ -374,6 +365,16 @@ def audio_to_midi_dataset_generator(
         seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
         seen_events = selected_midi_events.at[~seen_event_mask].set(
             jnp.array([0, BLANK_MIDI_EVENT])
+        )
+
+        # We only perturb the seen events, and leave the next event to predict non-perturbed
+        position_pertubation_keys = jax.random.split(
+            position_pertubation_key, num=seen_events.shape[0]
+        )
+        seen_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
+            position_pertubation_keys,
+            seen_events,
+            float(duration_per_frame_in_secs),
         )
 
         # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
