@@ -9,9 +9,13 @@ import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
 
-from audio_to_midi_dataset import (BLANK_MIDI_EVENT, SEQUENCE_END,
-                                   SEQUENCE_START, AudioToMidiDatasetLoader,
-                                   plot_frequency_domain_audio)
+from audio_to_midi_dataset import (
+    BLANK_MIDI_EVENT,
+    SEQUENCE_END,
+    SEQUENCE_START,
+    AudioToMidiDatasetLoader,
+    plot_frequency_domain_audio,
+)
 from model import OutputSequenceGenerator
 from train import model_config
 
@@ -32,11 +36,15 @@ def batch_infer(
     infer_limit: int = 20,
 ):
     batch_size = frames.shape[0]
-    seen_events = jnp.tile(jnp.array([0, SEQUENCE_START], dtype=jnp.int16), (batch_size, 1, 1))
+    seen_events = jnp.tile(
+        jnp.array([0, SEQUENCE_START], dtype=jnp.int16), (batch_size, 1, 1)
+    )
 
     i = 0
     # This will be an all False array in the beginning. The mask is updated every step in the inference loop
-    end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (seen_events[:, -1, 1] == BLANK_MIDI_EVENT)
+    end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
+        seen_events[:, -1, 1] == BLANK_MIDI_EVENT
+    )
 
     while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
         inference_key, key = jax.random.split(key, num=2)
@@ -55,7 +63,7 @@ def batch_infer(
 
         # Make sure the position is always monotonically increasing
         positions_no_pad = jnp.maximum(
-            seen_events[:,-1,0], jnp.argmax(position_probs, axis=1)
+            seen_events[:, -1, 0], jnp.argmax(position_probs, axis=1)
         )
         positions = jnp.select(
             [end_of_sequence_mask],
@@ -67,10 +75,14 @@ def batch_infer(
         predicted_events = jnp.transpose(jnp.vstack([positions, midi_events]))
 
         # Update seen events with the new predictions
-        seen_events = jnp.concatenate([seen_events, jnp.reshape(predicted_events, (batch_size, 1, 2))], axis=1)
+        seen_events = jnp.concatenate(
+            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 2))], axis=1
+        )
         # print(f"Seen events at step {i}", seen_events)
 
-        end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (seen_events[:, -1, 1] == BLANK_MIDI_EVENT)
+        end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
+            seen_events[:, -1, 1] == BLANK_MIDI_EVENT
+        )
         i += 1
 
     return seen_events
@@ -127,7 +139,7 @@ def main():
     plot_frequency_domain_audio(duration_per_frame, frames_1)
     plot_frequency_domain_audio(duration_per_frame, frames_2)
 
-    all_frames = jnp.stack([ frames_1, frames_2 ])
+    all_frames = jnp.stack([frames_1, frames_2])
 
     print("Infering midi events...")
 
@@ -137,7 +149,7 @@ def main():
     # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
 
     inferred_events = batch_infer(audio_to_midi, inference_key, all_frames)
-    print(f"Inferred events: {inferred_events[0]}")
+    print(f"Inferred events: {inferred_events}")
 
     plt.show()
 
