@@ -19,11 +19,21 @@ from model import OutputSequenceGenerator, model_config
 def single_position_loss(probs, expected):
     """
     Some kind of loss function that will promote having approximately correct positions
+
+    Assumption: The value of the integer `expected` should be in the range 0 <= expected <= probs.shape[0]!
     """
+    epsilon = 0.0000001
+    variance = 3.0
     x = jnp.arange(probs.shape[0])
-    expectation = jnp.exp(-0.5 * jnp.square(x - expected))
+    expectation = -0.5 * jnp.square((x - expected) / variance)
+    expectation = jnp.maximum(
+        expectation, -10.0
+    )  # Below values of -10 we will assume the exponential will give 0
+    expectation = jnp.exp(expectation)
+    expectation = expectation / jnp.sum(expectation)
+    # jax.debug.print("Expectation: {expectation}", expectation=expectation)
     # return optax.cosine_distance(probs, expectation)
-    return optax.kl_divergence(jnp.log(probs), expectation)
+    return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 
 @eqx.filter_jit
@@ -46,7 +56,7 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + 0.1 * position_loss)
+    return jnp.mean(midi_event_loss + 0.2 * position_loss)
 
 
 @eqx.filter_jit
