@@ -272,6 +272,113 @@ def perturb_midi_event_positions(
     return midi_events.at[:, 0].set(adjusted_event_positions)
 
 
+@partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
+def generate_batch(
+    key: jax.random.PRNGKey,
+    batch_size: int,
+    sample_rate: float,
+    all_midi_events: list[(int, int)],
+    all_audio_samples: Float[Array, "num_files samples"],
+    shard: jax.sharding.Sharding,
+):
+    (
+        key,
+        indexes_key,
+        sample_key,
+        midi_split_key,
+        time_shift_key,
+        position_pertubation_key,
+    ) = jax.random.split(key, num=6)
+    indexes = jax.random.randint(
+        indexes_key,
+        shape=(batch_size,),
+        minval=0,
+        maxval=len(all_midi_events),
+        dtype=jnp.int32,
+    )
+    sample_keys = jax.random.split(sample_key, num=batch_size)
+    selected_samples = jax.device_put(all_audio_samples[indexes], shard)
+    selected_midi_events = all_midi_events[indexes]
+
+    # TODO: Re-structure these transformations in a nicer way
+    selected_samples = jax.vmap(pad_or_trim, (None, 0))(sample_rate, selected_samples)
+
+    timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
+    selected_samples, selected_midi_events = jax.vmap(
+        time_shift_audio_and_events, (None, 0, 0, 0)
+    )(sample_rate, selected_samples, selected_midi_events, timeshift_keys)
+
+    perturbed_samples = jax.vmap(perturb_audio_sample, (0, 0))(
+        selected_samples, sample_keys
+    )
+
+    selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
+        audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
+    )(sample_rate, perturbed_samples)
+
+    # Select only the lowest 10_000 Hz frequencies
+    cutoff_frame = int(10_000 * duration_per_frame_in_secs)
+    selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
+
+    @jax.jit
+    def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
+        return jnp.array(
+            [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
+            dtype=jnp.int32,
+        )
+
+    # Express midi event position in terms of frames
+    # TODO: Consider doing this outside the loop
+    selected_midi_events = jnp.apply_along_axis(
+        position_to_frame_index, 2, selected_midi_events
+    )
+
+    midi_event_counts = jnp.count_nonzero(
+        selected_midi_events != BLANK_MIDI_EVENT, axis=(1)
+    )[
+        :, 1
+    ]  # Count along the event id dimension and exclude any padded events with value BLANK_MIDI_EVENT, and pick any split pointing to the index to split _before_
+    picked_midi_splits = jax.random.randint(
+        midi_split_key,
+        midi_event_counts.shape,
+        minval=jnp.ones(
+            midi_event_counts.shape
+        ),  # We use ones for min value to make sure we do not pick the start of sequence
+        maxval=midi_event_counts,
+    )
+
+    next_events = selected_midi_events[
+        jnp.arange(selected_midi_events.shape[0]), picked_midi_splits
+    ]
+
+    event_indices = jnp.arange(selected_midi_events.shape[1])
+    seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
+    seen_events = selected_midi_events.at[~seen_event_mask].set(
+        jnp.array([0, BLANK_MIDI_EVENT])
+    )
+
+    # We only perturb the seen events, and leave the next event to predict non-perturbed
+    position_pertubation_keys = jax.random.split(
+        position_pertubation_key, num=seen_events.shape[0]
+    )
+    seen_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
+        position_pertubation_keys,
+        seen_events,
+        float(duration_per_frame_in_secs),
+    )
+
+    # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
+    # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
+    # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
+
+    return {
+        "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),
+        "seen_events": seen_events,
+        "next_event": next_events,
+        "duration_per_frame_in_secs": duration_per_frame_in_secs,
+    }
+
+
 def audio_to_midi_dataset_generator(
     key: jax.random.PRNGKey,
     batch_size: int,
@@ -282,111 +389,21 @@ def audio_to_midi_dataset_generator(
     assert (
         len(all_midi_events) == all_audio_samples.shape[0]
     ), "The number of loaded files should be equal!"
-    file_count = len(all_midi_events)
 
     num_devices = len(jax.devices())
     devices = mesh_utils.create_device_mesh((num_devices, 1))
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        (
-            key,
-            indexes_key,
-            sample_key,
-            midi_split_key,
-            time_shift_key,
-            position_pertubation_key,
-        ) = jax.random.split(key, num=6)
-        indexes = jax.random.randint(
-            indexes_key,
-            shape=(batch_size,),
-            minval=0,
-            maxval=file_count,
-            dtype=jnp.int32,
+        batch_key, key = jax.random.split(key, num=2)
+        yield generate_batch(
+            batch_key,
+            batch_size,
+            sample_rate,
+            all_midi_events,
+            all_audio_samples,
+            shard,
         )
-        sample_keys = jax.random.split(sample_key, num=batch_size)
-        selected_samples = jax.device_put(all_audio_samples[indexes], shard)
-        selected_midi_events = all_midi_events[indexes]
-
-        # TODO: Re-structure these transformations in a nicer way
-        selected_samples = jax.vmap(pad_or_trim, (None, 0))(
-            sample_rate, selected_samples
-        )
-
-        timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
-        selected_samples, selected_midi_events = jax.vmap(
-            time_shift_audio_and_events, (None, 0, 0, 0)
-        )(sample_rate, selected_samples, selected_midi_events, timeshift_keys)
-
-        perturbed_samples = jax.vmap(perturb_audio_sample, (0, 0))(
-            selected_samples, sample_keys
-        )
-
-        selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
-            audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
-        )(sample_rate, perturbed_samples)
-
-        # Select only the lowest 10_000 Hz frequencies
-        cutoff_frame = int(10_000 * duration_per_frame_in_secs)
-        selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
-
-        @jax.jit
-        def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
-            return jnp.array(
-                [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
-                dtype=jnp.int32,
-            )
-
-        # Express midi event position in terms of frames
-        # TODO: Consider doing this outside the loop
-        selected_midi_events = jnp.apply_along_axis(
-            position_to_frame_index, 2, selected_midi_events
-        )
-
-        midi_event_counts = jnp.count_nonzero(
-            selected_midi_events != BLANK_MIDI_EVENT, axis=(1)
-        )[
-            :, 1
-        ]  # Count along the event id dimension and exclude any padded events with value BLANK_MIDI_EVENT, and pick any split pointing to the index to split _before_
-        picked_midi_splits = jax.random.randint(
-            midi_split_key,
-            midi_event_counts.shape,
-            minval=jnp.ones(
-                midi_event_counts.shape
-            ),  # We use ones for min value to make sure we do not pick the start of sequence
-            maxval=midi_event_counts,
-        )
-
-        next_events = selected_midi_events[
-            jnp.arange(selected_midi_events.shape[0]), picked_midi_splits
-        ]
-
-        event_indices = jnp.arange(selected_midi_events.shape[1])
-        seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
-        seen_events = selected_midi_events.at[~seen_event_mask].set(
-            jnp.array([0, BLANK_MIDI_EVENT])
-        )
-
-        # We only perturb the seen events, and leave the next event to predict non-perturbed
-        position_pertubation_keys = jax.random.split(
-            position_pertubation_key, num=seen_events.shape[0]
-        )
-        seen_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
-            position_pertubation_keys,
-            seen_events,
-            float(duration_per_frame_in_secs),
-        )
-
-        # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
-        # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
-        # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
-
-        yield {
-            "audio_frames": jnp.transpose(selected_audio_frames, axes=(0, 2, 1)),
-            "seen_events": seen_events,
-            "next_event": next_events,
-            "duration_per_frame_in_secs": duration_per_frame_in_secs,
-        }
 
 
 class AudioToMidiDatasetLoader:
