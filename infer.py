@@ -16,8 +16,7 @@ from audio_to_midi_dataset import (
     AudioToMidiDatasetLoader,
     plot_frequency_domain_audio,
 )
-from model import OutputSequenceGenerator
-from train import model_config
+from model import OutputSequenceGenerator, model_config
 
 
 @eqx.filter_jit
@@ -46,6 +45,7 @@ def batch_infer(
         seen_events[:, -1, 1] == BLANK_MIDI_EVENT
     )
 
+    # TODO: Consider jitting the inside of this loop
     while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
         inference_key, key = jax.random.split(key, num=2)
         _, midi_probs, _, position_probs = forward(
@@ -62,13 +62,13 @@ def batch_infer(
         )
 
         # Make sure the position is always monotonically increasing
-        positions_no_pad = jnp.maximum(
+        positions = jnp.maximum(
             seen_events[:, -1, 0], jnp.argmax(position_probs, axis=1)
         )
         positions = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            positions_no_pad,
+            positions,
         )
 
         # Combine the predicted positions with their corresponding midi events
@@ -121,25 +121,16 @@ def main():
     # TODO: Handle files that are longer than 5 seconds
     # TODO: Support loading a file from a CLI argument
     (
-        frames_1,
+        all_frames,
         sample_rate,
         duration_per_frame,
     ) = AudioToMidiDatasetLoader.load_audio_frames(
-        dataset_dir / "piano_BechsteinFelt_48.aac"
+        dataset_dir, ["piano_BechsteinFelt_48", "piano_BechsteinFelt_70"]
     )
+    print(f"Frames shape: {all_frames.shape}")
 
-    (
-        frames_2,
-        sample_rate,
-        duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames(
-        dataset_dir / "piano_BechsteinFelt_70.aac"
-    )
-
-    plot_frequency_domain_audio(duration_per_frame, frames_1)
-    plot_frequency_domain_audio(duration_per_frame, frames_2)
-
-    all_frames = jnp.stack([frames_1, frames_2])
+    plot_frequency_domain_audio(duration_per_frame, all_frames[0])
+    plot_frequency_domain_audio(duration_per_frame, all_frames[1])
 
     print("Infering midi events...")
 

@@ -81,20 +81,6 @@ def fft_audio(
     return jnp.float32(samples_per_fft / sample_rate), standardized_amplitudes
 
 
-def load_sample_names(dataset_dir: str):
-    audio_names = set(
-        map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.aac"))
-    )
-    label_names = set(
-        map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.csv"))
-    )
-
-    if audio_names != label_names:
-        raise "Did not find the same set of labels and samples!"
-
-    return list(sorted(audio_names))
-
-
 @partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
 def pad_or_trim(
     sample_rate: float,
@@ -421,24 +407,10 @@ class AudioToMidiDatasetLoader:
         self.batch_size = batch_size
         self.queue = queue.Queue(prefetch_count + 1)
 
-        all_sample_names = load_sample_names(dataset_dir)
-
-        unpadded_midi_events = list(
-            map(
-                lambda sample: events_from_sample(dataset_dir, sample), all_sample_names
-            )
+        all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
+        self.all_midi_events = AudioToMidiDatasetLoader.load_midi_events(
+            dataset_dir, all_sample_names
         )
-        max_events_length = max([events.shape[0] for events in unpadded_midi_events])
-        padded_midi_events = [
-            jnp.pad(
-                events,
-                ((0, max_events_length - events.shape[0])),
-                "constant",
-                constant_values=(0, BLANK_MIDI_EVENT),
-            )
-            for events in unpadded_midi_events
-        ]
-        self.all_midi_events = jnp.stack(padded_midi_events, axis=0)
 
         all_audio_samples = jnp.array(
             parallel_audio_reader.load_audio_files(
@@ -471,24 +443,57 @@ class AudioToMidiDatasetLoader:
             self.queue.put(next(batch_generator))
 
     @classmethod
-    def load_audio_frames(cls, file_path: Path):
+    def load_audio_frames(cls, dataset_dir: Path, sample_names: [str]):
         audio_samples = jnp.array(
             parallel_audio_reader.load_audio_files(
-                cls.SAMPLE_RATE,
-                [file_path],
-            )[0]
+                AudioToMidiDatasetLoader.SAMPLE_RATE,
+                [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
+            )
         )
-        normalized_audio = normalize_audio(audio_samples)
-        padded_or_trimmed = pad_or_trim(cls.SAMPLE_RATE, normalized_audio)
-        frames, sample_rate, duration_per_frame = audio_features_from_sample(
-            cls.SAMPLE_RATE, padded_or_trimmed
+        normalized_audio = jax.vmap(normalize_audio)(audio_samples)
+        padded_or_trimmed = jax.vmap(pad_or_trim, (None, 0))(
+            AudioToMidiDatasetLoader.SAMPLE_RATE, normalized_audio
         )
+        frames, sample_rate, duration_per_frame = jax.vmap(
+            audio_features_from_sample, (None, 0), (0, None, None)
+        )(AudioToMidiDatasetLoader.SAMPLE_RATE, padded_or_trimmed)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame)
-        frames = frames[0:cutoff_frame, :]
+        frames = frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames), sample_rate, duration_per_frame
+        return jnp.transpose(frames, axes=(0, 2, 1)), sample_rate, duration_per_frame
+
+    @classmethod
+    def load_midi_events(cls, dataset_dir: Path, sample_names: [str]):
+        unpadded_midi_events = list(
+            map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
+        )
+        max_events_length = max([events.shape[0] for events in unpadded_midi_events])
+        padded_midi_events = [
+            jnp.pad(
+                events,
+                ((0, max_events_length - events.shape[0])),
+                "constant",
+                constant_values=(0, BLANK_MIDI_EVENT),
+            )
+            for events in unpadded_midi_events
+        ]
+        return jnp.stack(padded_midi_events, axis=0)
+
+    @classmethod
+    def load_sample_names(cls, dataset_dir: Path):
+        audio_names = set(
+            map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.aac"))
+        )
+        label_names = set(
+            map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.csv"))
+        )
+
+        if audio_names != label_names:
+            raise "Did not find the same set of labels and samples!"
+
+        return list(sorted(audio_names))
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):

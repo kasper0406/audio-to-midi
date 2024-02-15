@@ -1,3 +1,4 @@
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -9,8 +10,9 @@ import optax
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from audio_to_midi_dataset import AudioToMidiDatasetLoader
-from model import OutputSequenceGenerator
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, AudioToMidiDatasetLoader
+from infer import batch_infer
+from model import OutputSequenceGenerator, model_config
 
 
 @eqx.filter_jit
@@ -66,8 +68,43 @@ def compute_training_step(
     return loss, model, opt_state, new_key
 
 
-def evaluate_model(model):
-    pass
+def fake_evaluate_model(
+    model, key: jax.random.PRNGKey, dataset_dir: Path, sample_size=4
+):
+    """
+    TODO: The evaluation is a bit fake right now, as we do not put aside a validation set.
+    However, as long as the model sturggles even with the in-sample data, it is fine
+
+    It is a bit like a loss function, but for now it mainly serves for me to get some
+    intuition using a different metric than the loss how the model is performing.
+    """
+    print("Starting model evaluation")
+
+    # Pick a sublist of the samples and use those for evaluation
+    sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)[:sample_size]
+    (
+        frames,
+        sample_rate,
+        duration_per_frame,
+    ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
+    inferred_events = batch_infer(model, key, frames)
+
+    actual_events = AudioToMidiDatasetLoader.load_midi_events(dataset_dir, sample_names)
+
+    min_dim = min(inferred_events.shape[1], actual_events.shape[1])
+    # This is a bit weird, but just some kind of penalty for predicting the
+    dim_penalty = jnp.sum(
+        inferred_events[:, min_dim:, 1] != BLANK_MIDI_EVENT
+    ) + jnp.sum(actual_events[:, min_dim:, 1] != BLANK_MIDI_EVENT)
+
+    # For now just count the amount of correctly predicted events where a position is deemed correct
+    # if it is within 5 frames
+    difference = jnp.abs(inferred_events[:, :min_dim, :] - actual_events)
+    position_penalty = jnp.sum(difference[:, :, 0] > 5) + dim_penalty
+    midi_penalty = jnp.sum(difference[:, :, 1] > 1) + dim_penalty
+    print(
+        f"Evaluation of model - position penalty = {position_penalty}, midi_penalty = {midi_penalty}"
+    )
 
 
 def train(
@@ -81,6 +118,7 @@ def train(
     print_every: int = 1000,
     inference_every: int = 500,
     key: Optional[jax.random.PRNGKey] = None,
+    model_evaluator=None,
 ):
     losses = []
     start_step = (
@@ -119,21 +157,11 @@ def train(
         if step % print_every == 0:
             print(f"Step {step}/{num_steps}, Loss: {loss}")
 
-        if step % inference_every == 0:
-            evaluate_model(model)
+        if step % inference_every == 0 and model_evaluator is not None:
+            eval_key, key = jax.random.split(key, num=2)
+            model_evaluator(model, eval_key)
 
     return model, state, losses
-
-
-model_config = {
-    "frame_size": 232,  # 464,
-    "max_frame_sequence_length": 256,
-    "attention_size": 128,
-    "intermediate_size": 512,
-    "num_heads": 2,
-    "num_layers": 4,
-    "dropout_rate": 0.05,
-}
 
 
 def main():
@@ -142,11 +170,11 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 16 * num_devices
+    batch_size = 4 * num_devices
     learning_rate = 5 * 1e-4
-    num_steps = 100
+    num_steps = 1000000
 
-    checkpoint_every = 100
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_prefetch_count = 10
     dataset_num_workers = 2
@@ -207,6 +235,8 @@ def main():
         num_steps=num_steps,
         print_every=1,
         key=training_key,
+        inference_every=checkpoint_every,
+        model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
     )
 
     checkpoint_manager.wait_until_finished()

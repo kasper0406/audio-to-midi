@@ -9,6 +9,16 @@ from jaxtyping import Array, Float, Integer, PRNGKeyArray
 import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT
 
+model_config = {
+    "frame_size": 232,  # 464,
+    "max_frame_sequence_length": 256,
+    "attention_size": 128,
+    "intermediate_size": 512,
+    "num_heads": 2,
+    "num_layers": 4,
+    "dropout_rate": 0.05,
+}
+
 
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
