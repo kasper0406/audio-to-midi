@@ -7,23 +7,73 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jaxtyping import Array, Float
 
-from audio_to_midi_dataset import (
-    SEQUENCE_END,
-    SEQUENCE_START,
-    AudioToMidiDatasetLoader,
-    plot_frequency_domain_audio,
-)
+from audio_to_midi_dataset import (BLANK_MIDI_EVENT, SEQUENCE_END,
+                                   SEQUENCE_START, AudioToMidiDatasetLoader,
+                                   plot_frequency_domain_audio)
 from model import OutputSequenceGenerator
 from train import model_config
 
 
 @eqx.filter_jit
-def infer(model, audio_frames, outputs_so_far, key):
-    midi_logits, midi_probs, position_logits, position_probs = model(
-        audio_frames, outputs_so_far, key
-    )
+def forward(model, audio_frames, outputs_so_far, key):
+    inference_keys = jax.random.split(key, num=audio_frames.shape[0])
+    midi_logits, midi_probs, position_logits, position_probs = jax.vmap(
+        model, (0, 0, 0)
+    )(audio_frames, outputs_so_far, inference_keys)
     return midi_logits, midi_probs, position_logits, position_probs
+
+
+def batch_infer(
+    model,
+    key: jax.random.PRNGKey,
+    frames: Float[Array, "batch_size frame_count"],
+    infer_limit: int = 20,
+):
+    batch_size = frames.shape[0]
+    seen_events = jnp.tile(jnp.array([0, SEQUENCE_START], dtype=jnp.int16), (batch_size, 1, 1))
+
+    i = 0
+    # This will be an all False array in the beginning. The mask is updated every step in the inference loop
+    end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (seen_events[:, -1, 1] == BLANK_MIDI_EVENT)
+
+    while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
+        inference_key, key = jax.random.split(key, num=2)
+        _, midi_probs, _, position_probs = forward(
+            model,
+            frames,
+            seen_events,
+            inference_key,
+        )
+
+        midi_events = jnp.select(
+            [end_of_sequence_mask],
+            [jnp.tile(jnp.array(BLANK_MIDI_EVENT, dtype=jnp.int16), (batch_size,))],
+            jnp.argmax(midi_probs, axis=1),
+        )
+
+        # Make sure the position is always monotonically increasing
+        positions_no_pad = jnp.maximum(
+            seen_events[:,-1,0], jnp.argmax(position_probs, axis=1)
+        )
+        positions = jnp.select(
+            [end_of_sequence_mask],
+            [jnp.zeros((batch_size,), jnp.int16)],
+            positions_no_pad,
+        )
+
+        # Combine the predicted positions with their corresponding midi events
+        predicted_events = jnp.transpose(jnp.vstack([positions, midi_events]))
+
+        # Update seen events with the new predictions
+        seen_events = jnp.concatenate([seen_events, jnp.reshape(predicted_events, (batch_size, 1, 2))], axis=1)
+        # print(f"Seen events at step {i}", seen_events)
+
+        end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (seen_events[:, -1, 1] == BLANK_MIDI_EVENT)
+        i += 1
+
+    return seen_events
 
 
 def main():
@@ -59,52 +109,35 @@ def main():
     # TODO: Handle files that are longer than 5 seconds
     # TODO: Support loading a file from a CLI argument
     (
-        frames,
+        frames_1,
         sample_rate,
         duration_per_frame,
     ) = AudioToMidiDatasetLoader.load_audio_frames(
         dataset_dir / "piano_BechsteinFelt_48.aac"
     )
 
-    plot_frequency_domain_audio(duration_per_frame, frames)
+    (
+        frames_2,
+        sample_rate,
+        duration_per_frame,
+    ) = AudioToMidiDatasetLoader.load_audio_frames(
+        dataset_dir / "piano_BechsteinFelt_70.aac"
+    )
+
+    plot_frequency_domain_audio(duration_per_frame, frames_1)
+    plot_frequency_domain_audio(duration_per_frame, frames_2)
+
+    all_frames = jnp.stack([ frames_1, frames_2 ])
 
     print("Infering midi events...")
-    last_event = (0, SEQUENCE_START)
-    seen_events = jnp.array([last_event])
 
     # Inference result should not change appending padding events!
     # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
     # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
     # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
 
-    infer_limit = 50
-    i = 0
-    while last_event[1] != SEQUENCE_END and i < infer_limit:
-        print(f"Seen events: {seen_events}")
-        _, midi_probs, _, position_probs = infer(
-            audio_to_midi,
-            frames,
-            seen_events,
-            inference_key,
-        )
-
-        midi_event = jnp.argmax(midi_probs)
-        position = jnp.argmax(position_probs)
-
-        # Make sure the position is always monotonically increasing
-        position = max(last_event[0], position)
-
-        last_event = (position, midi_event)
-
-        print(f"{position}\t{midi_event}")
-
-        seen_events = jnp.vstack(
-            (seen_events, jnp.array([last_event])), dtype=jnp.int16
-        )
-        i += 1
-
-    if i == infer_limit:
-        print("HIT INFERENCE LIMIT!!!")
+    inferred_events = batch_infer(audio_to_midi, inference_key, all_frames)
+    print(f"Inferred events: {inferred_events[0]}")
 
     plt.show()
 
@@ -115,5 +148,3 @@ if __name__ == "__main__":
 
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     main()
-
-    # https://github.com/microsoft/vscode/issues/174295 - ¯\_(ツ)_/¯

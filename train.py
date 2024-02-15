@@ -66,6 +66,10 @@ def compute_training_step(
     return loss, model, opt_state, new_key
 
 
+def evaluate_model(model):
+    pass
+
+
 def train(
     model,
     tx,
@@ -75,6 +79,7 @@ def train(
     device_mesh: [],
     num_steps: int = 10000,
     print_every: int = 1000,
+    inference_every: int = 500,
     key: Optional[jax.random.PRNGKey] = None,
 ):
     losses = []
@@ -114,6 +119,9 @@ def train(
         if step % print_every == 0:
             print(f"Step {step}/{num_steps}, Loss: {loss}")
 
+        if step % inference_every == 0:
+            evaluate_model(model)
+
     return model, state, losses
 
 
@@ -136,7 +144,7 @@ def main():
 
     batch_size = 16 * num_devices
     learning_rate = 5 * 1e-4
-    num_steps = 10000
+    num_steps = 100
 
     checkpoint_every = 100
     checkpoints_to_keep = 3
