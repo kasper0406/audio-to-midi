@@ -109,7 +109,9 @@ def fake_evaluate_model(
 
     # For now just count the amount of correctly predicted events where a position is deemed correct
     # if it is within 5 frames
-    difference = jnp.abs(inferred_events[:, :min_dim, :] - actual_events)
+    difference = jnp.abs(
+        inferred_events[:, :min_dim, :] - actual_events[:, :min_dim, :]
+    )
     position_penalty = jnp.sum(difference[:, :, 0] > 5) + dim_penalty
     midi_penalty = jnp.sum(difference[:, :, 1] > 1) + dim_penalty
     print(
