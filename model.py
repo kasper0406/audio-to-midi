@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Integer, PRNGKeyArray
 
 import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT
@@ -167,6 +167,7 @@ class FeedForwardBlock(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "attention_size"],
+        mask: Bool,
         enable_dropout: bool = True,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "attention_size"]:
@@ -181,6 +182,7 @@ class FeedForwardBlock(eqx.Module):
         output = self.dropout(output, inference=not enable_dropout, key=key)
 
         # Add residual and normalize the layers
+        output = output * mask
         output += inputs
         output = self.layernorm(output)
 
@@ -228,7 +230,7 @@ class AttentionBlock(eqx.Module):
     ) -> Float[Array, "seq_len attention_size"]:
         mask = None
         if input_mask is not None:
-            mask = self.make_self_attention_mask(
+            mask = self.make_attention_mask(
                 input_mask,
                 encoder_output.shape[0]
                 if encoder_output is not None
@@ -255,8 +257,7 @@ class AttentionBlock(eqx.Module):
 
         return result
 
-    # We allow attending to everything in the kv sequence
-    def make_self_attention_mask(
+    def make_attention_mask(
         self,
         input_mask: Integer[Array, " q_seq"],
         key_value_sequence_length: int,
@@ -265,6 +266,9 @@ class AttentionBlock(eqx.Module):
     ) -> Float[Array, "q_seq kv_seq"]:
         """Create self-attention mask from sequence-level mask."""
 
+        # In a non-self-attention layer where the kv arrays are the outputs of the encoder, we allow
+        # the decoder to attend everywhere. Otherwise if the kv arrays are the seen inputs so far, we
+        # mask out events not seen yet.
         kv_mask = jnp.ones(key_value_sequence_length, dtype=jnp.int32)
         if mask_key_values:
             kv_mask = input_mask
@@ -345,8 +349,11 @@ class TransformerLayer(eqx.Module):
 
         seq_len = inputs.shape[0]
         feed_forward_keys = jax.random.split(feed_forward_key, num=seq_len)
-        output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-            output, enable_dropout, feed_forward_keys
+
+        if mask is None:
+            mask = jnp.ones((seq_len,), dtype=jnp.bool_)
+        output = jax.vmap(self.feed_forward_block, in_axes=(0, 0, None, 0))(
+            output, mask, enable_dropout, feed_forward_keys
         )
         return output
 
@@ -495,18 +502,20 @@ class Decoder(eqx.Module):
                 key=layer_key,
             )
 
-        # We take the first token in the last decoder layer to mean the midi information of the next event
-        first_token_last_layer = decoder_output[..., 0, :]
+        # We take the first token in the last decoder layer to have information necessary for two
+        # different pooling layers to extract both the midi event and the position
+        # Notice: The first token must always be attendable by the mask! If not, the output of the token will
+        #         not give any meaningful result.
+        #         This padding is handled by our start of sequence token which is always pre-pended to the
+        #         seen events, causing the mask for the first position to never be masked out.
+        first_token_last_layer = decoder_output[0, :]
         midi_logits = self.midi_decoder_pooling(
             first_token_last_layer, key=midi_decoder_key
         )
         midi_probabilities = jax.nn.softmax(midi_logits)
 
-        # We take the second token in the last decoder layer to mean the position of where the midi event happens
-        # If the midi event is an EOS event, we will output the last input frame as the position
-        second_token_last_layer = decoder_output[..., 1, :]
         position_logits = self.position_decoder_pooling(
-            second_token_last_layer, key=position_decoder_key
+            first_token_last_layer, key=position_decoder_key
         )
         position_probabilities = jax.nn.softmax(position_logits)
 

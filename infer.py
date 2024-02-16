@@ -21,11 +21,44 @@ from model import OutputSequenceGenerator, model_config
 
 @eqx.filter_jit
 def forward(model, audio_frames, outputs_so_far, key):
+    jax.debug.print("Inferring with input {input}", input=outputs_so_far)
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
     midi_logits, midi_probs, position_logits, position_probs = jax.vmap(
         model, (0, 0, 0)
     )(audio_frames, outputs_so_far, inference_keys)
     return midi_logits, midi_probs, position_logits, position_probs
+
+
+def _update_raw_outputs(
+    current, batch_size, midi_logits, midi_probs, position_logits, position_probs
+):
+    midi_logits = jnp.reshape(midi_logits, (batch_size, 1, midi_logits.shape[1]))
+    midi_probs = jnp.reshape(midi_probs, (batch_size, 1, midi_probs.shape[1]))
+    position_logits = jnp.reshape(
+        position_logits, (batch_size, 1, position_logits.shape[1])
+    )
+    position_probs = jnp.reshape(
+        position_probs, (batch_size, 1, position_probs.shape[1])
+    )
+
+    if current is None:
+        return {
+            "midi_logits": midi_logits,
+            "midi_probs": midi_probs,
+            "position_logits": position_logits,
+            "position_probs": position_probs,
+        }
+
+    return {
+        "midi_logits": jnp.concatenate([current["midi_logits"], midi_logits], axis=1),
+        "midi_probs": jnp.concatenate([current["midi_probs"], midi_probs], axis=1),
+        "position_logits": jnp.concatenate(
+            [current["position_logits"], position_logits], axis=1
+        ),
+        "position_probs": jnp.concatenate(
+            [current["position_probs"], position_probs], axis=1
+        ),
+    }
 
 
 def batch_infer(
@@ -45,10 +78,22 @@ def batch_infer(
         seen_events[:, -1, 1] == BLANK_MIDI_EVENT
     )
 
+    raw_outputs = None
+
     # TODO: Consider jitting the inside of this loop
     while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
         inference_key, key = jax.random.split(key, num=2)
-        _, midi_probs, _, position_probs = forward(
+
+        # Inference result should not change appending padding events!
+        # padding = jnp.tile(
+        #     jnp.array([0, BLANK_MIDI_EVENT], dtype=jnp.int16), (batch_size, 5, 1)
+        # )
+        # padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
+        # jax.debug.print(
+        #     "Padded seen events {padded_seen_events}",
+        #     padded_seen_events=padded_seen_events,
+        # )
+        midi_logits, midi_probs, position_logits, position_probs = forward(
             model,
             frames,
             seen_events,
@@ -62,6 +107,7 @@ def batch_infer(
         )
 
         # Make sure the position is always monotonically increasing
+        # TODO: Consider to throw a weighted dice with position_probs probabilities here?
         positions = jnp.maximum(
             seen_events[:, -1, 0], jnp.argmax(position_probs, axis=1)
         )
@@ -80,12 +126,35 @@ def batch_infer(
         )
         # print(f"Seen events at step {i}", seen_events)
 
+        # Update logits and probs
+        raw_outputs = _update_raw_outputs(
+            raw_outputs,
+            batch_size,
+            midi_logits,
+            midi_probs,
+            position_logits,
+            position_probs,
+        )
+
         end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
             seen_events[:, -1, 1] == BLANK_MIDI_EVENT
         )
         i += 1
 
-    return seen_events
+    return seen_events, raw_outputs
+
+
+def plot_prob_dist(dist: Float[Array, "len"]):
+    fig, ax1 = plt.subplots()
+
+    X = jnp.arange(dist.shape[0])
+    ax1.plot(X, dist)
+
+    ax1.set(
+        xlabel="Position",
+        ylabel="Probability",
+        title="Probability distribution for position",
+    )
 
 
 def main():
@@ -120,27 +189,61 @@ def main():
     print("Loading audio file...")
     # TODO: Handle files that are longer than 5 seconds
     # TODO: Support loading a file from a CLI argument
-    (
-        all_frames,
-        sample_rate,
-        duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames(
-        dataset_dir, ["piano_BechsteinFelt_48", "piano_BechsteinFelt_70"]
+    sample_names = ["piano_BechsteinFelt_48", "piano_BechsteinFelt_70"]
+    # (
+    #     all_frames,
+    #     sample_rate,
+    #     duration_per_frame,
+    # ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
+    # print(f"Frames shape: {all_frames.shape}")
+
+    dataset_loader = AudioToMidiDatasetLoader(
+        dataset_dir=dataset_dir,
+        batch_size=2,
+        prefetch_count=1,
+        num_workers=1,
+        key=dataset_loader_key,
     )
-    print(f"Frames shape: {all_frames.shape}")
+    dataset_loader_iter = iter(dataset_loader)
+    dataset_batch = next(dataset_loader_iter)
+
+    duration_per_frame = dataset_batch["duration_per_frame_in_secs"]
+    all_frames = dataset_batch["audio_frames"]
 
     plot_frequency_domain_audio(duration_per_frame, all_frames[0])
     plot_frequency_domain_audio(duration_per_frame, all_frames[1])
 
     print("Infering midi events...")
-
-    # Inference result should not change appending padding events!
-    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
-    # seen_events = jnp.vstack([seen_events, jnp.array([0, -1])])
-
-    inferred_events = batch_infer(audio_to_midi, inference_key, all_frames)
+    inferred_events, raw_outputs = batch_infer(audio_to_midi, inference_key, all_frames)
     print(f"Inferred events: {inferred_events}")
+
+    # Evaluate losses
+
+    # expected_midi_events = (
+    #     AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
+    #         dataset_dir, sample_names, duration_per_frame
+    #     )
+    # )
+
+    # # For now just compute the loss of the first example
+    i = 0
+    end_of_sequence_mask = (inferred_events[:, :, 1] == SEQUENCE_END) | (
+        inferred_events[:, :, 1] == BLANK_MIDI_EVENT
+    )
+    while not jnp.all(end_of_sequence_mask[:, i]):
+        # loss = compute_loss_from_output(
+        #     raw_outputs["midi_logits"][:, i, :],
+        #     raw_outputs["position_probs"][:, i, :],
+        #     expected_midi_events[:, i],
+        # )
+        # loss = ~end_of_sequence_mask[:, i] * loss
+        # print(f"Loss at step {i}: {loss}")
+
+        plot_prob_dist(raw_outputs["position_probs"][0, i, :])
+        plot_prob_dist(raw_outputs["position_probs"][1, i, :])
+        plt.show()
+
+        i += 1
 
     plt.show()
 
