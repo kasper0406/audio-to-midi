@@ -1,4 +1,3 @@
-from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -253,7 +252,7 @@ def main():
         print_every=1,
         key=training_key,
         inference_every=checkpoint_every,
-        model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
+        # model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
     )
 
     checkpoint_manager.wait_until_finished()

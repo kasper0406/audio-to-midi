@@ -21,7 +21,6 @@ from model import OutputSequenceGenerator, model_config
 
 @eqx.filter_jit
 def forward(model, audio_frames, outputs_so_far, key):
-    jax.debug.print("Inferring with input {input}", input=outputs_so_far)
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
     midi_logits, midi_probs, position_logits, position_probs = jax.vmap(
         model, (0, 0, 0)
@@ -190,25 +189,12 @@ def main():
     # TODO: Handle files that are longer than 5 seconds
     # TODO: Support loading a file from a CLI argument
     sample_names = ["piano_BechsteinFelt_48", "piano_BechsteinFelt_70"]
-    # (
-    #     all_frames,
-    #     sample_rate,
-    #     duration_per_frame,
-    # ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
+    (
+        all_frames,
+        sample_rate,
+        duration_per_frame,
+    ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
     # print(f"Frames shape: {all_frames.shape}")
-
-    dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=dataset_dir,
-        batch_size=2,
-        prefetch_count=1,
-        num_workers=1,
-        key=dataset_loader_key,
-    )
-    dataset_loader_iter = iter(dataset_loader)
-    dataset_batch = next(dataset_loader_iter)
-
-    duration_per_frame = dataset_batch["duration_per_frame_in_secs"]
-    all_frames = dataset_batch["audio_frames"]
 
     plot_frequency_domain_audio(duration_per_frame, all_frames[0])
     plot_frequency_domain_audio(duration_per_frame, all_frames[1])
@@ -219,25 +205,27 @@ def main():
 
     # Evaluate losses
 
-    # expected_midi_events = (
-    #     AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
-    #         dataset_dir, sample_names, duration_per_frame
-    #     )
-    # )
+    expected_midi_events = (
+        AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
+            dataset_dir, sample_names, duration_per_frame
+        )
+    )
 
     # # For now just compute the loss of the first example
     i = 0
     end_of_sequence_mask = (inferred_events[:, :, 1] == SEQUENCE_END) | (
         inferred_events[:, :, 1] == BLANK_MIDI_EVENT
     )
+    from train import compute_loss_from_output
+
     while not jnp.all(end_of_sequence_mask[:, i]):
-        # loss = compute_loss_from_output(
-        #     raw_outputs["midi_logits"][:, i, :],
-        #     raw_outputs["position_probs"][:, i, :],
-        #     expected_midi_events[:, i],
-        # )
-        # loss = ~end_of_sequence_mask[:, i] * loss
-        # print(f"Loss at step {i}: {loss}")
+        loss = compute_loss_from_output(
+            raw_outputs["midi_logits"][:, i, :],
+            raw_outputs["position_probs"][:, i, :],
+            expected_midi_events[:, i],
+        )
+        loss = ~end_of_sequence_mask[:, i] * loss
+        print(f"Loss at step {i}: {loss}")
 
         plot_prob_dist(raw_outputs["position_probs"][0, i, :])
         plot_prob_dist(raw_outputs["position_probs"][1, i, :])
