@@ -1,4 +1,3 @@
-from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -37,14 +36,7 @@ def single_position_loss(probs, expected):
 
 
 @eqx.filter_jit
-@eqx.filter_value_and_grad
-def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
-    batch_size = audio_frames.shape[0]
-    batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, _, position_probs = jax.vmap(model, in_axes=(0, 0, 0))(
-        audio_frames, outputs_so_far, batched_keys
-    )
-
+def compute_loss_from_output(midi_logits, position_probs, expected_next_output):
     expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
@@ -57,6 +49,18 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     return jnp.mean(midi_event_loss + 0.2 * position_loss)
+
+
+@eqx.filter_jit
+@eqx.filter_value_and_grad
+def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
+    batch_size = audio_frames.shape[0]
+    batched_keys = jax.random.split(key, num=batch_size)
+    midi_logits, _, _, position_probs = jax.vmap(model, in_axes=(0, 0, 0))(
+        audio_frames, outputs_so_far, batched_keys
+    )
+
+    return compute_loss_from_output(midi_logits, position_probs, expected_next_output)
 
 
 @eqx.filter_jit
@@ -79,7 +83,7 @@ def compute_training_step(
 
 
 def fake_evaluate_model(
-    model, key: jax.random.PRNGKey, dataset_dir: Path, sample_size=4
+    model, key: jax.random.PRNGKey, dataset_dir: Path, sample_size=64
 ):
     """
     TODO: The evaluation is a bit fake right now, as we do not put aside a validation set.
@@ -97,7 +101,7 @@ def fake_evaluate_model(
         sample_rate,
         duration_per_frame,
     ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
-    inferred_events = batch_infer(model, key, frames)
+    inferred_events, raw_outputs = batch_infer(model, key, frames)
 
     actual_events = AudioToMidiDatasetLoader.load_midi_events(dataset_dir, sample_names)
 
@@ -248,7 +252,7 @@ def main():
         print_every=1,
         key=training_key,
         inference_every=checkpoint_every,
-        model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
+        # model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
     )
 
     checkpoint_manager.wait_until_finished()

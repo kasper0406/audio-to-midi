@@ -258,6 +258,23 @@ def perturb_midi_event_positions(
     return midi_events.at[:, 0].set(adjusted_event_positions)
 
 
+@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
+def event_positions_to_frame_time(
+    selected_midi_events: Float[Array, "2"], duration_per_frame_in_secs: Float
+) -> Integer[Array, "2"]:
+    @jax.jit
+    def position_to_frame_index(event: Float[Array, "2"]) -> Integer[Array, "2"]:
+        return jnp.array(
+            [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
+            dtype=jnp.int32,
+        )
+
+    # Express midi event position in terms of frames and convert the array to an integer array
+    return jnp.apply_along_axis(
+        position_to_frame_index, 2, selected_midi_events
+    ).astype(jnp.int16)
+
+
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
     key: jax.random.PRNGKey,
@@ -306,17 +323,8 @@ def generate_batch(
     cutoff_frame = int(10_000 * duration_per_frame_in_secs)
     selected_audio_frames = selected_audio_frames[:, 0:cutoff_frame, :]
 
-    @jax.jit
-    def position_to_frame_index(event: Integer[Array, "2"]) -> Integer[Array, "2"]:
-        return jnp.array(
-            [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
-            dtype=jnp.int32,
-        )
-
-    # Express midi event position in terms of frames
-    # TODO: Consider doing this outside the loop
-    selected_midi_events = jnp.apply_along_axis(
-        position_to_frame_index, 2, selected_midi_events
+    selected_midi_events = event_positions_to_frame_time(
+        selected_midi_events, float(duration_per_frame_in_secs)
     )
 
     midi_event_counts = jnp.count_nonzero(
@@ -408,8 +416,10 @@ class AudioToMidiDatasetLoader:
         self.queue = queue.Queue(prefetch_count + 1)
 
         all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
-        self.all_midi_events = AudioToMidiDatasetLoader.load_midi_events(
-            dataset_dir, all_sample_names
+        self.all_midi_events = (
+            AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
+                dataset_dir, all_sample_names
+            )
         )
 
         all_audio_samples = jnp.array(
@@ -465,7 +475,9 @@ class AudioToMidiDatasetLoader:
         return jnp.transpose(frames, axes=(0, 2, 1)), sample_rate, duration_per_frame
 
     @classmethod
-    def load_midi_events(cls, dataset_dir: Path, sample_names: [str]):
+    def load_midi_events_real_time_positions(
+        cls, dataset_dir: Path, sample_names: [str]
+    ):
         unpadded_midi_events = list(
             map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
         )
@@ -480,6 +492,19 @@ class AudioToMidiDatasetLoader:
             for events in unpadded_midi_events
         ]
         return jnp.stack(padded_midi_events, axis=0)
+
+    @classmethod
+    def load_midi_events_frame_time_positions(
+        cls, dataset_dir: Path, sample_names: [str], duration_per_frame: float
+    ):
+        events_real_time_positions = (
+            AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
+                dataset_dir, sample_names
+            )
+        )
+        return event_positions_to_frame_time(
+            events_real_time_positions, float(duration_per_frame)
+        )
 
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
