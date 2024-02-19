@@ -156,6 +156,11 @@ def time_shift_audio_and_events(
     In order to introduce more diversity in the training data, we will offset the audio signal and media event
     by a randomly picked amount
     """
+    # If as a result of the time-shift a midi event happens just before time 0 (defined by `epsilon` seconds before 0.0),
+    # we will still include the event and reset its position to 0. This is because there's usually a slight delay in the
+    # audio samples, and the FFT will aggregate information over a short time period.
+    # This mainly occours when predicting the start of a new audio file and the audio starts right away (frequent in the training data).
+    epsilon = 0.05  # seconds
     offset_amounts_in_seconds = jnp.float32(
         jax.random.uniform(key, shape=(1,), minval=-2.0, maxval=2.0, dtype=jnp.float32)
     )
@@ -179,6 +184,14 @@ def time_shift_audio_and_events(
 
     positions = jnp.arange(midi_events.shape[0])
     updated_midi_event_times = midi_events[:, 0] + offset_amounts_in_seconds
+    # Special case: Update the timestamps happening `epsilon` seconds before 0.0 to make them appear at
+    #               time 0.0, per the reasoning in the start of the function.
+    updated_midi_event_times = jnp.select(
+        [(updated_midi_event_times < 0.0) & (updated_midi_event_times > -epsilon)],
+        [0.0],
+        updated_midi_event_times,
+    )
+
     end_of_sequence = jnp.where(midi_events[:, 1] == SEQUENCE_END, size=1)[0]
     positions_to_update = (
         (positions > 0)
