@@ -89,9 +89,14 @@ class MidiVocabulary(eqx.Module):
     def voccab_size(cls):
         return 178
 
-    embedding: eqx.nn.Embedding
-    layernorm: eqx.nn.LayerNorm
+    @classmethod
+    def num_velocities(cls):
+        return 10
+
+    node_embedding: eqx.nn.Embedding
     position_embeddings: Float[Array, "seq_len output_shape"]
+    velocity_embedding: eqx.nn.Embedding
+    layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
     def __init__(
@@ -101,11 +106,17 @@ class MidiVocabulary(eqx.Module):
         dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        self.embedding = eqx.nn.Embedding(
-            num_embeddings=self.voccab_size(), embedding_size=output_size, key=key
+        node_key, velocity_key = jax.random.split(key, num=2)
+        self.node_embedding = eqx.nn.Embedding(
+            num_embeddings=self.voccab_size(), embedding_size=output_size, key=node_key
         )
         self.position_embeddings = position_encoding.for_input_frame(
             max_frame_sequence_length, output_size
+        )
+        self.velocity_embedding = eqx.nn.Embedding(
+            num_embeddings=self.num_velocities(),
+            embedding_size=output_size,
+            key=velocity_key,
         )
         self.layernorm = eqx.nn.LayerNorm(shape=output_size)
         self.dropout = eqx.nn.Dropout(dropout_rate)
@@ -113,14 +124,17 @@ class MidiVocabulary(eqx.Module):
     def __call__(
         self,
         midi_pair: Integer[
-            Array, " 2"
-        ],  # A numpy array of length 2. (midi event, position)
+            Array, " 3"
+        ],  # A numpy array of length 3. (midi event, position, velocity)
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        midi_embedding = self.embedding(midi_pair[1])
+        midi_embedding = self.node_embedding(midi_pair[1])
         position_embedding = self.position_embeddings[midi_pair[0], :]
-        combined = self.layernorm(midi_embedding + position_embedding)
+        velocity_embedding = self.velocity_embedding(midi_pair[2])
+        combined = self.layernorm(
+            midi_embedding + position_embedding + velocity_embedding
+        )
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
 
@@ -433,6 +447,7 @@ class Decoder(eqx.Module):
     decoder_layers: List[TransformerLayer]
     midi_decoder_pooling: eqx.nn.Linear
     position_decoder_pooling: eqx.nn.Linear
+    velocity_decoder_pooling: eqx.nn.Linear
 
     def __init__(
         self,
@@ -444,7 +459,12 @@ class Decoder(eqx.Module):
         dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        transformer_key, pooling_key = jax.random.split(key, num=2)
+        (
+            transformer_key,
+            midi_pooling_key,
+            position_pooling_key,
+            velocity_pooling_key,
+        ) = jax.random.split(key, num=4)
 
         self.decoder_layers = []
         layer_keys = jax.random.split(transformer_key, num_layers)
@@ -463,13 +483,19 @@ class Decoder(eqx.Module):
         self.midi_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
             out_features=MidiVocabulary.voccab_size(),
-            key=pooling_key,
+            key=midi_pooling_key,
         )
 
         self.position_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
             out_features=frame_seq_length,
-            key=pooling_key,
+            key=position_pooling_key,
+        )
+
+        self.velocity_decoder_pooling = eqx.nn.Linear(
+            in_features=attention_size,
+            out_features=MidiVocabulary.num_velocities(),
+            key=velocity_pooling_key,
         )
 
     # TODO: Consider a different attention_size for midi and frame embeddings
@@ -488,9 +514,12 @@ class Decoder(eqx.Module):
         Float[Array, "frame_seq_len"],
         Float[Array, "frame_seq_len"],
     ):  # Probability distribution over the midi events
-        transformer_key, midi_decoder_key, position_decoder_key = jax.random.split(
-            key, 3
-        )
+        (
+            transformer_key,
+            midi_decoder_key,
+            position_decoder_key,
+            velocity_decoder_key,
+        ) = jax.random.split(key, num=4)
 
         for layer in self.decoder_layers:
             transformer_key, layer_key = jax.random.split(transformer_key, 2)
@@ -519,7 +548,19 @@ class Decoder(eqx.Module):
         )
         position_probabilities = jax.nn.softmax(position_logits)
 
-        return midi_logits, midi_probabilities, position_logits, position_probabilities
+        velocity_logits = self.velocity_decoder_pooling(
+            first_token_last_layer, key=velocity_decoder_key
+        )
+        velocity_probabilities = jax.nn.softmax(velocity_logits)
+
+        return (
+            midi_logits,
+            midi_probabilities,
+            position_logits,
+            position_probabilities,
+            velocity_logits,
+            velocity_probabilities,
+        )
 
 
 class OutputSequenceGenerator(eqx.Module):
@@ -573,7 +614,7 @@ class OutputSequenceGenerator(eqx.Module):
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
         generated_output: Integer[
-            Array, "midi_seq_len 2"  # Pair of (input_frame_position, midi_event)
+            Array, "midi_seq_len 3"  # Pair of (input_frame_position, midi_event)
         ],  # Index of midi event in the vocabulary
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
@@ -597,7 +638,7 @@ class OutputSequenceGenerator(eqx.Module):
         # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
         mask = jnp.asarray(generated_output[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
-        midi_logits, midi_probs, position_logits, position_probs = self.decoder(
+        midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = self.decoder(
             decoder_output=midi_embeddings_so_far,
             encoder_output=encoder_output,
             mask=mask,
@@ -605,4 +646,4 @@ class OutputSequenceGenerator(eqx.Module):
             key=decoder_key,
         )
 
-        return midi_logits, midi_probs, position_logits, position_probs
+        return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
