@@ -11,10 +11,11 @@ from jaxtyping import Array, Float
 
 from audio_to_midi_dataset import (
     BLANK_MIDI_EVENT,
+    BLANK_VELOCITY,
     SEQUENCE_END,
     SEQUENCE_START,
     AudioToMidiDatasetLoader,
-    plot_frequency_domain_audio,
+    plot_frequency_domain_audio
 )
 from model import OutputSequenceGenerator, model_config
 
@@ -22,14 +23,21 @@ from model import OutputSequenceGenerator, model_config
 @eqx.filter_jit
 def forward(model, audio_frames, outputs_so_far, key):
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
-    midi_logits, midi_probs, position_logits, position_probs = jax.vmap(
+    midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = jax.vmap(
         model, (0, 0, 0)
     )(audio_frames, outputs_so_far, inference_keys)
-    return midi_logits, midi_probs, position_logits, position_probs
+    return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
 
 
 def _update_raw_outputs(
-    current, batch_size, midi_logits, midi_probs, position_logits, position_probs
+    current,
+    batch_size,
+    midi_logits,
+    midi_probs,
+    position_logits,
+    position_probs,
+    velocity_logits,
+    velocity_probs,
 ):
     midi_logits = jnp.reshape(midi_logits, (batch_size, 1, midi_logits.shape[1]))
     midi_probs = jnp.reshape(midi_probs, (batch_size, 1, midi_probs.shape[1]))
@@ -39,6 +47,12 @@ def _update_raw_outputs(
     position_probs = jnp.reshape(
         position_probs, (batch_size, 1, position_probs.shape[1])
     )
+    velocity_logits = jnp.reshape(
+        velocity_logits, (batch_size, 1, velocity_logits.shape[1])
+    )
+    velocity_probs = jnp.reshape(
+        velocity_probs, (batch_size, 1, velocity_probs.shape[1])
+    )
 
     if current is None:
         return {
@@ -46,6 +60,8 @@ def _update_raw_outputs(
             "midi_probs": midi_probs,
             "position_logits": position_logits,
             "position_probs": position_probs,
+            "velocity_logits": velocity_logits,
+            "velocity_probs": velocity_probs,
         }
 
     return {
@@ -56,6 +72,12 @@ def _update_raw_outputs(
         ),
         "position_probs": jnp.concatenate(
             [current["position_probs"], position_probs], axis=1
+        ),
+        "velocity_logits": jnp.concatenate(
+            [current["velocity_logits"], velocity_logits], axis=1
+        ),
+        "velocity_probs": jnp.concatenate(
+            [current["velocity_probs"], velocity_probs], axis=1
         ),
     }
 
@@ -68,7 +90,8 @@ def batch_infer(
 ):
     batch_size = frames.shape[0]
     seen_events = jnp.tile(
-        jnp.array([0, SEQUENCE_START], dtype=jnp.int16), (batch_size, 1, 1)
+        jnp.array([0, SEQUENCE_START, BLANK_VELOCITY], dtype=jnp.int16),
+        (batch_size, 1, 1),
     )
 
     i = 0
@@ -92,7 +115,14 @@ def batch_infer(
         #     "Padded seen events {padded_seen_events}",
         #     padded_seen_events=padded_seen_events,
         # )
-        midi_logits, midi_probs, position_logits, position_probs = forward(
+        (
+            midi_logits,
+            midi_probs,
+            position_logits,
+            position_probs,
+            velocity_logits,
+            velocity_probs,
+        ) = forward(
             model,
             frames,
             seen_events,
@@ -116,12 +146,20 @@ def batch_infer(
             positions,
         )
 
+        velocities = jnp.select(
+            [end_of_sequence_mask],
+            [jnp.zeros((batch_size,), jnp.int16)],
+            jnp.argmax(velocity_probs, axis=1),
+        )
+
         # Combine the predicted positions with their corresponding midi events
-        predicted_events = jnp.transpose(jnp.vstack([positions, midi_events]))
+        predicted_events = jnp.transpose(
+            jnp.vstack([positions, midi_events, velocities])
+        )
 
         # Update seen events with the new predictions
         seen_events = jnp.concatenate(
-            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 2))], axis=1
+            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 3))], axis=1
         )
         # print(f"Seen events at step {i}", seen_events)
 
@@ -133,6 +171,8 @@ def batch_infer(
             midi_probs,
             position_logits,
             position_probs,
+            velocity_logits,
+            velocity_probs,
         )
 
         end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
@@ -143,16 +183,16 @@ def batch_infer(
     return seen_events, raw_outputs
 
 
-def plot_prob_dist(dist: Float[Array, "len"]):
+def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()
 
     X = jnp.arange(dist.shape[0])
     ax1.plot(X, dist)
 
     ax1.set(
-        xlabel="Position",
+        xlabel=quantity,
         ylabel="Probability",
-        title="Probability distribution for position",
+        title=f"Probability distribution for {quantity}",
     )
 
 
@@ -222,13 +262,14 @@ def main():
         loss = compute_loss_from_output(
             raw_outputs["midi_logits"][:, i, :],
             raw_outputs["position_probs"][:, i, :],
+            raw_outputs["velocity_probs"][:, i, :],
             expected_midi_events[:, i],
         )
         loss = ~end_of_sequence_mask[:, i] * loss
         print(f"Loss at step {i}: {loss}")
 
-        plot_prob_dist(raw_outputs["position_probs"][0, i, :])
-        plot_prob_dist(raw_outputs["position_probs"][1, i, :])
+        plot_prob_dist("position", raw_outputs["position_probs"][0, i, :])
+        plot_prob_dist("velocity", raw_outputs["velocity_probs"][0, i, :])
         plt.show()
 
         i += 1

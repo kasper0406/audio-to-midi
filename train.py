@@ -1,3 +1,4 @@
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -15,14 +16,13 @@ from model import OutputSequenceGenerator, model_config
 
 
 @eqx.filter_jit
-def single_position_loss(probs, expected):
+def continous_probability_loss(probs, expected, variance):
     """
-    Some kind of loss function that will promote having approximately correct positions
+    Some kind of loss function that will promote having approximately correct positions / velocities
 
     Assumption: The value of the integer `expected` should be in the range 0 <= expected <= probs.shape[0]!
     """
     epsilon = 0.0000001
-    variance = 3.0
     x = jnp.arange(probs.shape[0])
     expectation = -0.5 * jnp.square((x - expected) / variance)
     expectation = jnp.maximum(
@@ -36,19 +36,26 @@ def single_position_loss(probs, expected):
 
 
 @eqx.filter_jit
-def compute_loss_from_output(midi_logits, position_probs, expected_next_output):
+def compute_loss_from_output(
+    midi_logits, position_probs, velocity_probs, expected_next_output
+):
     expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
     )
     # TODO: Consider if this can be represented in some other way
     expected_next_position = expected_next_output[:, 0]
-    position_loss = jax.vmap(single_position_loss, (0, 0))(
+    position_loss = jax.vmap(partial(continous_probability_loss, variance=3.0), (0, 0))(
         position_probs, expected_next_position
     )
 
+    expected_next_velocity = expected_next_output[:, 2]
+    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=1.0), (0, 0))(
+        velocity_probs, expected_next_velocity
+    )
+
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + 0.2 * position_loss)
+    return jnp.mean(midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss)
 
 
 @eqx.filter_jit
@@ -56,11 +63,13 @@ def compute_loss_from_output(midi_logits, position_probs, expected_next_output):
 def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, _, position_probs = jax.vmap(model, in_axes=(0, 0, 0))(
-        audio_frames, outputs_so_far, batched_keys
-    )
+    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
+        model, in_axes=(0, 0, 0)
+    )(audio_frames, outputs_so_far, batched_keys)
 
-    return compute_loss_from_output(midi_logits, position_probs, expected_next_output)
+    return compute_loss_from_output(
+        midi_logits, position_probs, velocity_probs, expected_next_output
+    )
 
 
 @eqx.filter_jit
@@ -116,6 +125,7 @@ def fake_evaluate_model(
     difference = jnp.abs(
         inferred_events[:, :min_dim, :] - actual_events[:, :min_dim, :]
     )
+    # TODO: Include velocity loss here if it turns out to be helpful
     position_penalty = jnp.sum(difference[:, :, 0] > 5) + dim_penalty
     midi_penalty = jnp.sum(difference[:, :, 1] > 1) + dim_penalty
     print(
@@ -186,14 +196,14 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 4 * num_devices
+    batch_size = 8 * num_devices
     learning_rate = 5 * 1e-4
     num_steps = 1000000
 
     checkpoint_every = 1000
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 10
-    dataset_num_workers = 2
+    dataset_prefetch_count = 30
+    dataset_num_workers = 5
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)

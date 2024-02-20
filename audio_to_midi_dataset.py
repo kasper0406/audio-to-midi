@@ -112,11 +112,13 @@ MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1
 SEQUENCE_END = 0
 BLANK_MIDI_EVENT = -1
+BLANK_VELOCITY = 0
+NUM_VELOCITY_CATEGORIES = 10
 
 
 def events_from_sample(
     dataset_dir: str, sample: str
-) -> Float[Array, "max_number_of_events 2"]:
+) -> Float[Array, "max_number_of_events 3"]:
     """
     Returns a numpy array with tuples of (timestamp in seconds, midi event id)
     """
@@ -134,28 +136,39 @@ def events_from_sample(
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
             if attack_time < MAX_EVENT_TIMESTAMP:
-                events.append((attack_time, 2 + 88 + (key - 21)))  # Attack
+                events.append((attack_time, 2 + 88 + (key - 21), velocity))  # Attack
             if attack_time + duration < MAX_EVENT_TIMESTAMP:
-                events.append((attack_time + duration, 2 + (key - 21)))  # Release
+                events.append(
+                    (attack_time + duration, 2 + (key - 21), BLANK_VELOCITY)
+                )  # Release
 
             max_event_timestamp = max(max_event_timestamp, attack_time + duration)
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
-    return jnp.array([(0.0, SEQUENCE_START)] + sorted(events) + [(0.0, SEQUENCE_END)])
+    return jnp.array(
+        [(0.0, SEQUENCE_START, BLANK_VELOCITY)]
+        + sorted(events)
+        + [(0.0, SEQUENCE_END, BLANK_VELOCITY)]
+    )
 
 
 @partial(jax.jit, static_argnames=["sample_rate"])
 def time_shift_audio_and_events(
     sample_rate: float,
     samples: Float[Array, "num_samples"],
-    midi_events: Float[Array, "num_events 2"],
+    midi_events: Float[Array, "num_events 3"],
     key: jax.random.PRNGKey,
 ):
     """
     In order to introduce more diversity in the training data, we will offset the audio signal and media event
     by a randomly picked amount
     """
+    # If as a result of the time-shift a midi event happens just before time 0 (defined by `epsilon` seconds before 0.0),
+    # we will still include the event and reset its position to 0. This is because there's usually a slight delay in the
+    # audio samples, and the FFT will aggregate information over a short time period.
+    # This mainly occours when predicting the start of a new audio file and the audio starts right away (frequent in the training data).
+    epsilon = 0.05  # seconds
     offset_amounts_in_seconds = jnp.float32(
         jax.random.uniform(key, shape=(1,), minval=-2.0, maxval=2.0, dtype=jnp.float32)
     )
@@ -179,6 +192,14 @@ def time_shift_audio_and_events(
 
     positions = jnp.arange(midi_events.shape[0])
     updated_midi_event_times = midi_events[:, 0] + offset_amounts_in_seconds
+    # Special case: Update the timestamps happening `epsilon` seconds before 0.0 to make them appear at
+    #               time 0.0, per the reasoning in the start of the function.
+    updated_midi_event_times = jnp.select(
+        [(updated_midi_event_times < 0.0) & (updated_midi_event_times > -epsilon)],
+        [0.0],
+        updated_midi_event_times,
+    )
+
     end_of_sequence = jnp.where(midi_events[:, 1] == SEQUENCE_END, size=1)[0]
     positions_to_update = (
         (positions > 0)
@@ -200,13 +221,17 @@ def time_shift_audio_and_events(
     # Construct a blank input that will contain start of sequence, end of sequence and padding
     # Values from this array will be selected outside of the mask
     blank_input = jnp.tile(
-        jnp.array([0.0, BLANK_MIDI_EVENT]), (midi_events.shape[0], 1)
+        jnp.array([0.0, BLANK_MIDI_EVENT, BLANK_VELOCITY]), (midi_events.shape[0], 1)
     )
-    blank_input = blank_input.at[0, :].set(jnp.array([0.0, SEQUENCE_END]))
+    blank_input = blank_input.at[0, :].set(
+        jnp.array([0.0, SEQUENCE_END, BLANK_VELOCITY])
+    )
     blank_input = jnp.roll(
         blank_input, num_to_keep + 1, axis=0
     )  # +1 due to start of sequence
-    blank_input = blank_input.at[0, :].set(jnp.array([0.0, SEQUENCE_START]))
+    blank_input = blank_input.at[0, :].set(
+        jnp.array([0.0, SEQUENCE_START, BLANK_VELOCITY])
+    )
 
     # jax.debug.print("Blank input = {blank_input}", blank_input=blank_input)
 
@@ -217,12 +242,13 @@ def time_shift_audio_and_events(
             [updated_midi_event_times, blank_input[:, 0]],
         )
     )
-    midi_events = midi_events.at[:, 1].set(
-        jnp.select(
-            [positions_to_update, positions >= 0],
-            [midi_events[:, 1], blank_input[:, 1]],
+    for i in range(1, 3):  # Loop over position, midi event, and velocity
+        midi_events = midi_events.at[:, i].set(
+            jnp.select(
+                [positions_to_update, positions >= 0],
+                [midi_events[:, i], blank_input[:, i]],
+            )
         )
-    )
 
     # jax.debug.print("Updated events = {updated_events}", updated_events=midi_events)
 
@@ -232,7 +258,7 @@ def time_shift_audio_and_events(
 @partial(jax.jit, static_argnames=["duration_per_frame"])
 def perturb_midi_event_positions(
     key: jax.random.PRNGKey,
-    midi_events: Float[Array, "num_events 2"],
+    midi_events: Float[Array, "num_events 3"],
     duration_per_frame: float,
 ):
     """
@@ -260,18 +286,28 @@ def perturb_midi_event_positions(
 
 @partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
 def event_positions_to_frame_time(
-    selected_midi_events: Float[Array, "2"], duration_per_frame_in_secs: Float
-) -> Integer[Array, "2"]:
+    selected_midi_events: Float[Array, "3"], duration_per_frame_in_secs: Float
+) -> Integer[Array, "3"]:
     @jax.jit
-    def position_to_frame_index(event: Float[Array, "2"]) -> Integer[Array, "2"]:
+    def convert_position_and_velocity(event: Float[Array, "3"]) -> Integer[Array, "3"]:
+        """
+        Positions and velocities are represented as floats in the dataset:
+         - position: The number of seconds since the beginning as a float
+         - velocity: A float between 0.0 and 1.0 indicating the velocity of the event
+        We convert both of them to integers so they can be understood by the model.
+        """
+        position = (event[0] / duration_per_frame_in_secs).astype(jnp.int16)
+        velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
+            jnp.int16
+        )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
         return jnp.array(
-            [jnp.int32(event[0] / duration_per_frame_in_secs), event[1]],
-            dtype=jnp.int32,
+            [position, event[1], velocity],
+            dtype=jnp.int16,
         )
 
     # Express midi event position in terms of frames and convert the array to an integer array
     return jnp.apply_along_axis(
-        position_to_frame_index, 2, selected_midi_events
+        convert_position_and_velocity, 2, selected_midi_events
     ).astype(jnp.int16)
 
 
@@ -348,7 +384,7 @@ def generate_batch(
     event_indices = jnp.arange(selected_midi_events.shape[1])
     seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
     seen_events = selected_midi_events.at[~seen_event_mask].set(
-        jnp.array([0, BLANK_MIDI_EVENT])
+        jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY])
     )
 
     # We only perturb the seen events, and leave the next event to predict non-perturbed
@@ -482,16 +518,23 @@ class AudioToMidiDatasetLoader:
             map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
         )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
+        padding = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[
+            None, :
+        ]
         padded_midi_events = [
-            jnp.pad(
-                events,
-                ((0, max_events_length - events.shape[0])),
-                "constant",
-                constant_values=(0, BLANK_MIDI_EVENT),
+            jnp.concatenate(
+                [
+                    events,
+                    jnp.repeat(
+                        padding, repeats=max_events_length - len(events), axis=0
+                    ),
+                ],
+                axis=0,
             )
             for events in unpadded_midi_events
         ]
-        return jnp.stack(padded_midi_events, axis=0)
+        stacked_events = jnp.stack(padded_midi_events, axis=0)
+        return stacked_events
 
     @classmethod
     def load_midi_events_frame_time_positions(
