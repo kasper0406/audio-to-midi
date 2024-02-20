@@ -55,7 +55,7 @@ def compute_loss_from_output(
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return jnp.mean(midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss)
+    return midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss
 
 
 @eqx.filter_jit
@@ -67,9 +67,9 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
         model, in_axes=(0, 0, 0)
     )(audio_frames, outputs_so_far, batched_keys)
 
-    return compute_loss_from_output(
+    return jnp.mean(compute_loss_from_output(
         midi_logits, position_probs, velocity_probs, expected_next_output
-    )
+    ))
 
 
 @eqx.filter_jit
