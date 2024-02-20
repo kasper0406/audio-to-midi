@@ -31,7 +31,6 @@ def forward(model, audio_frames, outputs_so_far, key):
 
 def _update_raw_outputs(
     current,
-    batch_size,
     midi_logits,
     midi_probs,
     position_logits,
@@ -39,20 +38,12 @@ def _update_raw_outputs(
     velocity_logits,
     velocity_probs,
 ):
-    midi_logits = jnp.reshape(midi_logits, (batch_size, 1, midi_logits.shape[1]))
-    midi_probs = jnp.reshape(midi_probs, (batch_size, 1, midi_probs.shape[1]))
-    position_logits = jnp.reshape(
-        position_logits, (batch_size, 1, position_logits.shape[1])
-    )
-    position_probs = jnp.reshape(
-        position_probs, (batch_size, 1, position_probs.shape[1])
-    )
-    velocity_logits = jnp.reshape(
-        velocity_logits, (batch_size, 1, velocity_logits.shape[1])
-    )
-    velocity_probs = jnp.reshape(
-        velocity_probs, (batch_size, 1, velocity_probs.shape[1])
-    )
+    midi_logits = midi_logits[:, None, :]
+    midi_probs = midi_probs[:, None, :]
+    position_logits = position_logits[:, None, :]
+    position_probs = position_probs[:, None, :]
+    velocity_logits = velocity_logits[:, None, :]
+    velocity_probs = velocity_probs[:, None, :]
 
     if current is None:
         return {
@@ -166,7 +157,6 @@ def batch_infer(
         # Update logits and probs
         raw_outputs = _update_raw_outputs(
             raw_outputs,
-            batch_size,
             midi_logits,
             midi_probs,
             position_logits,
@@ -263,7 +253,7 @@ def main():
             raw_outputs["midi_logits"][:, i, :],
             raw_outputs["position_probs"][:, i, :],
             raw_outputs["velocity_probs"][:, i, :],
-            expected_midi_events[:, i],
+            expected_midi_events[:, i + 1],
         )
         loss = ~end_of_sequence_mask[:, i] * loss
         print(f"Loss at step {i}: {loss}")

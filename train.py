@@ -196,17 +196,19 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 8 * num_devices
+    batch_size = 1024 * num_devices
     learning_rate = 5 * 1e-4
     num_steps = 1000000
 
-    checkpoint_every = 1000
+    checkpoint_every = 20
     checkpoints_to_keep = 3
     dataset_prefetch_count = 30
-    dataset_num_workers = 5
+    dataset_num_workers = 2
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
+
+    print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
 
     # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
