@@ -462,6 +462,7 @@ class AudioToMidiDatasetLoader:
             parallel_audio_reader.load_audio_files(
                 self.SAMPLE_RATE,
                 [dataset_dir / f"{name}.aac" for name in all_sample_names],
+                MAX_EVENT_TIMESTAMP * 1000
             )
         )
         self.all_audio_samples = jax.vmap(normalize_audio)(all_audio_samples)
@@ -494,6 +495,7 @@ class AudioToMidiDatasetLoader:
             parallel_audio_reader.load_audio_files(
                 AudioToMidiDatasetLoader.SAMPLE_RATE,
                 [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
+                MAX_EVENT_TIMESTAMP * 1000
             )
         )
         normalized_audio = jax.vmap(normalize_audio)(audio_samples)
@@ -658,7 +660,7 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,
