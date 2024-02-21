@@ -19,14 +19,25 @@ import parallel_audio_reader
 
 
 @jax.jit
+def normalize_audio(
+    samples: Float[Array, "num_samples"],
+) -> Float[Array, "num_samples"]:
+    # sample_array = jnp.array(samples).T.astype(jnp.float16)
+    # normalized_samples = sample_array / jnp.max(jnp.abs(sample_array))
+    jax.debug.print("Max value in sample: {max}", max=jnp.max(jnp.abs(samples)))
+    return samples
+
+
+@jax.jit
 def perturb_audio_sample(
     samples, key: jax.random.PRNGKey
 ) -> (int, NDArray[jnp.float32]):
     """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
     1. Add gausian noise
     """
-    sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
-    gaussian_noise = sigma * jax.random.normal(key, samples.shape)
+    key1, key2 = jax.random.split(key, num=2)
+    sigma = jax.random.uniform(key1) / 100  # Randomize the level of noise
+    gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
     return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
 
 
@@ -59,17 +70,15 @@ def fft_audio(
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
-    compression_factor = 200
+    compression_factor = 255
     compressed_amplitudes = (
         jnp.sign(transposed_amplitudes)
         * jnp.log1p(compression_factor * jnp.abs(transposed_amplitudes))
         / jnp.log1p(compression_factor)
     )
 
-    # Normalize the coefficients to give them 0 mean and unit variance
-    standardized_amplitudes = (
-        compressed_amplitudes - jnp.mean(compressed_amplitudes)
-    ) / jnp.var(compressed_amplitudes)
+    # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
+    standardized_amplitudes = compressed_amplitudes - (4/3)
 
     return standardized_amplitudes
 
@@ -430,16 +439,11 @@ class AudioToMidiDatasetLoader:
             )
         )
         
-        all_audio_samples = jnp.array(
-            parallel_audio_reader.load_audio_files(
-                self.SAMPLE_RATE,
-                [dataset_dir / f"{name}.aac" for name in all_sample_names],
-                MAX_EVENT_TIMESTAMP * 1000
-            )
+        self.all_audio_samples = parallel_audio_reader.load_audio_files(
+            self.SAMPLE_RATE,
+            [dataset_dir / f"{name}.aac" for name in all_sample_names],
+            MAX_EVENT_TIMESTAMP * 1000
         )
-        # We do not want to store all_audio_samples on the processing device as it takes a lot of memory!
-        # De-allocate it and move it to the host
-        self.all_audio_samples = np.array(all_audio_samples, dtype=np.float16)
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
@@ -465,12 +469,10 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_audio_frames(cls, dataset_dir: Path, sample_names: [str]):
-        audio_samples = jnp.array(
-            parallel_audio_reader.load_audio_files(
-                AudioToMidiDatasetLoader.SAMPLE_RATE,
-                [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
-                MAX_EVENT_TIMESTAMP * 1000
-            )
+        audio_samples = parallel_audio_reader.load_audio_files(
+            AudioToMidiDatasetLoader.SAMPLE_RATE,
+            [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
+            MAX_EVENT_TIMESTAMP * 1000
         )
 
         # TODO(knielsen): Consider factoring this out to some shared place
@@ -633,7 +635,7 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
         batch_size=64,
         prefetch_count=1,
         num_workers=1,
