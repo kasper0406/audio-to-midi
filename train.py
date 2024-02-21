@@ -192,15 +192,15 @@ def train(
 
 def main():
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
 
     num_devices = len(jax.devices())
 
-    batch_size = 1024 * num_devices
+    batch_size = 1 * num_devices
     learning_rate = 5 * 1e-4
     num_steps = 1000000
 
-    checkpoint_every = 20
+    checkpoint_every = 200
     checkpoints_to_keep = 3
     dataset_prefetch_count = 30
     dataset_num_workers = 2
