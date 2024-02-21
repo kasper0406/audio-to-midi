@@ -196,7 +196,7 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 1 * num_devices
+    batch_size = 64 * num_devices
     learning_rate = 5 * 1e-4
     num_steps = 1000000
 

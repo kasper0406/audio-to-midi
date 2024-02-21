@@ -19,15 +19,6 @@ import parallel_audio_reader
 
 
 @jax.jit
-def normalize_audio(
-    samples: Float[Array, "num_samples"],
-) -> Float[Array, "num_samples"]:
-    sample_array = jnp.array(samples).T.astype(jnp.float16)
-    normalized_samples = sample_array / jnp.max(jnp.abs(sample_array))
-    return normalized_samples
-
-
-@jax.jit
 def perturb_audio_sample(
     samples, key: jax.random.PRNGKey
 ) -> (int, NDArray[jnp.float32]):
@@ -446,11 +437,9 @@ class AudioToMidiDatasetLoader:
                 MAX_EVENT_TIMESTAMP * 1000
             )
         )
-        self.all_audio_samples = jax.vmap(normalize_audio)(all_audio_samples)
         # We do not want to store all_audio_samples on the processing device as it takes a lot of memory!
         # De-allocate it and move it to the host
-        self.all_audio_samples = np.array(self.all_audio_samples, dtype=np.float16)
-        print(f"All audio samples dtype: {self.all_audio_samples.dtype}")
+        self.all_audio_samples = np.array(all_audio_samples, dtype=np.float16)
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
@@ -483,13 +472,12 @@ class AudioToMidiDatasetLoader:
                 MAX_EVENT_TIMESTAMP * 1000
             )
         )
-        normalized_audio = jax.vmap(normalize_audio)(audio_samples)
 
         # TODO(knielsen): Consider factoring this out to some shared place
         desired_fft_duration = 20 # ms
         samples_per_fft = next_power_of_2(int(AudioToMidiDatasetLoader.SAMPLE_RATE * (desired_fft_duration / 1000)))
         duration_per_frame = samples_per_fft / AudioToMidiDatasetLoader.SAMPLE_RATE
-        frames = jax.vmap(fft_audio, (0, None))(normalized_audio, samples_per_fft)
+        frames = jax.vmap(fft_audio, (0, None))(audio_samples, samples_per_fft)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame)
@@ -645,8 +633,8 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
-        batch_size=1,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v0"),
+        batch_size=64,
         prefetch_count=1,
         num_workers=1,
         key=key,

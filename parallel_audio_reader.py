@@ -22,7 +22,9 @@ def load_audio(file: str, sample_rate, duration: 5000) -> Float[Array, "num_samp
         silence = AudioSegment.silent(duration=padding_needed)
         audio = audio + silence
 
-    left_channel_samples = audio.split_to_mono()[0].get_array_of_samples()
+    samples = audio.split_to_mono()[0].get_array_of_samples()
+    left_channel_samples = np.array(samples).T.astype(np.float16)
+    left_channel_samples /= np.iinfo(samples.typecode).max
     return left_channel_samples
 
 
