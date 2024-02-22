@@ -19,16 +19,6 @@ import parallel_audio_reader
 
 
 @jax.jit
-def normalize_audio(
-    samples: Float[Array, "num_samples"],
-) -> Float[Array, "num_samples"]:
-    # sample_array = jnp.array(samples).T.astype(jnp.float16)
-    # normalized_samples = sample_array / jnp.max(jnp.abs(sample_array))
-    jax.debug.print("Max value in sample: {max}", max=jnp.max(jnp.abs(samples)))
-    return samples
-
-
-@jax.jit
 def perturb_audio_sample(
     samples, key: jax.random.PRNGKey
 ) -> (int, NDArray[jnp.float32]):
