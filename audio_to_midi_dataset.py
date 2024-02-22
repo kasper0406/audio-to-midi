@@ -3,6 +3,7 @@ import glob
 import queue
 import random
 import threading
+import numpy as np
 from functools import partial
 from pathlib import Path
 
@@ -18,23 +19,15 @@ import parallel_audio_reader
 
 
 @jax.jit
-def normalize_audio(
-    samples: Float[Array, "num_samples"],
-) -> Float[Array, "num_samples"]:
-    sample_array = jnp.array(samples).T.astype(jnp.float32)
-    normalized_samples = sample_array / jnp.max(jnp.abs(sample_array))
-    return normalized_samples
-
-
-@jax.jit
 def perturb_audio_sample(
     samples, key: jax.random.PRNGKey
 ) -> (int, NDArray[jnp.float32]):
     """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
     1. Add gausian noise
     """
-    sigma = jax.random.uniform(key) / 10  # Randomize the level of noise
-    gaussian_noise = sigma * jax.random.normal(key, samples.shape)
+    key1, key2 = jax.random.split(key, num=2)
+    sigma = jax.random.uniform(key1) / 100  # Randomize the level of noise
+    gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
     return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
 
 
@@ -42,10 +35,10 @@ def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
 
-@partial(jax.jit, static_argnames=["sample_rate", "desired_fft_duration"])
+@partial(jax.jit, static_argnames=["samples_per_fft"])
 def fft_audio(
-    sample_rate: int, samples: NDArray[jnp.float32], desired_fft_duration=20
-) -> (Float, NDArray[jnp.float32]):
+    samples: NDArray[jnp.float32], samples_per_fft: int
+) -> NDArray[jnp.float32]:
     """Computes the fft of the audio samples
     Returns a tuple of the frame duration in seconds, and the complex FFT components
 
@@ -53,7 +46,8 @@ def fft_audio(
         fft_duration: The duration in ms to compute the fft for. It will be rounded to the next
                       power of 2 samples
     """
-    samples_per_fft = next_power_of_2(int(sample_rate * (desired_fft_duration / 1000)))
+    if samples_per_fft != next_power_of_2(samples_per_fft):
+        raise "samples_per_fft must be a power of 2"
 
     num_padding_symbols = samples_per_fft - (samples.shape[0] % samples_per_fft)
     if num_padding_symbols == samples_per_fft:
@@ -66,45 +60,17 @@ def fft_audio(
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
-    compression_factor = 200
+    compression_factor = 255
     compressed_amplitudes = (
         jnp.sign(transposed_amplitudes)
         * jnp.log1p(compression_factor * jnp.abs(transposed_amplitudes))
         / jnp.log1p(compression_factor)
     )
 
-    # Normalize the coefficients to give them 0 mean and unit variance
-    standardized_amplitudes = (
-        compressed_amplitudes - jnp.mean(compressed_amplitudes)
-    ) / jnp.var(compressed_amplitudes)
+    # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
+    standardized_amplitudes = compressed_amplitudes - (4/3)
 
-    return jnp.float32(samples_per_fft / sample_rate), standardized_amplitudes
-
-
-@partial(jax.jit, static_argnames=["sample_rate", "fixed_duration_in_seconds"])
-def pad_or_trim(
-    sample_rate: float,
-    samples: Float[Array, "num_samples"],
-    fixed_duration_in_seconds: float = 5,
-):
-    """Trim the audio to exactly 5 seconds in duration. Padding with empty audio if shorter, truncating if longer"""
-    desired_sample_count = int(sample_rate * fixed_duration_in_seconds)
-    return jnp.pad(samples, (0, max(0, desired_sample_count - samples.shape[0])))[
-        0:desired_sample_count
-    ]
-
-
-@partial(jax.jit, static_argnames=["sample_rate"])
-def audio_features_from_sample(
-    sample_rate: float, samples: Float[Array, "num_samples"]
-):
-    duration_per_frame, frequency_domain = fft_audio(sample_rate, samples)
-
-    return (
-        frequency_domain,
-        sample_rate,
-        duration_per_frame,
-    )
+    return standardized_amplitudes
 
 
 # TODO: Clean this up
@@ -311,6 +277,7 @@ def event_positions_to_frame_time(
     ).astype(jnp.int16)
 
 
+@partial(jax.jit, static_argnames=["shard", "batch_size", "sample_rate"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
     key: jax.random.PRNGKey,
@@ -340,8 +307,6 @@ def generate_batch(
     selected_midi_events = all_midi_events[indexes]
 
     # TODO: Re-structure these transformations in a nicer way
-    selected_samples = jax.vmap(pad_or_trim, (None, 0))(sample_rate, selected_samples)
-
     timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
     selected_samples, selected_midi_events = jax.vmap(
         time_shift_audio_and_events, (None, 0, 0, 0)
@@ -351,9 +316,11 @@ def generate_batch(
         selected_samples, sample_keys
     )
 
-    selected_audio_frames, _, duration_per_frame_in_secs = jax.vmap(
-        audio_features_from_sample, in_axes=(None, 0), out_axes=(0, None, None)
-    )(sample_rate, perturbed_samples)
+    desired_fft_duration = 20 # ms
+    samples_per_fft = next_power_of_2(int(sample_rate * (desired_fft_duration / 1000)))
+    duration_per_frame_in_secs = samples_per_fft / sample_rate
+
+    selected_audio_frames = jax.vmap(fft_audio, in_axes=(0, None))(perturbed_samples, samples_per_fft)
 
     # Select only the lowest 10_000 Hz frequencies
     cutoff_frame = int(10_000 * duration_per_frame_in_secs)
@@ -383,8 +350,12 @@ def generate_batch(
 
     event_indices = jnp.arange(selected_midi_events.shape[1])
     seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
-    seen_events = selected_midi_events.at[~seen_event_mask].set(
-        jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY])
+    seen_event_mask = jnp.repeat(seen_event_mask[:, :, None], repeats=3, axis=2) # Repeat for every (position, event, velocity) pair
+    blank_events = jnp.repeat(jnp.repeat(jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[None, :], selected_midi_events.shape[1], axis=0)[None, ...], batch_size, axis=0)
+    seen_events = jnp.select(
+        [~seen_event_mask],
+        [blank_events],
+        selected_midi_events
     )
 
     # We only perturb the seen events, and leave the next event to predict non-perturbed
@@ -457,15 +428,12 @@ class AudioToMidiDatasetLoader:
                 dataset_dir, all_sample_names
             )
         )
-
-        all_audio_samples = jnp.array(
-            parallel_audio_reader.load_audio_files(
-                self.SAMPLE_RATE,
-                [dataset_dir / f"{name}.aac" for name in all_sample_names],
-                MAX_EVENT_TIMESTAMP * 1000
-            )
+        
+        self.all_audio_samples = parallel_audio_reader.load_audio_files(
+            self.SAMPLE_RATE,
+            [dataset_dir / f"{name}.aac" for name in all_sample_names],
+            MAX_EVENT_TIMESTAMP * 1000
         )
-        self.all_audio_samples = jax.vmap(normalize_audio)(all_audio_samples)
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
@@ -491,26 +459,23 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_audio_frames(cls, dataset_dir: Path, sample_names: [str]):
-        audio_samples = jnp.array(
-            parallel_audio_reader.load_audio_files(
-                AudioToMidiDatasetLoader.SAMPLE_RATE,
-                [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
-                MAX_EVENT_TIMESTAMP * 1000
-            )
+        audio_samples = parallel_audio_reader.load_audio_files(
+            AudioToMidiDatasetLoader.SAMPLE_RATE,
+            [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
+            MAX_EVENT_TIMESTAMP * 1000
         )
-        normalized_audio = jax.vmap(normalize_audio)(audio_samples)
-        padded_or_trimmed = jax.vmap(pad_or_trim, (None, 0))(
-            AudioToMidiDatasetLoader.SAMPLE_RATE, normalized_audio
-        )
-        frames, sample_rate, duration_per_frame = jax.vmap(
-            audio_features_from_sample, (None, 0), (0, None, None)
-        )(AudioToMidiDatasetLoader.SAMPLE_RATE, padded_or_trimmed)
+
+        # TODO(knielsen): Consider factoring this out to some shared place
+        desired_fft_duration = 20 # ms
+        samples_per_fft = next_power_of_2(int(AudioToMidiDatasetLoader.SAMPLE_RATE * (desired_fft_duration / 1000)))
+        duration_per_frame = samples_per_fft / AudioToMidiDatasetLoader.SAMPLE_RATE
+        frames = jax.vmap(fft_audio, (0, None))(audio_samples, samples_per_fft)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame)
         frames = frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames, axes=(0, 2, 1)), sample_rate, duration_per_frame
+        return jnp.transpose(frames, axes=(0, 2, 1)), AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame
 
     @classmethod
     def load_midi_events_real_time_positions(
@@ -661,7 +626,7 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
-        batch_size=1,
+        batch_size=64,
         prefetch_count=1,
         num_workers=1,
         key=key,

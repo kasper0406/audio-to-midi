@@ -22,7 +22,8 @@ def load_audio(file: str, sample_rate, duration: 5000) -> Float[Array, "num_samp
         silence = AudioSegment.silent(duration=padding_needed)
         audio = audio + silence
 
-    left_channel_samples = audio.split_to_mono()[0].get_array_of_samples()
+    samples = audio.split_to_mono()[0].get_array_of_samples()
+    left_channel_samples = np.array(samples).T.astype(np.float16)
     return left_channel_samples
 
 
@@ -37,7 +38,10 @@ def load_audio_files(
             )
         )
     max_len = max([ len(frame) for frame in all_audio_frames ])
-    return [ np.pad(frame, (0, max_len - len(frame)), 'constant', constant_values=(0)) for frame in all_audio_frames ]
+    samples = [ np.pad(frame, (0, max_len - len(frame)), 'constant', constant_values=(0)) for frame in all_audio_frames ]
+    samples = samples / np.max(np.abs(samples))
+
+    return samples
 
 
 if __name__ == "__main__":
