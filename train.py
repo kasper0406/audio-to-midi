@@ -1,6 +1,7 @@
 from functools import partial
 from pathlib import Path
 from typing import Optional
+import os
 
 import equinox as eqx
 import jax
@@ -191,8 +192,10 @@ def train(
 
 
 def main():
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
+
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
     num_devices = len(jax.devices())
 
@@ -202,8 +205,8 @@ def main():
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 30
-    dataset_num_workers = 2
+    dataset_prefetch_count = 0
+    dataset_num_workers = 1
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
