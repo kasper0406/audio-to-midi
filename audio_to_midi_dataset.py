@@ -18,10 +18,10 @@ from numpy.typing import NDArray
 import parallel_audio_reader
 
 
-@jax.jit
+@partial(jax.jit, donate_argnames=["samples"])
 def perturb_audio_sample(
     samples, key: jax.random.PRNGKey
-) -> (int, NDArray[jnp.float32]):
+) -> Float[Array, "num_samples"]:
     """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
     1. Add gausian noise
     """
@@ -119,7 +119,7 @@ def events_from_sample(
     )
 
 
-@partial(jax.jit, static_argnames=["sample_rate"])
+@partial(jax.jit, static_argnames=["sample_rate"], donate_argnames=["samples"])
 def time_shift_audio_and_events(
     sample_rate: float,
     samples: Float[Array, "num_samples"],
@@ -283,35 +283,24 @@ def generate_batch(
     key: jax.random.PRNGKey,
     batch_size: int,
     sample_rate: float,
-    all_midi_events: list[(int, int)],
-    all_audio_samples: Float[Array, "num_files samples"],
+    selected_midi_events: Integer[Array, "batch_size max_len 3"],
+    selected_samples: Float[Array, "batch_size samples"],
     shard: jax.sharding.Sharding,
 ):
     (
         key,
-        indexes_key,
         sample_key,
         midi_split_key,
         time_shift_key,
         position_pertubation_key,
-    ) = jax.random.split(key, num=6)
-    indexes = jax.random.randint(
-        indexes_key,
-        shape=(batch_size,),
-        minval=0,
-        maxval=len(all_midi_events),
-        dtype=jnp.int32,
-    )
-    sample_keys = jax.random.split(sample_key, num=batch_size)
-    selected_samples = jax.device_put(all_audio_samples[indexes], shard)
-    selected_midi_events = all_midi_events[indexes]
-
+    ) = jax.random.split(key, num=5)
     # TODO: Re-structure these transformations in a nicer way
     timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
     selected_samples, selected_midi_events = jax.vmap(
         time_shift_audio_and_events, (None, 0, 0, 0)
     )(sample_rate, selected_samples, selected_midi_events, timeshift_keys)
 
+    sample_keys = jax.random.split(sample_key, num=batch_size)
     perturbed_samples = jax.vmap(perturb_audio_sample, (0, 0))(
         selected_samples, sample_keys
     )
@@ -384,7 +373,7 @@ def audio_to_midi_dataset_generator(
     key: jax.random.PRNGKey,
     batch_size: int,
     sample_rate: float,
-    all_midi_events: list[(int, int)],
+    all_midi_events: Integer[Array, "num_files max_length 3"],
     all_audio_samples: Float[Array, "num_files samples"],
 ):
     assert (
@@ -396,13 +385,24 @@ def audio_to_midi_dataset_generator(
     shard = sharding.PositionalSharding(devices)
 
     while True:
-        batch_key, key = jax.random.split(key, num=2)
+        batch_key, indexes_key, key = jax.random.split(key, num=3)
+
+        indexes = jax.random.randint(
+            indexes_key,
+            shape=(batch_size,),
+            minval=0,
+            maxval=all_midi_events.shape[0],
+            dtype=jnp.int32,
+        )
+        selected_samples = jax.device_put(all_audio_samples[indexes], shard)
+        selected_midi_events = jax.device_put(all_midi_events[indexes], shard)
+
         yield generate_batch(
             batch_key,
             batch_size,
             sample_rate,
-            all_midi_events,
-            all_audio_samples,
+            selected_midi_events,
+            selected_samples,
             shard,
         )
 
@@ -485,14 +485,14 @@ class AudioToMidiDatasetLoader:
             map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
         )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
-        padding = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[
+        padding = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)[
             None, :
         ]
         padded_midi_events = [
-            jnp.concatenate(
+            np.concatenate(
                 [
                     events,
-                    jnp.repeat(
+                    np.repeat(
                         padding, repeats=max_events_length - len(events), axis=0
                     ),
                 ],
@@ -500,7 +500,7 @@ class AudioToMidiDatasetLoader:
             )
             for events in unpadded_midi_events
         ]
-        stacked_events = jnp.stack(padded_midi_events, axis=0)
+        stacked_events = np.stack(padded_midi_events, axis=0)
         return stacked_events
 
     @classmethod
