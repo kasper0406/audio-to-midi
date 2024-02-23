@@ -289,12 +289,11 @@ def generate_batch(
 ):
     (
         key,
-        indexes_key,
         sample_key,
         midi_split_key,
         time_shift_key,
         position_pertubation_key,
-    ) = jax.random.split(key, num=6)
+    ) = jax.random.split(key, num=5)
     # TODO: Re-structure these transformations in a nicer way
     timeshift_keys = jax.random.split(time_shift_key, num=selected_samples.shape[0])
     selected_samples, selected_midi_events = jax.vmap(
