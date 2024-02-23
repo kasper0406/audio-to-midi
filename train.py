@@ -1,7 +1,9 @@
-from functools import partial
+from functools import partial, lru_cache
 from pathlib import Path
 from typing import Optional
 import os
+import csv
+import time
 
 import equinox as eqx
 import jax
@@ -92,46 +94,30 @@ def compute_training_step(
     return loss, model, opt_state, new_key
 
 
-def fake_evaluate_model(
-    model, key: jax.random.PRNGKey, dataset_dir: Path, sample_size=64
-):
-    """
-    TODO: The evaluation is a bit fake right now, as we do not put aside a validation set.
-    However, as long as the model sturggles even with the in-sample data, it is fine
-
-    It is a bit like a loss function, but for now it mainly serves for me to get some
-    intuition using a different metric than the loss how the model is performing.
-    """
-    print("Starting model evaluation")
-
-    # Pick a sublist of the samples and use those for evaluation
-    sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)[:sample_size]
+@lru_cache(maxsize=1)
+def load_test_set(testset_dir: Path):
+    sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
     (
         frames,
-        sample_rate,
+        _,
         duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
-    inferred_events, raw_outputs = batch_infer(model, key, frames)
-
-    actual_events = AudioToMidiDatasetLoader.load_midi_events(dataset_dir, sample_names)
-
-    min_dim = min(inferred_events.shape[1], actual_events.shape[1])
-    # This is a bit weird, but just some kind of penalty for predicting the
-    dim_penalty = jnp.sum(
-        inferred_events[:, min_dim:, 1] != BLANK_MIDI_EVENT
-    ) + jnp.sum(actual_events[:, min_dim:, 1] != BLANK_MIDI_EVENT)
-
-    # For now just count the amount of correctly predicted events where a position is deemed correct
-    # if it is within 5 frames
-    difference = jnp.abs(
-        inferred_events[:, :min_dim, :] - actual_events[:, :min_dim, :]
+    ) = AudioToMidiDatasetLoader.load_audio_frames(testset_dir, sample_names)
+    midi_events = (
+        AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
+            testset_dir, sample_names, duration_per_frame
+        )
     )
-    # TODO: Include velocity loss here if it turns out to be helpful
-    position_penalty = jnp.sum(difference[:, :, 0] > 5) + dim_penalty
-    midi_penalty = jnp.sum(difference[:, :, 1] > 1) + dim_penalty
-    print(
-        f"Evaluation of model - position penalty = {position_penalty}, midi_penalty = {midi_penalty}"
-    )
+    return frames, midi_events
+
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):
+    from infer import compute_test_loss
+    frames, midi_events = load_test_set(testset_dir)
+
+    print("Loaded test set")
+    test_loss_sum = jnp.array(0.0, dtype=jnp.float32)
+    for i in range(frames.shape[0]):
+        test_loss_sum += jnp.mean(compute_test_loss(model, key, frames[i], midi_events[i]))
+    return test_loss_sum / frames.shape[0]
 
 
 def train(
@@ -140,13 +126,17 @@ def train(
     data_loader,
     state: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
+    trainloss_csv: Optional[any],
+    testloss_csv: Optional[any],
     device_mesh: [],
+    testset_dir: Optional[Path],
     num_steps: int = 10000,
     print_every: int = 1000,
-    inference_every: int = 500,
+    testset_loss_every: int = 1000,
     key: Optional[jax.random.PRNGKey] = None,
-    model_evaluator=None,
 ):
+    start_time = time.time()
+
     losses = []
     start_step = (
         checkpoint_manager.latest_step() + 1
@@ -177,16 +167,23 @@ def train(
             key,
             tx,
         )
+        step_end_time = time.time()
 
         checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
         losses.append(loss)
         if step % print_every == 0:
+            if trainloss_csv is not None:
+                trainloss_csv.writerow([step, loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Step {step}/{num_steps}, Loss: {loss}")
 
-        if step % inference_every == 0 and model_evaluator is not None:
+        if step % testset_loss_every == 0 and testset_dir is not None:
+            print("Evaluating test loss...")
             eval_key, key = jax.random.split(key, num=2)
-            model_evaluator(model, eval_key)
+            testset_loss = compute_testset_loss(model, testset_dir, eval_key)
+            if testloss_csv is not None:
+                testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
+            print(f"Test loss: {testset_loss}")
 
     return model, state, losses
 
@@ -196,10 +193,11 @@ def main():
 
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
     num_devices = len(jax.devices())
 
-    batch_size = 64 * num_devices
+    batch_size = 1 * num_devices
     learning_rate = 5 * 1e-4
     num_steps = 1000000
 
@@ -256,19 +254,26 @@ def main():
     dataset_loader_iter = iter(dataset_loader)
 
     print("Starting training...")
-    audio_to_midi, state, losses = train(
-        audio_to_midi,
-        tx,
-        dataset_loader_iter,
-        state,
-        checkpoint_manager,
-        device_mesh=device_mesh,
-        num_steps=num_steps,
-        print_every=1,
-        key=training_key,
-        inference_every=checkpoint_every,
-        # model_evaluator=partial(fake_evaluate_model, dataset_dir=dataset_dir),
-    )
+    with open('train_loss.csv', mode='w', buffering=1) as trainloss_file:
+        with open('test_loss.csv', mode='w', buffering=1) as testloss_file:
+            trainloss_csv = csv.writer(trainloss_file)
+            testloss_csv = csv.writer(testloss_file)
+
+            audio_to_midi, state, losses = train(
+                audio_to_midi,
+                tx,
+                dataset_loader_iter,
+                state,
+                checkpoint_manager,
+                trainloss_csv=trainloss_csv,
+                testloss_csv=testloss_csv,
+                device_mesh=device_mesh,
+                testset_dir=testset_dir,
+                num_steps=num_steps,
+                print_every=1,
+                key=training_key,
+                testset_loss_every=checkpoint_every,
+            )
 
     checkpoint_manager.wait_until_finished()
 

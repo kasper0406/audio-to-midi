@@ -77,7 +77,7 @@ def batch_infer(
     model,
     key: jax.random.PRNGKey,
     frames: Float[Array, "batch_size frame_count"],
-    infer_limit: int = 20,
+    infer_limit: int = 50,
 ):
     batch_size = frames.shape[0]
     seen_events = jnp.tile(
@@ -172,6 +172,51 @@ def batch_infer(
 
     return seen_events, raw_outputs
 
+def compute_test_loss(
+    model,
+    key: jax.random.PRNGKey,
+    audio_frames: Float[Array, "num_frames num_frame_data"],
+    midi_events: Float[Array, "max_events 3"]
+):
+    event_count = jnp.count_nonzero(midi_events[:, 1] != BLANK_MIDI_EVENT)
+    batch_audio_frames = jnp.repeat(audio_frames[None, ...], repeats=event_count - 1, axis=0)
+
+    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+    event_prefixes = []
+    counts = jnp.repeat(jnp.arange(midi_events.shape[0])[:, None], repeats=3, axis=1)
+    for i in range(event_count - 1):
+        event_prefix = jnp.select(
+            [counts <= i],
+            [midi_events],
+            blank_event
+        )
+        event_prefixes.append(event_prefix)
+    event_prefixes = jnp.array(event_prefixes)
+
+    (
+        midi_logits,
+        _,
+        _,
+        position_probs,
+        _,
+        velocity_probs,
+    ) = forward(
+        model,
+        batch_audio_frames,
+        event_prefixes,
+        key,
+    )
+
+    from train import compute_loss_from_output
+    losses = compute_loss_from_output(
+        midi_logits,
+        position_probs,
+        velocity_probs,
+        midi_events[1:, :], # Skip the start of sequence event
+    )
+
+    return losses
+
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()
@@ -193,7 +238,7 @@ def main():
     num_devices = len(jax.devices())
 
     key = jax.random.PRNGKey(1234)
-    model_init_key, inference_key, dataset_loader_key = jax.random.split(key, num=3)
+    model_init_key, inference_key, dataset_loader_key, test_loss_key = jax.random.split(key, num=4)
 
     # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
