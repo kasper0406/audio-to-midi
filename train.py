@@ -12,9 +12,9 @@ import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jaxtyping import Array, Float
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, AudioToMidiDatasetLoader
-from infer import batch_infer
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator, model_config
 
 
@@ -108,6 +108,43 @@ def load_test_set(testset_dir: Path):
         )
     )
     return frames, midi_events
+
+
+def compute_test_loss(
+    model,
+    key: jax.random.PRNGKey,
+    audio_frames: Float[Array, "num_frames num_frame_data"],
+    midi_events: Float[Array, "max_events 3"]
+):
+    event_count = jnp.count_nonzero(midi_events[:, 1] != BLANK_MIDI_EVENT)
+    batch_audio_frames = jnp.repeat(audio_frames[None, ...], repeats=event_count - 1, axis=0)
+
+    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+    event_prefixes = []
+    counts = jnp.repeat(jnp.arange(midi_events.shape[0])[:, None], repeats=3, axis=1)
+    for i in range(event_count - 1):
+        event_prefix = jnp.select(
+            [counts <= i],
+            [midi_events],
+            blank_event
+        )
+        event_prefixes.append(event_prefix)
+    event_prefixes = jnp.array(event_prefixes)
+
+    inference_keys = jax.random.split(key, num=batch_audio_frames.shape[0])
+    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
+        model, (0, 0, 0)
+    )(batch_audio_frames, event_prefixes, inference_keys)
+
+    losses = compute_loss_from_output(
+        midi_logits,
+        position_probs,
+        velocity_probs,
+        midi_events[1:event_count, :], # Skip the start of sequence event, but include the end of sequence
+    )
+
+    return losses
+
 
 def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):
     from infer import compute_test_loss
