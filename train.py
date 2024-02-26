@@ -136,7 +136,10 @@ def compute_test_loss(
         midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
     )
 
-    return losses
+    # Blank out the losses obtained when the prediction should result in a blank event
+    actual_event_mask = midi_events[1:, 1] != BLANK_MIDI_EVENT
+    losses = jnp.select([actual_event_mask], [losses], 0.0)
+    return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
 
 
 def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):

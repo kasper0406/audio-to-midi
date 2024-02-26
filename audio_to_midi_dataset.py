@@ -437,7 +437,7 @@ class AudioToMidiDatasetLoader:
             ))
 
     def _load_samples_from_disk(self, num_samples_to_load: int):
-        picked_samples = random.sample(self.all_sample_names, num_samples_to_load)
+        picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
         loaded_midi_events = (
             AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
                 self.dataset_dir, picked_samples
@@ -459,13 +459,14 @@ class AudioToMidiDatasetLoader:
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
+            time.sleep(sleep_time)
+
+            print("Reloading dataset")
             loaded_midi_events, loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
 
             with self.sample_load_lock:
                 self.loaded_midi_events = loaded_midi_events
                 self.loaded_audio_samples = loaded_audio_samples
-
-            time.sleep(sleep_time)
 
 
     @classmethod
