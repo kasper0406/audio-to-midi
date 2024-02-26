@@ -109,6 +109,12 @@ def load_test_set(testset_dir: Path):
     )
     return frames, midi_events
 
+@jax.jit
+def call_model(model, key, batch_frames, batch_events):
+    inference_keys = jax.random.split(key, num=batch_frames.shape[0])
+    return jax.vmap(
+        model, (0, 0, 0)
+    )(batch_frames, batch_events, inference_keys)
 
 def compute_test_loss(
     model,
@@ -131,10 +137,7 @@ def compute_test_loss(
         event_prefixes.append(event_prefix)
     event_prefixes = jnp.array(event_prefixes)
 
-    inference_keys = jax.random.split(key, num=batch_audio_frames.shape[0])
-    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-        model, (0, 0, 0)
-    )(batch_audio_frames, event_prefixes, inference_keys)
+    midi_logits, _, _, position_probs, _, velocity_probs = call_model(model, key, batch_audio_frames, event_prefixes)
 
     losses = compute_loss_from_output(
         midi_logits,
@@ -147,7 +150,6 @@ def compute_test_loss(
 
 
 def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):
-    from infer import compute_test_loss
     frames, midi_events = load_test_set(testset_dir)
 
     print("Loaded test set")
