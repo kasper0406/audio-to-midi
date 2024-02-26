@@ -110,40 +110,30 @@ def load_test_set(testset_dir: Path):
     return frames, midi_events
 
 @jax.jit
-def call_model(model, key, batch_frames, batch_events):
-    inference_keys = jax.random.split(key, num=batch_frames.shape[0])
-    return jax.vmap(
-        model, (0, 0, 0)
-    )(batch_frames, batch_events, inference_keys)
-
 def compute_test_loss(
     model,
     key: jax.random.PRNGKey,
     audio_frames: Float[Array, "num_frames num_frame_data"],
     midi_events: Float[Array, "max_events 3"]
 ):
-    event_count = jnp.count_nonzero(midi_events[:, 1] != BLANK_MIDI_EVENT)
-    batch_audio_frames = jnp.repeat(audio_frames[None, ...], repeats=event_count - 1, axis=0)
+    size = midi_events.shape[0]
+    mask = jnp.arange(size).reshape(1, size) <= jnp.arange(size).reshape(size, 1)
+    mask = jnp.repeat(mask[..., None], repeats=3, axis=2)
 
     blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
-    event_prefixes = []
-    counts = jnp.repeat(jnp.arange(midi_events.shape[0])[:, None], repeats=3, axis=1)
-    for i in range(event_count - 1):
-        event_prefix = jnp.select(
-            [counts <= i],
-            [midi_events],
-            blank_event
-        )
-        event_prefixes.append(event_prefix)
-    event_prefixes = jnp.array(event_prefixes)
+    # Do not pick the last element with the full sequence, as there is nothing to predict
+    event_prefixes = jnp.where(mask, midi_events, blank_event)[0:-1, ...]
 
-    midi_logits, _, _, position_probs, _, velocity_probs = call_model(model, key, batch_audio_frames, event_prefixes)
+    inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
+    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
+        model, (None, 0, 0)
+    )(audio_frames, event_prefixes, inference_keys)
 
     losses = compute_loss_from_output(
         midi_logits,
         position_probs,
         velocity_probs,
-        midi_events[1:event_count, :], # Skip the start of sequence event, but include the end of sequence
+        midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
     )
 
     return losses
@@ -153,10 +143,10 @@ def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):
     frames, midi_events = load_test_set(testset_dir)
 
     print("Loaded test set")
-    test_loss_sum = jnp.array(0.0, dtype=jnp.float32)
-    for i in range(frames.shape[0]):
-        test_loss_sum += jnp.mean(compute_test_loss(model, key, frames[i], midi_events[i]))
-    return test_loss_sum / frames.shape[0]
+    test_loss_keys = jax.random.split(key, num=frames.shape[0])
+    test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+    print("Finished evaluating test loss")
+    return jnp.mean(test_losses)
 
 
 def train(

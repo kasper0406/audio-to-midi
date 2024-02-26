@@ -241,6 +241,13 @@ def main():
         )
     )
 
+    # from train import compute_test_loss, compute_testset_loss
+    # loss = compute_test_loss(audio_to_midi, test_loss_key, all_frames[0], expected_midi_events[0])
+    # print(f"Loss of example: {loss}")
+
+    # testset_loss = compute_testset_loss(audio_to_midi, dataset_dir, test_loss_key)
+    # print(f"Testset loss: {testset_loss}")
+
     # # For now just compute the loss of the first example
     i = 0
     end_of_sequence_mask = (inferred_events[:, :, 1] == SEQUENCE_END) | (

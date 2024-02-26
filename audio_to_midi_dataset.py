@@ -530,10 +530,10 @@ class AudioToMidiDatasetLoader:
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
         audio_names = set(
-            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.aac"))
+            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.aac", recursive=True))
         )
         label_names = set(
-            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.csv"))
+            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.csv", recursive=True))
         )
 
         if audio_names != label_names:
