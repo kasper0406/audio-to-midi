@@ -3,6 +3,7 @@ import glob
 import queue
 import random
 import threading
+import time
 import numpy as np
 from functools import partial
 from pathlib import Path
@@ -14,6 +15,7 @@ import jax.sharding as sharding
 import matplotlib.pyplot as plt
 from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
+from threading import Lock
 
 import parallel_audio_reader
 
@@ -277,7 +279,7 @@ def event_positions_to_frame_time(
     ).astype(jnp.int16)
 
 
-@partial(jax.jit, static_argnames=["shard", "batch_size", "sample_rate"])
+@partial(jax.jit, static_argnames=["batch_size", "sample_rate"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
     key: jax.random.PRNGKey,
@@ -285,7 +287,6 @@ def generate_batch(
     sample_rate: float,
     selected_midi_events: Integer[Array, "batch_size max_len 3"],
     selected_samples: Float[Array, "batch_size samples"],
-    shard: jax.sharding.Sharding,
 ):
     (
         key,
@@ -369,44 +370,6 @@ def generate_batch(
     }
 
 
-def audio_to_midi_dataset_generator(
-    key: jax.random.PRNGKey,
-    batch_size: int,
-    sample_rate: float,
-    all_midi_events: Integer[Array, "num_files max_length 3"],
-    all_audio_samples: Float[Array, "num_files samples"],
-):
-    assert (
-        len(all_midi_events) == all_audio_samples.shape[0]
-    ), "The number of loaded files should be equal!"
-
-    num_devices = len(jax.devices())
-    devices = mesh_utils.create_device_mesh((num_devices, 1))
-    shard = sharding.PositionalSharding(devices)
-
-    while True:
-        batch_key, indexes_key, key = jax.random.split(key, num=3)
-
-        indexes = jax.random.randint(
-            indexes_key,
-            shape=(batch_size,),
-            minval=0,
-            maxval=all_midi_events.shape[0],
-            dtype=jnp.int32,
-        )
-        selected_samples = jax.device_put(all_audio_samples[indexes], shard)
-        selected_midi_events = jax.device_put(all_midi_events[indexes], shard)
-
-        yield generate_batch(
-            batch_key,
-            batch_size,
-            sample_rate,
-            selected_midi_events,
-            selected_samples,
-            shard,
-        )
-
-
 class AudioToMidiDatasetLoader:
     SAMPLE_RATE = 44100.0
 
@@ -421,19 +384,20 @@ class AudioToMidiDatasetLoader:
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
         self.queue = queue.Queue(prefetch_count + 1)
+        self.sample_load_lock = Lock()
 
-        all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
-        self.all_midi_events = (
-            AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
-                dataset_dir, all_sample_names
-            )
-        )
-        
-        self.all_audio_samples = parallel_audio_reader.load_audio_files(
-            self.SAMPLE_RATE,
-            [dataset_dir / f"{name}.aac" for name in all_sample_names],
-            MAX_EVENT_TIMESTAMP * 1000
-        )
+        num_devices = len(jax.devices())
+        devices = mesh_utils.create_device_mesh((num_devices, 1))
+        self.sharding = sharding.PositionalSharding(devices)
+
+        self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
+
+        num_samples_to_load = 2 * self.batch_size
+        self.loaded_midi_events, self.loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
+        threading.Thread(
+            target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load),
+            daemon=True,
+        ).start()
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
@@ -447,15 +411,62 @@ class AudioToMidiDatasetLoader:
             yield self.queue.get()
 
     def _generate_batch(self, key: jax.random.PRNGKey):
-        batch_generator = audio_to_midi_dataset_generator(
-            key,
-            self.batch_size,
-            self.SAMPLE_RATE,
-            self.all_midi_events,
-            self.all_audio_samples,
-        )
+        with self.sample_load_lock:
+            current_loaded_midi_events = self.loaded_midi_events
+            current_loaded_audio_samples = self.loaded_audio_samples
+
         while True:
-            self.queue.put(next(batch_generator))
+            batch_key, indexes_key, key = jax.random.split(key, num=3)
+
+            indexes = jax.random.randint(
+                indexes_key,
+                shape=(self.batch_size,),
+                minval=0,
+                maxval=current_loaded_midi_events.shape[0],
+                dtype=jnp.int32,
+            )
+            selected_samples = jax.device_put(current_loaded_audio_samples[indexes], self.sharding)
+            selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
+
+            self.queue.put(generate_batch(
+                batch_key,
+                self.batch_size,
+                self.SAMPLE_RATE,
+                selected_midi_events,
+                selected_samples,
+            ))
+
+    def _load_samples_from_disk(self, num_samples_to_load: int):
+        picked_samples = random.sample(self.all_sample_names, num_samples_to_load)
+        loaded_midi_events = (
+            AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
+                self.dataset_dir, picked_samples
+            )
+        )
+        
+        loaded_audio_samples = parallel_audio_reader.load_audio_files(
+            self.SAMPLE_RATE,
+            [self.dataset_dir / f"{name}.aac" for name in picked_samples],
+            MAX_EVENT_TIMESTAMP * 1000
+        )
+
+        return loaded_midi_events, loaded_audio_samples
+
+    def _periodic_refresh_samples(
+        self,
+        num_samples_to_load: int,
+        sleep_time: int = 30 # seconds
+    ):
+        # TODO: Consider doing this in a way that preserves determinism
+        while True:
+            loaded_midi_events, loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
+
+            with self.sample_load_lock:
+                self.loaded_midi_events = loaded_midi_events
+                self.loaded_audio_samples = loaded_audio_samples
+
+            time.sleep(sleep_time)
+
 
     @classmethod
     def load_audio_frames(cls, dataset_dir: Path, sample_names: [str]):
@@ -519,10 +530,10 @@ class AudioToMidiDatasetLoader:
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
         audio_names = set(
-            map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.aac"))
+            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.aac"))
         )
         label_names = set(
-            map(lambda path: Path(path).stem, glob.glob(f"{dataset_dir}/*.csv"))
+            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.csv"))
         )
 
         if audio_names != label_names:
