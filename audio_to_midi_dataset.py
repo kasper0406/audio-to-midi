@@ -411,13 +411,12 @@ class AudioToMidiDatasetLoader:
             yield self.queue.get()
 
     def _generate_batch(self, key: jax.random.PRNGKey):
-        with self.sample_load_lock:
-            current_loaded_midi_events = self.loaded_midi_events
-            current_loaded_audio_samples = self.loaded_audio_samples
-
         while True:
-            batch_key, indexes_key, key = jax.random.split(key, num=3)
+            with self.sample_load_lock:
+                current_loaded_midi_events = self.loaded_midi_events
+                current_loaded_audio_samples = self.loaded_audio_samples
 
+            batch_key, indexes_key, key = jax.random.split(key, num=3)
             indexes = jax.random.randint(
                 indexes_key,
                 shape=(self.batch_size,),
