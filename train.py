@@ -1,6 +1,6 @@
 from functools import partial, lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 import os
 import csv
 import time
@@ -160,6 +160,7 @@ def train(
     checkpoint_manager: ocp.CheckpointManager,
     trainloss_csv: Optional[any],
     testloss_csv: Optional[any],
+    learning_rate_schedule: Callable,
     device_mesh: [],
     testset_dir: Optional[Path],
     num_steps: int = 10000,
@@ -205,9 +206,10 @@ def train(
 
         losses.append(loss)
         if step % print_every == 0:
+            learning_rate = learning_rate_schedule(step)
             if trainloss_csv is not None:
-                trainloss_csv.writerow([step, loss, step_end_time - start_time, step * audio_frames.shape[0]])
-            print(f"Step {step}/{num_steps}, Loss: {loss}")
+                trainloss_csv.writerow([step, loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
+            print(f"Step {step}/{num_steps}, Loss: {loss}, LR = {learning_rate}")
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")
@@ -219,19 +221,32 @@ def train(
 
     return model, state, losses
 
+def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, cosine_decay_steps: int):
+    warmup_fn = optax.linear_schedule(
+        init_value=0.,
+        end_value=base_learning_rate,
+        transition_steps=warmup_steps)
+    cosine_fn = optax.cosine_decay_schedule(
+        init_value=base_learning_rate,
+        decay_steps=cosine_decay_steps
+    )
+    return optax.join_schedules(
+        schedules=[warmup_fn, cosine_fn],
+        boundaries=[warmup_steps]
+    )
 
 def main():
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set")
 
     num_devices = len(jax.devices())
 
     batch_size = 16 * num_devices
-    learning_rate = 5 * 1e-4
     num_steps = 1000000
+    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 5000, num_steps)
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
@@ -268,7 +283,7 @@ def main():
             args=ocp.args.StandardRestore(audio_to_midi),
         )
 
-    tx = optax.adam(learning_rate=learning_rate)
+    tx = optax.adam(learning_rate=learning_rate_schedule)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0), tx
     )  # TODO: Investigate clip by RMS
@@ -299,6 +314,7 @@ def main():
                 checkpoint_manager,
                 trainloss_csv=trainloss_csv,
                 testloss_csv=testloss_csv,
+                learning_rate_schedule=learning_rate_schedule,
                 device_mesh=device_mesh,
                 testset_dir=testset_dir,
                 num_steps=num_steps,
