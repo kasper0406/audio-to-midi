@@ -15,6 +15,7 @@ import jax.sharding as sharding
 import matplotlib.pyplot as plt
 from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
+from typing import Optional
 from threading import Lock
 
 import parallel_audio_reader
@@ -392,7 +393,7 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        num_samples_to_load = 2 * self.batch_size
+        num_samples_to_load = 5 * self.batch_size
         self.loaded_midi_events, self.loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
         threading.Thread(
             target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load),
@@ -435,11 +436,11 @@ class AudioToMidiDatasetLoader:
                 selected_samples,
             ))
 
-    def _load_samples_from_disk(self, num_samples_to_load: int):
+    def _load_samples_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
         loaded_midi_events = (
             AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
-                self.dataset_dir, picked_samples
+                self.dataset_dir, picked_samples, minimum_size=minimum_midi_event_size
             )
         )
         
@@ -461,7 +462,10 @@ class AudioToMidiDatasetLoader:
             time.sleep(sleep_time)
 
             print("Reloading dataset")
-            loaded_midi_events, loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
+            with self.sample_load_lock:
+                # Try to avoid unncessary JIT's due to different midi event lengths
+                minimum_midi_event_size = self.loaded_midi_events.shape[1]
+            loaded_midi_events, loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load, minimum_midi_event_size)
 
             with self.sample_load_lock:
                 self.loaded_midi_events = loaded_midi_events
@@ -490,12 +494,15 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_midi_events_real_time_positions(
-        cls, dataset_dir: Path, sample_names: [str]
+        cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
     ):
         unpadded_midi_events = list(
             map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
         )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
+        if minimum_size is not None:
+            # We support extra padding to avoid JAX jit recompilations
+            max_events_length = max(max_events_length, minimum_size)
         padding = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)[
             None, :
         ]
