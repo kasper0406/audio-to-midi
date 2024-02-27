@@ -1,0 +1,13 @@
+{
+    "frame_size": 232,
+    "max_frame_sequence_length": 256,
+    "attention_size": 256,
+    "intermediate_size": 1024,
+    "num_heads": 4,
+    "num_layers": 8,
+    "dropout_rate": 0.05,
+    "batch_size": 1024,
+    "num_devices": 8,
+    "num_steps": 500000,
+    "learning_rate": "0.0005,5000,500000"
+}

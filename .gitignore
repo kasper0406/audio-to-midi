@@ -162,5 +162,5 @@ cython_debug/
 # Trained model state
 positional_encoding_models*
 audio_to_midi_checkpoints*
-*.csv
 saved_checkpoints/**/*.tgz
+/*.csv
