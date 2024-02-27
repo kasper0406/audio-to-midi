@@ -494,7 +494,7 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_midi_events_real_time_positions(
-        cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int]
+        cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
     ):
         unpadded_midi_events = list(
             map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
