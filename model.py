@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Integer, PRNGKeyArray
 
 import position_encoding
-from audio_to_midi_dataset import BLANK_MIDI_EVENT
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY
 
 model_config = {
     "frame_size": 232,  # 464,
@@ -17,6 +17,7 @@ model_config = {
     "num_heads": 2,
     "num_layers": 4,
     "dropout_rate": 0.05,
+    "midi_event_context_size": 10,
 }
 
 
@@ -575,6 +576,8 @@ class OutputSequenceGenerator(eqx.Module):
 
     midi_embedding: MidiVocabulary
 
+    midi_event_context_size: int = eqx.field(static=True)
+
     def __init__(
         self,
         conf: Dict[str, any],
@@ -610,11 +613,13 @@ class OutputSequenceGenerator(eqx.Module):
             key=midi_embedding_key,
         )
 
+        self.midi_event_context_size = conf["midi_event_context_size"]
+
     def __call__(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
         generated_output: Integer[
-            Array, "midi_seq_len 3"  # Pair of (input_frame_position, midi_event)
+            Array, "midi_seq_len 3"  # Pair of (input_frame_position, midi_key, velocity)
         ],  # Index of midi event in the vocabulary
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
@@ -627,6 +632,7 @@ class OutputSequenceGenerator(eqx.Module):
             input_frames=input_frames, enable_dropout=enable_dropout, key=encoder_key
         )
 
+        generated_output = self._trim_to_midi_event_context_size(generated_output)
         midi_embeddings_so_far = jax.vmap(
             partial(
                 self.midi_embedding,
@@ -647,3 +653,13 @@ class OutputSequenceGenerator(eqx.Module):
         )
 
         return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
+
+    def _trim_to_midi_event_context_size(self, generated_output: Integer[Array, "midi_seq_len 3"]) -> Integer[Array, "10 3"]:
+        num_events = jnp.count_nonzero(generated_output[:, 1] != BLANK_MIDI_EVENT, axis=0)
+        offset = jnp.maximum(0, num_events - self.midi_event_context_size)
+        generated_output = jnp.roll(generated_output, shift=-offset, axis=0)
+        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < num_events
+        generated_output = jnp.where(mask, generated_output, blank_event)
+        generated_output = generated_output[0:self.midi_event_context_size, ...]
+        return generated_output
