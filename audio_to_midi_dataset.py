@@ -386,6 +386,8 @@ class AudioToMidiDatasetLoader:
         self.batch_size = batch_size
         self.queue = queue.Queue(prefetch_count + 1)
         self.sample_load_lock = Lock()
+        self._stop_event = threading.Event()
+        self._threads = []
 
         num_devices = len(jax.devices())
         devices = mesh_utils.create_device_mesh((num_devices, 1))
@@ -393,26 +395,39 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        num_samples_to_load = 5 * self.batch_size
+        num_samples_to_load = 4 * self.batch_size
         self.loaded_midi_events, self.loaded_audio_samples = self._load_samples_from_disk(num_samples_to_load)
-        threading.Thread(
+        refresh_thread = threading.Thread(
             target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load),
             daemon=True,
-        ).start()
+        )
+        self._threads.append(refresh_thread)
+        refresh_thread.start()
 
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
-            threading.Thread(
+            worker_thread = threading.Thread(
                 target=partial(self._generate_batch, key=worker_keys[worker_id]),
                 daemon=True,
-            ).start()
+            )
+            self._threads.append(worker_thread)
+            worker_thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Signal all threads to stop
+        self._stop_event.set()
+        for t in self._threads:
+            t.join()
 
     def __iter__(self):
         while True:
             yield self.queue.get()
 
     def _generate_batch(self, key: jax.random.PRNGKey):
-        while True:
+        while not self._stop_event.is_set():
             with self.sample_load_lock:
                 current_loaded_midi_events = self.loaded_midi_events
                 current_loaded_audio_samples = self.loaded_audio_samples
@@ -428,13 +443,22 @@ class AudioToMidiDatasetLoader:
             selected_samples = jax.device_put(current_loaded_audio_samples[indexes], self.sharding)
             selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
 
-            self.queue.put(generate_batch(
+            batch = generate_batch(
                 batch_key,
                 self.batch_size,
                 self.SAMPLE_RATE,
                 selected_midi_events,
                 selected_samples,
-            ))
+            )
+            success = False
+            while not success and not self._stop_event.is_set():
+                try:
+                    self.queue.put(batch, timeout=1)
+                    success = True
+                except queue.Full:
+                    # This was not successful
+                    pass
+
 
     def _load_samples_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
@@ -459,7 +483,9 @@ class AudioToMidiDatasetLoader:
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
-            time.sleep(sleep_time)
+            self._stop_event.wait(sleep_time)
+            if self._stop_event.is_set():
+                return
 
             print("Reloading dataset")
             with self.sample_load_lock:
@@ -603,11 +629,38 @@ def visualize_sample(
     plt.show()
 
 
+def benchmark():
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
+    with open('dataset_benchmark.csv', mode='w', buffering=1) as benchmark_file:
+        benchmark_csv = csv.writer(benchmark_file)
+
+        for batch_size in [32,64,128,256,512,1024,2048,4096,8192]:
+            for prefetch_count in [0,1,2,4,8]:
+                for num_workers in [1,2,4,8]:
+                    with AudioToMidiDatasetLoader(
+                        dataset_dir=dataset_dir,
+                        batch_size=batch_size,
+                        prefetch_count=prefetch_count,
+                        num_workers=num_workers,
+                        key=key,
+                    ) as dataset_loader:
+                        dataset_loader_iter = iter(dataset_loader)
+
+                        start_time = time.time()
+                        generated_samples = 0
+                        for num, loaded_batch in zip(range(0, 100), dataset_loader_iter):
+                            generated_samples += loaded_batch["audio_frames"].shape[0]
+                        finished_time = time.time()
+
+                        benchmark_csv.writerow([batch_size, prefetch_count, num_workers, generated_samples, finished_time - start_time])
+
+
 if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     jax.config.update("jax_threefry_partitionable", True)
-
     key = jax.random.PRNGKey(42)
+
+    benchmark()
 
     # sample_rate, samples = load_audio_and_normalize(
     #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
