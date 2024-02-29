@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from matplotlib.ticker import FuncFormatter
+from scipy.stats import linregress
 
 def list_directories(path: Path):
     return [ path for path in path.iterdir() if path.is_dir() ]
@@ -22,6 +23,20 @@ def read_test_loss(experiment_path: Path):
         return None
     return np.genfromtxt(file, delimiter=',')
 
+def power_series_regression(sample_counts, losses):
+    # Do not consider samples <10^6 because training has not gotten up to speed yet
+    start_index = np.where(sample_counts >= 1e6)[0][0]
+    sample_counts = sample_counts[start_index:]
+    losses = losses[start_index:]
+
+    log_sample_counts = np.log(sample_counts)
+    log_losses = np.log(losses)
+
+    slope, intercept, r_value, p_value, std_err = linregress(log_sample_counts, log_losses)
+    
+    return slope, intercept
+
+
 def plot_train_losses(name: str, experiment_path: Path, xaxis):
     train_logs = read_train_loss(experiment_path)
     if train_logs is None:
@@ -37,11 +52,12 @@ def plot_train_losses(name: str, experiment_path: Path, xaxis):
         # We have learning rate information
         learning_rates = train_logs[:, 4]
 
-    xaxis.loglog(num_samples, losses, base=10, color="blue", label="Train loss")
+    xaxis.loglog(num_samples, losses, base=10, color="b", label="Train loss")
 
     xaxis.set_xlabel("# seen samples")
     xaxis.set_ylabel("Loss")
     xaxis.set_yticks(np.array([5, 3, 1, 0.5, 0.2, 0.1, 0.01]))
+    xaxis.set_xlim(left=1e6)
     def custom_format(x, _pos):
         return f'{x:.2f}'
     xaxis.yaxis.set_major_formatter(FuncFormatter(custom_format))
@@ -64,10 +80,15 @@ def plot_test_losses(name: str, experiment_path: Path, xaxis):
     wall_clock = test_logs[:, 2]
     num_samples = test_logs[:, 3]
 
-    xaxis.loglog(num_samples, losses, base=10, color="red", label="Test loss")
+    slope, intercept = power_series_regression(num_samples, losses)
+    trendline = np.exp(intercept) * (num_samples ** slope)
+    xaxis.loglog(num_samples, trendline, 'g--', base=10, label=f'Trendline (y = {np.exp(intercept):.2f}x^{slope:.2f})')
+
+    xaxis.loglog(num_samples, losses, base=10, color="r", label="Test loss")
     xaxis.set_xlabel("# seen samples")
     xaxis.set_ylabel("Loss")
     xaxis.set_yticks(np.array([5, 3, 1, 0.5, 0.2, 0.1, 0.01]))
+    xaxis.set_xlim(left=1e6)
     def custom_format(x, _pos):
         return f'{x:.2f}'
     xaxis.yaxis.set_major_formatter(FuncFormatter(custom_format))

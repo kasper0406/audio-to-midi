@@ -246,7 +246,7 @@ def main():
 
     batch_size = 16 * num_devices
     num_steps = 1000000
-    learning_rate_schedule = create_learning_rate_schedule(2.5 * 1e-4, 1000, num_steps / batch_size)
+    learning_rate_schedule = create_learning_rate_schedule(2.5 * 1e-4, 1000, num_steps)
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
