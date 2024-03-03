@@ -37,6 +37,26 @@ def continous_probability_loss(probs, expected, variance):
     # return optax.cosine_distance(probs, expectation)
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
+@eqx.filter_jit
+def velocity_loss_fn(probs, expected, variance):
+    epsilon = 0.0000001
+    expectation = None
+    if expected == 0:
+        expectation = jnp.zeros(probs.shape[0])
+        expectation = expectation.at[0].set(1.0)
+    else:
+        x = jnp.arange(probs.shape[0])
+        expectation = -0.5 * jnp.square((x - expected) / variance)
+        expectation = expectation.at[0].set(0.0)
+        expectation = jnp.maximum(
+            expectation, -10.0
+        )  # Below values of -10 we will assume the exponential will give 0
+        expectation = jnp.exp(expectation)
+
+    expectation = expectation / jnp.sum(expectation)
+    # jax.debug.print("Expectation: {expectation}", expectation=expectation)
+    # return optax.cosine_distance(probs, expectation)
+    return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
 def compute_loss_from_output(
@@ -53,7 +73,7 @@ def compute_loss_from_output(
     )
 
     expected_next_velocity = expected_next_output[:, 2]
-    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=1.0), (0, 0))(
+    velocity_loss = jax.vmap(partial(velocity_loss_fn, variance=1.0), (0, 0))(
         velocity_probs, expected_next_velocity
     )
 

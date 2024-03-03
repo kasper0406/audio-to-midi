@@ -29,7 +29,7 @@ def perturb_audio_sample(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 100  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 500  # Randomize the level of noise
     gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
     return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
 
@@ -485,7 +485,7 @@ class AudioToMidiDatasetLoader:
     def _periodic_refresh_samples(
         self,
         num_samples_to_load: int,
-        sleep_time: int = 20 # seconds
+        sleep_time: int = 5 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
