@@ -97,6 +97,7 @@ def events_from_sample(
         return 2 + (key - 21)
 
     events = []
+    max_velocity = 0.0
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
@@ -109,6 +110,7 @@ def events_from_sample(
             # Notice we put releases prior to attacks in terms of midi event index
             if attack_time < MAX_EVENT_TIMESTAMP:
                 events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
+                max_velocity = max(max_velocity, velocity)
             if attack_time + duration < MAX_EVENT_TIMESTAMP + 5 * epsilon:
                 # HACK: If `attack_time + duration > MAX_EVENT_TIMESTAMP` we will clamp it to `MAX_EVENT_TIMESTAMP`
                 #       This has to do with the generated dataset in that it has a quirk that the release may be
@@ -117,6 +119,9 @@ def events_from_sample(
                 events.append(
                     (min(attack_time + duration - epsilon, MAX_EVENT_TIMESTAMP), key_to_event(key), BLANK_VELOCITY)
                 )  # Release
+
+    # Re-normalize velocities as we normalize the audio level as well
+    events = [ (event[0], event[1], event[2] / max_velocity) for event in events ]
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
