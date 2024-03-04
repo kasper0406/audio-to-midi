@@ -13,6 +13,7 @@ import optax
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
+from functools import reduce
 
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator, model_config
@@ -78,11 +79,12 @@ def compute_loss_from_output(
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    return midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss
+    individual_losses = jnp.array([ midi_event_loss, position_loss, velocity_loss ])
+    return midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss, individual_losses
 
 
 @eqx.filter_jit
-@eqx.filter_value_and_grad
+@eqx.filter_value_and_grad(has_aux=True)
 def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
@@ -90,9 +92,10 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
         model, in_axes=(0, 0, 0)
     )(audio_frames, outputs_so_far, batched_keys)
 
-    return jnp.mean(compute_loss_from_output(
+    loss, individual_losses = compute_loss_from_output(
         midi_logits, position_probs, velocity_probs, expected_next_output
-    ))
+    )
+    return jnp.mean(loss), jnp.mean(individual_losses, axis=1)
 
 
 @eqx.filter_jit
@@ -100,7 +103,7 @@ def compute_training_step(
     model, audio_frames, outputs_so_far, next_output, opt_state, key, tx
 ):
     key, new_key = jax.random.split(key)
-    loss, grads = compute_loss(
+    (loss, individual_losses), grads = compute_loss(
         model,
         audio_frames=audio_frames,
         outputs_so_far=outputs_so_far,
@@ -111,7 +114,7 @@ def compute_training_step(
     updates, opt_state = tx.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
 
-    return loss, model, opt_state, new_key
+    return (loss, individual_losses), model, opt_state, new_key
 
 
 @lru_cache(maxsize=1)
@@ -149,7 +152,7 @@ def compute_test_loss(
         model, (None, 0, 0)
     )(audio_frames, event_prefixes, inference_keys)
 
-    losses = compute_loss_from_output(
+    losses, individual_losses = compute_loss_from_output(
         midi_logits,
         position_probs,
         velocity_probs,
@@ -190,7 +193,6 @@ def train(
 ):
     start_time = time.time()
 
-    losses = []
     start_step = (
         checkpoint_manager.latest_step() + 1
         if checkpoint_manager.latest_step() is not None
@@ -205,13 +207,14 @@ def train(
         ),
     )
 
+    losses = []
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         (audio_frames, seen_events, next_event) = jax.device_put(
             (batch["audio_frames"], batch["seen_events"], batch["next_event"]),
             batch_sharding,
         )
 
-        loss, model, state, key = compute_training_step(
+        (loss, individual_losses), model, state, key = compute_training_step(
             model,
             audio_frames,
             seen_events,
@@ -224,12 +227,18 @@ def train(
 
         checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
-        losses.append(loss)
+        losses.append((loss, individual_losses))
         if step % print_every == 0:
             learning_rate = learning_rate_schedule(step)
+
+            averaged_loss = reduce(lambda cumulative, loss: cumulative + loss[0], losses, 0) / len(losses)
+            averaged_individual_losses = reduce(lambda cumulative, loss: cumulative + loss[1], losses, 0) / len(losses)
+
             if trainloss_csv is not None:
-                trainloss_csv.writerow([step, loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
-            print(f"Step {step}/{num_steps}, Loss: {loss}, LR = {learning_rate}")
+                trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
+            print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}, Idv.loss = {averaged_individual_losses}")
+
+            losses = []
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")
@@ -239,7 +248,7 @@ def train(
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Test loss: {testset_loss}")
 
-    return model, state, losses
+    return model, state
 
 def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, cosine_decay_steps: int):
     warmup_fn = optax.linear_schedule(
@@ -256,7 +265,7 @@ def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, 
     )
 
 def main():
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
+    # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
@@ -326,7 +335,7 @@ def main():
             trainloss_csv = csv.writer(trainloss_file)
             testloss_csv = csv.writer(testloss_file)
 
-            audio_to_midi, state, losses = train(
+            audio_to_midi, state = train(
                 audio_to_midi,
                 tx,
                 dataset_loader_iter,
@@ -338,7 +347,7 @@ def main():
                 device_mesh=device_mesh,
                 testset_dir=testset_dir,
                 num_steps=num_steps,
-                print_every=1,
+                print_every=5,
                 key=training_key,
                 testset_loss_every=checkpoint_every,
             )
