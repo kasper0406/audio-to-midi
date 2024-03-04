@@ -29,7 +29,7 @@ def perturb_audio_sample(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 100  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 500  # Randomize the level of noise
     gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
     return jax.numpy.clip(samples + gaussian_noise, -1.0, 1.0)
 
@@ -89,11 +89,15 @@ def events_from_sample(
     dataset_dir: str, sample: str
 ) -> Float[Array, "max_number_of_events 3"]:
     """
-    Returns a numpy array with tuples of (timestamp in seconds, midi event id)
+    Returns a numpy array with tuples of (timestamp in seconds, midi event id, velocity)
     """
-    max_event_timestamp = 0.0
+    epsilon = 0.05 # HACK: We want to make sure that because of numeic accuracy the release events
+                   # comes before potential subsequent attach events
+    def key_to_event(key: int):
+        return 2 + (key - 21)
 
     events = []
+    max_velocity = 0.0
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
@@ -105,13 +109,19 @@ def events_from_sample(
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
             if attack_time < MAX_EVENT_TIMESTAMP:
-                events.append((attack_time, 2 + 88 + (key - 21), velocity))  # Attack
-            if attack_time + duration < MAX_EVENT_TIMESTAMP:
+                events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
+                max_velocity = max(max_velocity, velocity)
+            if attack_time + duration < MAX_EVENT_TIMESTAMP + 5 * epsilon:
+                # HACK: If `attack_time + duration > MAX_EVENT_TIMESTAMP` we will clamp it to `MAX_EVENT_TIMESTAMP`
+                #       This has to do with the generated dataset in that it has a quirk that the release may be
+                #       slightly beyond `MAX_EVENT_TIMESTAMP`, but in reality the note has been released
+                #       I should be able to delete this once I fix and re-generate the dataset
                 events.append(
-                    (attack_time + duration, 2 + (key - 21), BLANK_VELOCITY)
+                    (min(attack_time + duration - epsilon, MAX_EVENT_TIMESTAMP), key_to_event(key), BLANK_VELOCITY)
                 )  # Release
 
-            max_event_timestamp = max(max_event_timestamp, attack_time + duration)
+    # Re-normalize velocities as we normalize the audio level as well
+    events = [ (event[0], event[1], event[2] / max_velocity) for event in events ]
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
@@ -143,13 +153,13 @@ def time_shift_audio_and_events(
     )
 
     # Handle audio samples
-    frames_to_roll = jnp.int32(sample_rate * offset_amounts_in_seconds)
+    audio_samples_to_roll = jnp.int32(sample_rate * offset_amounts_in_seconds)
     audio_frame_positions = jnp.arange(samples.shape[0])
-    frame_mask = audio_frame_positions < jnp.absolute(frames_to_roll)
+    frame_mask = audio_frame_positions < jnp.absolute(audio_samples_to_roll)
     frame_mask = jnp.roll(
-        frame_mask, shift=jnp.min(jnp.array([frames_to_roll, jnp.zeros(1)]))
-    )  # Flip the mask if `frames_to_roll`` is negative
-    samples = jnp.roll(samples, shift=frames_to_roll)
+        frame_mask, shift=jnp.min(jnp.array([audio_samples_to_roll, jnp.zeros(1)]))
+    )  # Flip the mask if `audio_samples_to_roll`` is negative
+    samples = jnp.roll(samples, shift=audio_samples_to_roll)
     samples = jnp.select(
         [~frame_mask],
         [samples],
@@ -173,7 +183,7 @@ def time_shift_audio_and_events(
     positions_to_update = (
         (positions > 0)
         & (positions < end_of_sequence)
-        & (updated_midi_event_times > 0.0)
+        & (updated_midi_event_times >= 0.0)
         & (updated_midi_event_times < MAX_EVENT_TIMESTAMP)
     )
     first_to_keep = jnp.where(positions_to_update == True, size=1)[0]
@@ -184,6 +194,7 @@ def time_shift_audio_and_events(
         updated_midi_event_times, -first_to_keep + 1, axis=0
     )
     positions_to_update = jnp.roll(positions_to_update, -first_to_keep + 1, axis=0)
+    rolled_midi_events = jnp.roll(midi_events, -first_to_keep + 1, axis=0)
 
     # jax.debug.print("Mask = {mask}", mask=positions_to_update)
 
@@ -215,7 +226,7 @@ def time_shift_audio_and_events(
         midi_events = midi_events.at[:, i].set(
             jnp.select(
                 [positions_to_update, positions >= 0],
-                [midi_events[:, i], blank_input[:, i]],
+                [rolled_midi_events[:, i], blank_input[:, i]],
             )
         )
 
@@ -265,7 +276,7 @@ def event_positions_to_frame_time(
          - velocity: A float between 0.0 and 1.0 indicating the velocity of the event
         We convert both of them to integers so they can be understood by the model.
         """
-        position = (event[0] / duration_per_frame_in_secs).astype(jnp.int16)
+        position = jnp.round(event[0] / duration_per_frame_in_secs).astype(jnp.int16)
         velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
             jnp.int16
         )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
@@ -479,7 +490,7 @@ class AudioToMidiDatasetLoader:
     def _periodic_refresh_samples(
         self,
         num_samples_to_load: int,
-        sleep_time: int = 30 # seconds
+        sleep_time: int = 5 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -660,7 +671,7 @@ if __name__ == "__main__":
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
-    benchmark()
+    # benchmark()
 
     # sample_rate, samples = load_audio_and_normalize(
     #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
@@ -696,9 +707,9 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
-        batch_size=64,
-        prefetch_count=1,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        batch_size=1,
+        prefetch_count=0,
         num_workers=1,
         key=key,
     )
