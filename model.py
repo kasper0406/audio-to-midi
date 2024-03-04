@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY
 model_config = {
     "frame_size": 232,  # 464,
     "max_frame_sequence_length": 256,
-    "attention_size": 256,
-    "intermediate_size": 1024,
-    "num_heads": 4,
-    "num_layers": 8,
+    "attention_size": 64,
+    "intermediate_size": 128,
+    "num_heads": 2,
+    "num_layers": 3,
     "dropout_rate": 0.05,
     "midi_event_context_size": 10,
 }

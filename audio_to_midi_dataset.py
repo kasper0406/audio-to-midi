@@ -37,7 +37,7 @@ def perturb_audio_frames(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 500  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 10  # Randomize the level of noise
     gaussian_noise = jnp.abs(sigma * jax.random.normal(key2, frames.shape))
     return frames + gaussian_noise
 
@@ -245,9 +245,9 @@ def perturb_midi_event_positions(
     We will pick the new positions using a Gaussian prob distribution around the desired location, and make sure events
     maintain the same order as in the training dataset by taking the commulative max
     """
-    pertubation = (
-        jax.random.normal(key, shape=(midi_events.shape[0],)) * duration_per_frame * 2
-    )
+    pertubation = jnp.round(
+        jax.random.normal(key, shape=(midi_events.shape[0],)) * 2 # Perturb with a normal distribution with a variance of 2 frames
+    ).astype(jnp.int16)
     pertubation = pertubation + midi_events[:, 0]
     # Make sure the new perturbated event positions are monotonically increasing
     pertubation = jax.lax.cummax(pertubation)
@@ -277,10 +277,7 @@ def event_positions_to_frame_time(
         velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
             jnp.int16
         )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
-        return jnp.array(
-            [position, event[1], velocity],
-            dtype=jnp.int16,
-        )
+        return jnp.array([position, event[1], velocity]).astype(jnp.int16)
 
     # Express midi event position in terms of frames and convert the array to an integer array
     return jnp.apply_along_axis(
@@ -375,6 +372,8 @@ class AudioToMidiDatasetLoader:
         prefetch_count: int,
         num_workers: int,
         key: jax.random.PRNGKey,
+        num_samples_to_load: int = 250,
+        num_samples_to_maintain: int = 5000,
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
@@ -389,10 +388,9 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        num_samples_to_load = 4 * self.batch_size
-        self.loaded_midi_events, self.loaded_audio_samples, self.duration_per_frame = self._load_samples_from_disk(num_samples_to_load)
+        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(num_samples_to_load)
         refresh_thread = threading.Thread(
-            target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load),
+            target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load, num_samples_to_maintain=num_samples_to_maintain),
             daemon=True,
         )
         self._threads.append(refresh_thread)
@@ -424,7 +422,7 @@ class AudioToMidiDatasetLoader:
         while not self._stop_event.is_set():
             with self.sample_load_lock:
                 current_loaded_midi_events = self.loaded_midi_events
-                current_loaded_audio_samples = self.loaded_audio_samples
+                current_loaded_audio_samples = self.loaded_audio_frames
 
             batch_key, indexes_key, key = jax.random.split(key, num=3)
             indexes = jax.random.randint(
@@ -454,7 +452,7 @@ class AudioToMidiDatasetLoader:
                     pass
 
 
-    def _load_samples_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
+    def _load_frames_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
 
         loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames(
@@ -473,7 +471,8 @@ class AudioToMidiDatasetLoader:
     def _periodic_refresh_samples(
         self,
         num_samples_to_load: int,
-        sleep_time: int = 5 # seconds
+        num_samples_to_maintain: int,
+        sleep_time: int = 1 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -481,15 +480,39 @@ class AudioToMidiDatasetLoader:
             if self._stop_event.is_set():
                 return
 
-            print("Reloading dataset")
             with self.sample_load_lock:
                 # Try to avoid unncessary JIT's due to different midi event lengths
-                minimum_midi_event_size = self.loaded_midi_events.shape[1]
-            loaded_midi_events, loaded_audio_samples, _duration_per_frame = self._load_samples_from_disk(num_samples_to_load, minimum_midi_event_size)
+                current_events = self.loaded_midi_events
+                current_frames = self.loaded_audio_frames
+            
+            print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
+            loaded_midi_events, loaded_audio_frames, _duration_per_frame = self._load_frames_from_disk(num_samples_to_load, current_events.shape[1])
+
+            current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
+            current_events = current_events[current_amount_to_evict:, ...]
+            current_frames = current_frames[current_amount_to_evict:, ...]
+
+            # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
+            blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)
+            current_events = np.concatenate([ # Make sure there is sufficient edge padding on the current events
+                current_events,
+                np.repeat(
+                    np.repeat(blank_event[None, :], repeats=loaded_midi_events.shape[1] - current_events.shape[1], axis=0)[None, ...],
+                    repeats=current_events.shape[0], axis=0)
+            ], axis=1)
+
+            new_events = np.concatenate([
+                current_events,
+                loaded_midi_events,
+            ], axis=0)
+            new_frames = np.concatenate([
+                current_frames,
+                loaded_audio_frames,
+            ], axis=0)
 
             with self.sample_load_lock:
-                self.loaded_midi_events = loaded_midi_events
-                self.loaded_audio_samples = loaded_audio_samples
+                self.loaded_midi_events = new_events
+                self.loaded_audio_frames = new_frames
 
 
     @classmethod
@@ -690,11 +713,13 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
         batch_size=16,
         prefetch_count=0,
         num_workers=1,
         key=key,
+        num_samples_to_load=5,
+        num_samples_to_maintain=200,
     )
     dataset_loader_iter = iter(dataset_loader)
 

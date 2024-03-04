@@ -35,7 +35,6 @@ def continous_probability_loss(probs, expected, variance):
     expectation = jnp.exp(expectation)
     expectation = expectation / jnp.sum(expectation)
     # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    # return optax.cosine_distance(probs, expectation)
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
@@ -47,16 +46,16 @@ def velocity_loss_fn(probs, expected, variance):
 
     x = jnp.arange(probs.shape[0])
     expectation_if_nonzero = -0.5 * jnp.square((x - expected) / variance)
-    expectation_if_nonzero = expectation_if_nonzero.at[0].set(0.0)
     expectation_if_nonzero = jnp.maximum(
         expectation_if_nonzero, -10.0
     )  # Below values of -10 we will assume the exponential will give 0
     expectation_if_nonzero = jnp.exp(expectation_if_nonzero)
+    # 0 probability of velocity 0 as that would be no event in the first place
+    expectation_if_nonzero = expectation_if_nonzero.at[0].set(0.0)
 
     expectation = jnp.select([expected == 0], [expectation_if_zero], expectation_if_nonzero)
     expectation = expectation / jnp.sum(expectation)
     # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    # return optax.cosine_distance(probs, expectation)
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
@@ -282,6 +281,9 @@ def main():
     dataset_prefetch_count = 0
     dataset_num_workers = 1
 
+    num_samples_to_load=10
+    num_samples_to_maintain=batch_size * 10
+
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
 
@@ -326,6 +328,8 @@ def main():
         prefetch_count=dataset_prefetch_count,
         num_workers=dataset_num_workers,
         key=dataset_loader_key,
+        num_samples_to_load=num_samples_to_load,
+        num_samples_to_maintain=num_samples_to_maintain,
     )
     dataset_loader_iter = iter(dataset_loader)
 
