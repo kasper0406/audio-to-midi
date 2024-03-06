@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import os
 import equinox as eqx
 import jax
 import jax.experimental.mesh_utils as mesh_utils
@@ -94,14 +95,17 @@ def batch_infer(
     raw_outputs = None
 
     # TODO: Consider jitting the inside of this loop
+    padding_increment = 20
     while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
         inference_key, key = jax.random.split(key, num=2)
 
         # Inference result should not change appending padding events!
-        # padding = jnp.tile(
-        #     jnp.array([0, BLANK_MIDI_EVENT], dtype=jnp.int16), (batch_size, 5, 1)
-        # )
-        # padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
+        # Use a padded version to avoid jax recompilations
+        padding_amount = (padding_increment - seen_events.shape[1]) % padding_increment
+        padding = jnp.tile(
+            jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16), (batch_size, padding_amount, 1)
+        )
+        padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
         # jax.debug.print(
         #     "Padded seen events {padded_seen_events}",
         #     padded_seen_events=padded_seen_events,
@@ -116,7 +120,7 @@ def batch_infer(
         ) = forward(
             model,
             frames,
-            seen_events,
+            padded_seen_events,
             inference_key,
         )
 
@@ -197,12 +201,9 @@ def main():
 
     # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
-
-    # Replicate the model on all JAX devices
-    device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
-    audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
+    abstract_audio_to_midi = jax.tree_util.tree_map(
+        ocp.utils.to_shape_dtype_struct, audio_to_midi
+    )
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_manager = ocp.CheckpointManager(checkpoint_path)
@@ -212,8 +213,14 @@ def main():
         print(f"Restoring saved model at step {step_to_restore}")
         audio_to_midi = checkpoint_manager.restore(
             step_to_restore,
-            args=ocp.args.StandardRestore(audio_to_midi),
+            args=ocp.args.StandardRestore(abstract_audio_to_midi),
         )
+    
+    # Replicate the model on all JAX devices
+    device_mesh = mesh_utils.create_device_mesh((num_devices,))
+    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
+    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
 
     print("Loading audio file...")
     # TODO: Handle files that are longer than 5 seconds
@@ -233,7 +240,7 @@ def main():
     inferred_events, raw_outputs = batch_infer(audio_to_midi, inference_key, all_frames)
     print(f"Inferred events: {inferred_events}")
 
-    # Evaluate losses
+    # # Evaluate losses
 
     expected_midi_events = (
         AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
@@ -241,12 +248,12 @@ def main():
         )
     )
 
-    # from train import compute_test_loss, compute_testset_loss
-    # loss = compute_test_loss(audio_to_midi, test_loss_key, all_frames[0], expected_midi_events[0])
-    # print(f"Loss of example: {loss}")
+    from train import compute_test_loss, compute_testset_loss
+    loss = compute_test_loss(audio_to_midi, test_loss_key, all_frames[0], expected_midi_events[0])
+    print(f"Loss of example: {loss}")
 
-    # testset_loss = compute_testset_loss(audio_to_midi, dataset_dir, test_loss_key)
-    # print(f"Testset loss: {testset_loss}")
+    testset_loss = compute_testset_loss(audio_to_midi, dataset_dir, test_loss_key)
+    print(f"Testset loss: {testset_loss}")
 
     # # For now just compute the loss of the first example
     i = 0
@@ -256,7 +263,7 @@ def main():
     from train import compute_loss_from_output
 
     while not jnp.all(end_of_sequence_mask[:, i]):
-        loss = compute_loss_from_output(
+        loss, individual_losses = compute_loss_from_output(
             raw_outputs["midi_logits"][:, i, :],
             raw_outputs["position_probs"][:, i, :],
             raw_outputs["velocity_probs"][:, i, :],
@@ -275,7 +282,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
 
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):

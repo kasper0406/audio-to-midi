@@ -18,7 +18,6 @@ from functools import reduce
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator, model_config
 
-
 @eqx.filter_jit
 def continous_probability_loss(probs, expected, variance):
     """
@@ -138,13 +137,13 @@ def compute_test_loss(
     audio_frames: Float[Array, "num_frames num_frame_data"],
     midi_events: Float[Array, "max_events 3"]
 ):
-    size = midi_events.shape[0]
+    size = midi_events.shape[0] - 1 # Minus one because we do not pick the last event
     mask = jnp.arange(size).reshape(1, size) <= jnp.arange(size).reshape(size, 1)
     mask = jnp.repeat(mask[..., None], repeats=3, axis=2)
 
     blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
     # Do not pick the last element with the full sequence, as there is nothing to predict
-    event_prefixes = jnp.where(mask, midi_events, blank_event)[0:-1, ...]
+    event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(

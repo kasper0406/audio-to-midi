@@ -260,28 +260,27 @@ def perturb_midi_event_positions(
 
     return midi_events.at[:, 0].set(adjusted_event_positions)
 
+@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
+def convert_position_and_velocity(event: Float[Array, "3"], duration_per_frame_in_secs: float) -> Integer[Array, "3"]:
+    """
+    Positions and velocities are represented as floats in the dataset:
+        - position: The number of seconds since the beginning as a float
+        - velocity: A float between 0.0 and 1.0 indicating the velocity of the event
+    We convert both of them to integers so they can be understood by the model.
+    """
+    position = jnp.round(event[0] / duration_per_frame_in_secs).astype(jnp.int16)
+    velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
+        jnp.int16
+    )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
+    return jnp.array([position, event[1], velocity]).astype(jnp.int16)
 
 @partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
 def event_positions_to_frame_time(
     selected_midi_events: Float[Array, "3"], duration_per_frame_in_secs: Float
 ) -> Integer[Array, "3"]:
-    @jax.jit
-    def convert_position_and_velocity(event: Float[Array, "3"]) -> Integer[Array, "3"]:
-        """
-        Positions and velocities are represented as floats in the dataset:
-         - position: The number of seconds since the beginning as a float
-         - velocity: A float between 0.0 and 1.0 indicating the velocity of the event
-        We convert both of them to integers so they can be understood by the model.
-        """
-        position = jnp.round(event[0] / duration_per_frame_in_secs).astype(jnp.int16)
-        velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
-            jnp.int16
-        )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
-        return jnp.array([position, event[1], velocity]).astype(jnp.int16)
-
     # Express midi event position in terms of frames and convert the array to an integer array
     return jnp.apply_along_axis(
-        convert_position_and_velocity, 2, selected_midi_events
+        partial(convert_position_and_velocity, duration_per_frame_in_secs=duration_per_frame_in_secs), 2, selected_midi_events
     ).astype(jnp.int16)
 
 

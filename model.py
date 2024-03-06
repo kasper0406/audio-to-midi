@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY
 model_config = {
     "frame_size": 232,  # 464,
     "max_frame_sequence_length": 256,
-    "attention_size": 64,
-    "intermediate_size": 128,
-    "num_heads": 2,
-    "num_layers": 3,
+    "attention_size": 256,
+    "intermediate_size": 1024,
+    "num_heads": 4,
+    "num_layers": 8,
     "dropout_rate": 0.05,
     "midi_event_context_size": 10,
 }
@@ -626,13 +626,26 @@ class OutputSequenceGenerator(eqx.Module):
     ) -> Float[
         Array, "midi_voccab_size"
     ]:  # Probability distribution over the midi events:
+        generated_output = OutputSequenceGenerator._trim_midi_event_to_context_size(
+            generated_output, context_size=self.midi_event_context_size)
+        return self.call_model(input_frames, generated_output, key, enable_dropout)
+
+    @partial(jax.jit, static_argnames=["enable_dropout"])
+    def call_model(
+        self,
+        input_frames: Float[Array, "frame_seq_len frame_size"],
+        generated_output: Integer[
+            Array, "10 3"  # Pair of (input_frame_position, midi_key, velocity)
+        ],  # Index of midi event in the vocabulary
+        key: Optional[jax.random.PRNGKey] = None,
+        enable_dropout: bool = False,
+    ):
         encoder_key, decoder_key, midi_embedding_key = jax.random.split(key, num=3)
 
         encoder_output = self.encoder(
             input_frames=input_frames, enable_dropout=enable_dropout, key=encoder_key
         )
 
-        generated_output = self._trim_to_midi_event_context_size(generated_output)
         midi_embeddings_so_far = jax.vmap(
             partial(
                 self.midi_embedding,
@@ -654,12 +667,18 @@ class OutputSequenceGenerator(eqx.Module):
 
         return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
 
-    def _trim_to_midi_event_context_size(self, generated_output: Integer[Array, "midi_seq_len 3"]) -> Integer[Array, "10 3"]:
+    @partial(jax.jit, static_argnames=["context_size"])
+    def _trim_midi_event_to_context_size(generated_output: Integer[Array, "midi_seq_len 3"], context_size: int) -> Integer[Array, "midi_event_context_size 3"]:
         num_events = jnp.count_nonzero(generated_output[:, 1] != BLANK_MIDI_EVENT, axis=0)
-        offset = jnp.maximum(0, num_events - self.midi_event_context_size)
+        offset = jnp.maximum(0, num_events - context_size)
         generated_output = jnp.roll(generated_output, shift=-offset, axis=0)
         blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
         mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < num_events
         generated_output = jnp.where(mask, generated_output, blank_event)
-        generated_output = generated_output[0:self.midi_event_context_size, ...]
+        generated_output = generated_output[0:context_size, ...]
+
+        # Pad with necessary blank events to always reach the fixed context size
+        padded_blanks = jnp.repeat(blank_event[None, ...], repeats=context_size, axis=0)
+        generated_output = padded_blanks.at[:generated_output.shape[0], ...].set(generated_output)
+
         return generated_output
