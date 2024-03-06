@@ -224,6 +224,10 @@ def train(
         )
         step_end_time = time.time()
 
+        if jnp.isnan(loss):
+            print(f"Encountered NAN loss at step {step}. Stopping the training!")
+            break
+
         checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
         losses.append((loss, individual_losses))

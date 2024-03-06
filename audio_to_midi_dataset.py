@@ -11,7 +11,7 @@ from pathlib import Path
 import jax
 import jax.experimental.mesh_utils as mesh_utils
 import jax.numpy as jnp
-import jax.sharding as sharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 import matplotlib.pyplot as plt
 from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
@@ -383,8 +383,14 @@ class AudioToMidiDatasetLoader:
         self._threads = []
 
         num_devices = len(jax.devices())
-        devices = mesh_utils.create_device_mesh((num_devices, 1))
-        self.sharding = sharding.PositionalSharding(devices)
+        device_mesh = mesh_utils.create_device_mesh((num_devices,))
+        batch_mesh = Mesh(device_mesh, ("batch",))
+        self.sharding = NamedSharding(
+            batch_mesh,
+            PartitionSpec(
+                "batch",
+            ),
+        )
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
@@ -458,6 +464,7 @@ class AudioToMidiDatasetLoader:
         loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames(
             self.dataset_dir,
             picked_samples,
+            sharding=self.sharding,
         )
 
         loaded_midi_events = (
@@ -516,12 +523,14 @@ class AudioToMidiDatasetLoader:
 
 
     @classmethod
-    def load_audio_frames(cls, dataset_dir: Path, sample_names: [str]):
+    def load_audio_frames(cls, dataset_dir: Path, sample_names: [str], sharding = None):
         audio_samples = parallel_audio_reader.load_audio_files(
             AudioToMidiDatasetLoader.SAMPLE_RATE,
             [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
             MAX_EVENT_TIMESTAMP * 1000
         )
+        if sharding is not None:
+            audio_samples = jax.device_put(audio_samples, sharding)
 
         # TODO(knielsen): Consider factoring this out to some shared place
         desired_fft_duration = 20 # ms
