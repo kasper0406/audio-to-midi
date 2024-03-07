@@ -522,7 +522,7 @@ class AudioToMidiDatasetLoader:
                 self.loaded_audio_frames = new_frames
 
     @classmethod
-    def load_audio_frames(cls, dataset_dir: Path, filenames: [Path], sharding = None):
+    def load_audio_frames(cls, filenames: [Path], sharding = None):
         audio_samples = parallel_audio_reader.load_audio_files(
             AudioToMidiDatasetLoader.SAMPLE_RATE,
             filenames,
