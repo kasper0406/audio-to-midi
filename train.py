@@ -18,7 +18,6 @@ from functools import reduce
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator, model_config
 
-
 @eqx.filter_jit
 def continous_probability_loss(probs, expected, variance):
     """
@@ -35,7 +34,6 @@ def continous_probability_loss(probs, expected, variance):
     expectation = jnp.exp(expectation)
     expectation = expectation / jnp.sum(expectation)
     # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    # return optax.cosine_distance(probs, expectation)
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
@@ -47,16 +45,16 @@ def velocity_loss_fn(probs, expected, variance):
 
     x = jnp.arange(probs.shape[0])
     expectation_if_nonzero = -0.5 * jnp.square((x - expected) / variance)
-    expectation_if_nonzero = expectation_if_nonzero.at[0].set(0.0)
     expectation_if_nonzero = jnp.maximum(
         expectation_if_nonzero, -10.0
     )  # Below values of -10 we will assume the exponential will give 0
     expectation_if_nonzero = jnp.exp(expectation_if_nonzero)
+    # 0 probability of velocity 0 as that would be no event in the first place
+    expectation_if_nonzero = expectation_if_nonzero.at[0].set(0.0)
 
     expectation = jnp.select([expected == 0], [expectation_if_zero], expectation_if_nonzero)
     expectation = expectation / jnp.sum(expectation)
     # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    # return optax.cosine_distance(probs, expectation)
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
@@ -139,13 +137,13 @@ def compute_test_loss(
     audio_frames: Float[Array, "num_frames num_frame_data"],
     midi_events: Float[Array, "max_events 3"]
 ):
-    size = midi_events.shape[0]
+    size = midi_events.shape[0] - 1 # Minus one because we do not pick the last event
     mask = jnp.arange(size).reshape(1, size) <= jnp.arange(size).reshape(size, 1)
     mask = jnp.repeat(mask[..., None], repeats=3, axis=2)
 
     blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
     # Do not pick the last element with the full sequence, as there is nothing to predict
-    event_prefixes = jnp.where(mask, midi_events, blank_event)[0:-1, ...]
+    event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
@@ -225,6 +223,10 @@ def train(
         )
         step_end_time = time.time()
 
+        if jnp.isnan(loss):
+            print(f"Encountered NAN loss at step {step}. Stopping the training!")
+            break
+
         checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
         losses.append((loss, individual_losses))
@@ -282,6 +284,9 @@ def main():
     dataset_prefetch_count = 0
     dataset_num_workers = 1
 
+    num_samples_to_load=10
+    num_samples_to_maintain=batch_size * 10
+
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
 
@@ -326,6 +331,8 @@ def main():
         prefetch_count=dataset_prefetch_count,
         num_workers=dataset_num_workers,
         key=dataset_loader_key,
+        num_samples_to_load=num_samples_to_load,
+        num_samples_to_maintain=num_samples_to_maintain,
     )
     dataset_loader_iter = iter(dataset_loader)
 

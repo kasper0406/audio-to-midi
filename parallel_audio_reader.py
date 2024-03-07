@@ -30,7 +30,7 @@ def load_audio(file: str, sample_rate, duration: 5000) -> Float[Array, "num_samp
 def load_audio_files(
     sample_rate, files_to_load: list[Path], duration: 5000
 ) -> list[Float[Array, "num_samples"]]:
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=256) as executor:
         all_audio_frames = list(
             executor.map(
                 partial(load_audio, sample_rate=sample_rate, duration=duration),
