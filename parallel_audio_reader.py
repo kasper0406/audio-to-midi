@@ -4,23 +4,25 @@ from functools import partial
 from pathlib import Path
 import numpy as np
 
+from typing import Optional
 from jaxtyping import Array, Float
 from pydub import AudioSegment
 
 
-def load_audio(file: str, sample_rate, duration: 5000) -> Float[Array, "num_samples"]:
+def load_audio(file: Path, sample_rate, duration: Optional[int] = 5000, pad_to_fixed_duration: bool = True) -> Float[Array, "num_samples"]:
     """Loads an audio file and returns the sample rate along with the normalized samples."""
-    audio = AudioSegment.from_file(file, "aac")
+    audio = AudioSegment.from_file(file)
     audio = audio.set_frame_rate(
         sample_rate
     )  # Resample to the frequency we operate in
 
     # Make the audio be of length exactly `duration`
-    audio = audio[:duration] # Pick only the first `duration` ms
-    padding_needed = duration - len(audio)
-    if padding_needed > 0:
-        silence = AudioSegment.silent(duration=padding_needed)
-        audio = audio + silence
+    if duration is not None:
+        audio = audio[:duration] # Pick only the first `duration` ms
+        padding_needed = duration - len(audio)
+        if pad_to_fixed_duration and padding_needed > 0:
+            silence = AudioSegment.silent(duration=padding_needed)
+            audio = audio + silence
 
     samples = audio.split_to_mono()[0].get_array_of_samples()
     left_channel_samples = np.array(samples).T.astype(np.float16)
