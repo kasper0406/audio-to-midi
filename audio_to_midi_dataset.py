@@ -7,6 +7,7 @@ import time
 import numpy as np
 from functools import partial
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.experimental.mesh_utils as mesh_utils
@@ -101,6 +102,10 @@ def events_from_sample(
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
+            if row[0].startswith("%"):
+                # Skip control messages such as tempo and time signatures
+                continue
+
             attack_time = float(row[0])
             duration = float(row[1])
             key = int(row[2])
@@ -461,6 +466,8 @@ class AudioToMidiDatasetLoader:
     def _load_frames_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
 
+        # TODO: These two loading steps could be done in parallel, but before the midi events dependence on
+        #       `duration_per_frame` must be removed and applied later.
         loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
             self.dataset_dir,
             picked_samples,
@@ -561,7 +568,20 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_audio_frames_from_sample_name(cls, dataset_dir: Path, sample_names: [str], sharding = None):
-        filenames = [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names]
+        # HACK: Consider getting rid of this approach by qualifying the sample names
+        filenames = []
+        audio_extensions = [ ".aac", ".aif" ]
+        for sample in sample_names:
+            found = False
+            for extension in audio_extensions:
+                candidate = dataset_dir / f"{sample}{extension}"
+                if candidate.exists():
+                    filenames.append(candidate)
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Did not find audio file for sample named {sample}")
+
         return AudioToMidiDatasetLoader.load_audio_frames(filenames)
 
     @classmethod
@@ -581,9 +601,10 @@ class AudioToMidiDatasetLoader:
     def load_midi_events_real_time_positions(
         cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
     ):
-        unpadded_midi_events = list(
-            map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
-        )
+        with ThreadPoolExecutor(max_workers=256) as executor:
+            unpadded_midi_events = list(
+                executor.map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
+            )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
         if minimum_size is not None:
             # We support extra padding to avoid JAX jit recompilations
@@ -621,15 +642,20 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
-        audio_names = set(
-            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.aac", recursive=True))
-        )
+        audio_extensions = [ ".aif", ".aac" ]
+        audio_names = set()
+        for extension in audio_extensions:
+            audio_names = audio_names.union(set(
+                map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*{extension}", recursive=True))
+            ))
         label_names = set(
             map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.csv", recursive=True))
         )
 
         if audio_names != label_names:
-            raise "Did not find the same set of labels and samples!"
+            audio_no_csv = audio_names - label_names
+            csv_no_audio = label_names - audio_names
+            raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
         return list(sorted(audio_names))
 
