@@ -7,6 +7,7 @@ import time
 import numpy as np
 from functools import partial
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.experimental.mesh_utils as mesh_utils
@@ -17,6 +18,7 @@ from jaxtyping import Array, Float, Integer
 from numpy.typing import NDArray
 from typing import Optional
 from threading import Lock
+import math
 
 import parallel_audio_reader
 
@@ -100,6 +102,10 @@ def events_from_sample(
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
         for row in reader:
+            if row[0].startswith("%"):
+                # Skip control messages such as tempo and time signatures
+                continue
+
             attack_time = float(row[0])
             duration = float(row[1])
             key = int(row[2])
@@ -393,7 +399,9 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(num_samples_to_load)
+        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(
+            num_samples_to_load,
+            minimum_midi_event_size=128)
         refresh_thread = threading.Thread(
             target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load, num_samples_to_maintain=num_samples_to_maintain),
             daemon=True,
@@ -460,7 +468,9 @@ class AudioToMidiDatasetLoader:
     def _load_frames_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
 
-        loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames(
+        # TODO: These two loading steps could be done in parallel, but before the midi events dependence on
+        #       `duration_per_frame` must be removed and applied later.
+        loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
             self.dataset_dir,
             picked_samples,
             sharding=self.sharding,
@@ -520,36 +530,83 @@ class AudioToMidiDatasetLoader:
                 self.loaded_midi_events = new_events
                 self.loaded_audio_frames = new_frames
 
-
     @classmethod
-    def load_audio_frames(cls, dataset_dir: Path, sample_names: [str], sharding = None):
+    def load_audio_frames(cls, filenames: [Path], sharding = None):
         audio_samples = parallel_audio_reader.load_audio_files(
             AudioToMidiDatasetLoader.SAMPLE_RATE,
-            [dataset_dir / f"{sample_name}.aac" for sample_name in sample_names],
+            filenames,
             MAX_EVENT_TIMESTAMP * 1000
         )
         if sharding is not None:
             audio_samples = jax.device_put(audio_samples, sharding)
 
-        # TODO(knielsen): Consider factoring this out to some shared place
+        frames, duration_per_frame = AudioToMidiDatasetLoader._convert_samples(audio_samples)
+
+        return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame
+    
+    @classmethod
+    def load_and_slice_full_audio(cls, filename: Path, overlap: float = 0.5):
+        audio_samples = parallel_audio_reader.load_audio(
+            filename,
+            AudioToMidiDatasetLoader.SAMPLE_RATE,
+            duration=None,
+        )
+
+        window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
+        overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
+
+        step = window_size - overlap
+        n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
+        windows = []
+        for i in range(n_windows):
+            window_samples = audio_samples[i * step:i * step + window_size]
+            # Make sure the window has the exact length (i.e. pad the last window if necessary)
+            window_samples = jnp.pad(window_samples, ((0,window_size - window_samples.shape[0])), constant_values=(0,))
+            windows.append(window_samples)
+        windowed = jnp.stack(windows)
+        
+        return AudioToMidiDatasetLoader._convert_samples(windowed)
+
+
+    @classmethod
+    def load_audio_frames_from_sample_name(cls, dataset_dir: Path, sample_names: [str], sharding = None):
+        # HACK: Consider getting rid of this approach by qualifying the sample names
+        filenames = []
+        audio_extensions = [ ".aac", ".aif" ]
+        for sample in sample_names:
+            found = False
+            for extension in audio_extensions:
+                candidate = dataset_dir / f"{sample}{extension}"
+                if candidate.exists():
+                    filenames.append(candidate)
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Did not find audio file for sample named {sample}")
+
+        return AudioToMidiDatasetLoader.load_audio_frames(filenames)
+
+    @classmethod
+    def _convert_samples(cls, samples: Float[Array, "count samples"]):
         desired_fft_duration = 20 # ms
         samples_per_fft = next_power_of_2(int(AudioToMidiDatasetLoader.SAMPLE_RATE * (desired_fft_duration / 1000)))
         duration_per_frame = samples_per_fft / AudioToMidiDatasetLoader.SAMPLE_RATE
-        frames = jax.vmap(fft_audio, (0, None))(audio_samples, samples_per_fft)
+        frames = jax.vmap(fft_audio, (0, None))(samples, samples_per_fft)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame)
         frames = frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames, axes=(0, 2, 1)), AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame
+        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame
 
     @classmethod
     def load_midi_events_real_time_positions(
         cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
     ):
-        unpadded_midi_events = list(
-            map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
-        )
+        with ThreadPoolExecutor(max_workers=256) as executor:
+            unpadded_midi_events = list(
+                executor.map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
+            )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
         if minimum_size is not None:
             # We support extra padding to avoid JAX jit recompilations
@@ -587,15 +644,20 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
-        audio_names = set(
-            map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.aac", recursive=True))
-        )
+        audio_extensions = [ ".aif", ".aac" ]
+        audio_names = set()
+        for extension in audio_extensions:
+            audio_names = audio_names.union(set(
+                map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*{extension}", recursive=True))
+            ))
         label_names = set(
             map(lambda path: path[(len(str(dataset_dir)) + 1):-4], glob.glob(f"{dataset_dir}/**/*.csv", recursive=True))
         )
 
         if audio_names != label_names:
-            raise "Did not find the same set of labels and samples!"
+            audio_no_csv = audio_names - label_names
+            csv_no_audio = label_names - audio_names
+            raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
         return list(sorted(audio_names))
 

@@ -189,38 +189,45 @@ def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
         title=f"Probability distribution for {quantity}",
     )
 
-
-def main():
-    current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
-
+def load_newest_checkpoint(checkpoint_path: Path):
     num_devices = len(jax.devices())
 
+    # The randomness does not matter as we will load a checkpoint model anyways
     key = jax.random.PRNGKey(1234)
-    model_init_key, inference_key, dataset_loader_key, test_loss_key = jax.random.split(key, num=4)
-
-    # TODO: Enable dropout for training
-    audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
+    audio_to_midi = OutputSequenceGenerator(model_config, key)
     abstract_audio_to_midi = jax.tree_util.tree_map(
         ocp.utils.to_shape_dtype_struct, audio_to_midi
     )
-
-    checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_manager = ocp.CheckpointManager(checkpoint_path)
 
     step_to_restore = checkpoint_manager.latest_step()
-    if step_to_restore is not None:
-        print(f"Restoring saved model at step {step_to_restore}")
-        audio_to_midi = checkpoint_manager.restore(
-            step_to_restore,
-            args=ocp.args.StandardRestore(abstract_audio_to_midi),
-        )
-    
+    if step_to_restore is None:
+        raise "There is no checkpoint to load! Inference will be useless"
+
+    print(f"Restoring saved model at step {step_to_restore}")
+    audio_to_midi = checkpoint_manager.restore(
+        step_to_restore,
+        args=ocp.args.StandardRestore(abstract_audio_to_midi),
+    )
+
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
     mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
     replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
     audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
+
+    return audio_to_midi
+
+
+def main():
+    current_directory = Path(__file__).resolve().parent
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
+
+    key = jax.random.PRNGKey(1234)
+    inference_key, dataset_loader_key, test_loss_key = jax.random.split(key, num=3)
+
+    checkpoint_path = current_directory / "audio_to_midi_checkpoints"
+    audio_to_midi = load_newest_checkpoint(checkpoint_path)
 
     print("Loading audio file...")
     # TODO: Handle files that are longer than 5 seconds
@@ -230,7 +237,7 @@ def main():
         all_frames,
         sample_rate,
         duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames(dataset_dir, sample_names)
+    ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(dataset_dir, sample_names)
     # print(f"Frames shape: {all_frames.shape}")
 
     plot_frequency_domain_audio(duration_per_frame, all_frames[0])

@@ -122,7 +122,7 @@ def load_test_set(testset_dir: Path):
         frames,
         _,
         duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames(testset_dir, sample_names)
+    ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(testset_dir, sample_names)
     midi_events = (
         AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
             testset_dir, sample_names, duration_per_frame
