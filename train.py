@@ -145,6 +145,9 @@ def compute_test_loss(
     # Do not pick the last element with the full sequence, as there is nothing to predict
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
+    # Truncate theevent prefixes to be the correct shape for the model
+    event_prefixes = jax.vmap(AudioToMidiDatasetLoader.truncate_midi_event_to_context_size, (0, None))(event_prefixes, model_config["midi_event_context_size"])
+
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
         model, (None, 0, 0)
@@ -212,6 +215,9 @@ def train(
             batch_sharding,
         )
 
+        # Make sure the seen events conforms to the model context size
+        seen_events = jax.vmap(AudioToMidiDatasetLoader.truncate_midi_event_to_context_size, (0, None))(seen_events, model_config["midi_event_context_size"])
+
         (loss, individual_losses), model, state, key = compute_training_step(
             model,
             audio_frames,
@@ -270,8 +276,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v2")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/debug2")
 
     num_devices = len(jax.devices())
 
@@ -284,8 +290,8 @@ def main():
     dataset_prefetch_count = 0
     dataset_num_workers = 1
 
-    num_samples_to_load=10
-    num_samples_to_maintain=batch_size * 10
+    num_samples_to_load=16
+    num_samples_to_maintain=batch_size * 8
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)

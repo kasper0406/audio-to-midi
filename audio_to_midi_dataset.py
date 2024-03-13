@@ -488,7 +488,7 @@ class AudioToMidiDatasetLoader:
         self,
         num_samples_to_load: int,
         num_samples_to_maintain: int,
-        sleep_time: int = 1 # seconds
+        sleep_time: int = 30 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -660,6 +660,24 @@ class AudioToMidiDatasetLoader:
             raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
         return list(sorted(audio_names))
+
+    @partial(jax.jit, static_argnames=["context_size"])
+    def truncate_midi_event_to_context_size(
+        generated_output: Integer[Array, "midi_seq_len 3"],
+        context_size: int) -> Integer[Array, "midi_event_context_size 3"]:
+        num_events = jnp.count_nonzero(generated_output[:, 1] != BLANK_MIDI_EVENT, axis=0)
+        offset = jnp.maximum(0, num_events - context_size)
+        generated_output = jnp.roll(generated_output, shift=-offset, axis=0)
+        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < num_events
+        generated_output = jnp.where(mask, generated_output, blank_event)
+        generated_output = generated_output[0:context_size, ...]
+
+        # Pad with necessary blank events to always reach the fixed context size
+        padded_blanks = jnp.repeat(blank_event[None, ...], repeats=context_size, axis=0)
+        generated_output = padded_blanks.at[:generated_output.shape[0], ...].set(generated_output)
+
+        return generated_output
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
