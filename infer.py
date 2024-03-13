@@ -221,7 +221,7 @@ def load_newest_checkpoint(checkpoint_path: Path):
 
 def main():
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
     key = jax.random.PRNGKey(1234)
     inference_key, dataset_loader_key, test_loss_key = jax.random.split(key, num=3)

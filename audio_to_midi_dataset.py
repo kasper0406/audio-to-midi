@@ -399,7 +399,9 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(num_samples_to_load)
+        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(
+            num_samples_to_load,
+            minimum_midi_event_size=128)
         refresh_thread = threading.Thread(
             target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load, num_samples_to_maintain=num_samples_to_maintain),
             daemon=True,
