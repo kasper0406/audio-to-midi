@@ -20,6 +20,7 @@ from numpy.typing import NDArray
 from typing import Optional
 from threading import Lock
 import math
+import rust_plugins
 
 import parallel_audio_reader
 
@@ -154,7 +155,7 @@ def events_from_sample(
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
-    return jnp.array(
+    return np.array(
         [(0.0, SEQUENCE_START, BLANK_VELOCITY)]
         + sorted(events)
         + [(0.0, SEQUENCE_END, BLANK_VELOCITY)],
@@ -792,11 +793,43 @@ def benchmark():
 
                         benchmark_csv.writerow([batch_size, prefetch_count, num_workers, generated_samples, finished_time - start_time])
 
+def benchmark_event_loading():
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v2")
+    all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
+    batch_size = 4096
+
+    print("Starting benchmark...")
+    for i in range(0, 16):
+        python_samples = random.sample(all_sample_names, batch_size)
+        rust_samples = random.sample(all_sample_names, batch_size)
+
+        rust_start = time.time()
+        rust_version = rust_plugins.events_from_samples(str(dataset_dir), rust_samples, MAX_EVENT_TIMESTAMP)
+        rust_stop = time.time()
+        print(f"Rust time: {rust_stop - rust_start}")
+
+        python_start = time.time()
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            python_version = list(
+                executor.map(lambda sample: events_from_sample(dataset_dir, sample), python_samples)
+            )
+        python_stop = time.time()
+        print(f"Python time: {python_stop - python_start}")
+
+        # all_equal = True
+        # for (py_events, rust_events) in zip(python_version, rust_version):
+        #     all_equal = all_equal and np.allclose(py_events, rust_events)
+        # print(f"All equal? {all_equal}")
+
 
 if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
+
+    benchmark_event_loading()
+
+    exit(0)
 
     # benchmark()
 

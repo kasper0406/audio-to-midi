@@ -25,11 +25,11 @@ struct EventRecord {
     velocity: f32,
 }
 
-fn key_to_event(key: u32) -> i32 {
-    2 + (key - 21) as i32
+fn key_to_event(key: u32) -> u32 {
+    2 + (key - 21) as u32
 }
 
-type MidiEvents = Vec<(f32, i32, f32)>;
+type MidiEvents = Vec<(f32, u32, f32)>;
 
 async fn process_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std::io::Error> {
     let mut file = File::open(path).await?;
@@ -44,11 +44,13 @@ async fn process_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std
     reader.set_headers(csv::StringRecord::from(vec!["time", "duration", "key", "velocity"]));
 
     let mut events = vec![];
+    let mut max_velocity: f32 = 0.0;
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
                 if record.time < max_event_time {
                     events.push( (record.time, key_to_event(record.key) + 88, record.velocity) );
+                    max_velocity = max_velocity.max(record.velocity)
                 }
                 if record.time + record.duration < max_event_time + 5.0 * epsilon {
                     let release_time = max_event_time.min(record.time + record.duration - epsilon);
@@ -60,10 +62,18 @@ async fn process_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std
     }
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
 
+    // Normalize the velocity. TODO: Refactor this
+    if max_velocity != 0.0 {
+        for i in 0..events.len() {
+            let (time, key, velocity) = events[i];
+            events[i] = (time, key, velocity / max_velocity);
+        }
+    }
+
     let mut events_with_padding: MidiEvents = vec![];
-    events_with_padding.push((0.0, 0, 0.0));
+    events_with_padding.push((0.0, 1, 0.0));
     events_with_padding.append(&mut events);
-    events_with_padding.push((0.0, -1, 0.0));
+    events_with_padding.push((0.0, 0, 0.0));
     Ok(events_with_padding)
 }
 
@@ -84,15 +94,16 @@ fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, m
 
     let all_events = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
-            let mut join_set = JoinSet::new();
+            let mut futures = vec![];
 
             for sample_file in sample_files {
-                join_set.spawn(async move { process_file(&sample_file, max_event_time).await });
+                let future = TOKIO_RUNTIME.spawn(async move { process_file(&sample_file, max_event_time).await });
+                futures.push(future);
             }
 
             let mut all_events = vec![];
-            while let Some(result) = join_set.join_next().await {
-                match result {
+            for future in futures {
+                match future.await {
                     Ok(Ok(events)) => {
                         all_events.push(events);
                     },
