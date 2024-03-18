@@ -31,7 +31,7 @@ fn key_to_event(key: u32) -> u32 {
 
 type MidiEvents = Vec<(f32, u32, f32)>;
 
-async fn process_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std::io::Error> {
+async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std::io::Error> {
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
@@ -77,13 +77,12 @@ async fn process_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std
     Ok(events_with_padding)
 }
 
-#[pyfunction]
-fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, max_event_time: f32) -> PyResult<Py<PyList>> {
+fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
     let mut sample_files = vec![];
     for maybe_sample_name in sample_names {
         match maybe_sample_name.extract::<String>() {
             Ok(sample_name) => {
-                let sample_csv_file = format!("{}/{}.csv", dataset_dir, sample_name);
+                let sample_csv_file = format!("{}/{}", dataset_dir, sample_name);
                 sample_files.push(sample_csv_file);
             },
             Err(_) => {
@@ -91,13 +90,19 @@ fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, m
             }
         }
     }
+    Ok(sample_files)
+}
+
+#[pyfunction]
+fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, max_event_time: f32) -> PyResult<Py<PyList>> {
+    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let all_events = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
             let mut futures = vec![];
 
             for sample_file in sample_files {
-                let future = TOKIO_RUNTIME.spawn(async move { process_file(&sample_file, max_event_time).await });
+                let future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&format!["{}.csv", sample_file], max_event_time).await });
                 futures.push(future);
             }
 
@@ -132,12 +137,61 @@ fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, m
         }
         numpy_results.push(np_array);
     }
+    Ok(PyList::new(py, &numpy_results).into())
+}
 
+async fn load_audio_sample(file: &str, max_duration: f32) -> Result<Vec<f32>, std::io::Error> {
+    Ok(vec![])
+}
+
+#[pyfunction]
+fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, max_duration: f32) -> PyResult<Py<PyList>> {
+    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+
+    let all_samples = py.allow_threads(move || {
+        TOKIO_RUNTIME.block_on(async {
+            let mut futures = vec![];
+
+            for sample_file in sample_files {
+                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&sample_file, max_duration).await });
+                futures.push(future);
+            }
+
+            let mut all_samples = vec![];
+            for future in futures {
+                match future.await {
+                    Ok(Ok(samples)) => {
+                        all_samples.push(samples);
+                    },
+                    Ok(Err(err)) => {
+                        return Err(PyTypeError::new_err(format!("Failed to read sample: {:?}", err)))
+                    },
+                    Err(err) => {
+                        return Err(PyTypeError::new_err(format!("Error during processing: {:?}", err)))
+                    }
+                }
+            }
+            Ok(all_samples)
+        })
+    }).unwrap();
+
+    let mut numpy_results = vec![];
+    for samples in all_samples {
+        let mut np_array = PyArray1::<f32>::zeros(py, samples.len(), false);
+        {
+            let mut array_read_write = np_array.readwrite();
+            for i in 0..samples.len() {
+                *array_read_write.get_mut(i).unwrap() = samples[i];
+            }
+        }
+        numpy_results.push(np_array);
+    }
     Ok(PyList::new(py, &numpy_results).into())
 }
 
 #[pymodule]
 fn rust_plugins(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(events_from_samples, m)?)?;
+    m.add_function(wrap_pyfunction!(load_audio_samples, m)?)?;
     Ok(())
 }
