@@ -589,7 +589,7 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def _convert_samples(cls, samples: Float[Array, "count samples"]):
-        desired_fft_duration = 20 # ms
+        desired_fft_duration = 30 # ms
         samples_per_fft = next_power_of_2(int(AudioToMidiDatasetLoader.SAMPLE_RATE * (desired_fft_duration / 1000)))
         duration_per_frame = samples_per_fft / AudioToMidiDatasetLoader.SAMPLE_RATE
         frames = jax.vmap(fft_audio, (0, None))(samples, samples_per_fft)
@@ -604,7 +604,7 @@ class AudioToMidiDatasetLoader:
     def load_midi_events_real_time_positions(
         cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
     ):
-        with ThreadPoolExecutor(max_workers=256) as executor:
+        with ThreadPoolExecutor(max_workers=64) as executor:
             unpadded_midi_events = list(
                 executor.map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
             )
