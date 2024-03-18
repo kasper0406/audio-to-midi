@@ -651,29 +651,28 @@ def visualize_sample(
 
 
 def benchmark():
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    with open('dataset_benchmark.csv', mode='w', buffering=1) as benchmark_file:
-        benchmark_csv = csv.writer(benchmark_file)
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v2")
+    with AudioToMidiDatasetLoader(
+        dataset_dir=dataset_dir,
+        batch_size=256,
+        prefetch_count=0,
+        num_workers=2,
+        key=key,
+    ) as dataset_loader:
+        dataset_loader_iter = iter(dataset_loader)
 
-        for batch_size in [32,64,128,256,512,1024,2048,4096,8192]:
-            for prefetch_count in [0,1,2,4,8]:
-                for num_workers in [1,2,4,8]:
-                    with AudioToMidiDatasetLoader(
-                        dataset_dir=dataset_dir,
-                        batch_size=batch_size,
-                        prefetch_count=prefetch_count,
-                        num_workers=num_workers,
-                        key=key,
-                    ) as dataset_loader:
-                        dataset_loader_iter = iter(dataset_loader)
+        times = []
+        samples = 10
+        for i in range(samples):
+            start_time = time.time()
+            generated_samples = 0
+            for num, loaded_batch in zip(range(0, 1000), dataset_loader_iter):
+                generated_samples += loaded_batch["audio_frames"].shape[0]
+            finished_time = time.time()
+            times.append(finished_time - start_time)
 
-                        start_time = time.time()
-                        generated_samples = 0
-                        for num, loaded_batch in zip(range(0, 100), dataset_loader_iter):
-                            generated_samples += loaded_batch["audio_frames"].shape[0]
-                        finished_time = time.time()
-
-                        benchmark_csv.writerow([batch_size, prefetch_count, num_workers, generated_samples, finished_time - start_time])
+        times = sorted(times)
+        print(f"P50: {times[samples/2]}, Min: {times[0]}, Max: {times[samples - 1]}")
 
 
 if __name__ == "__main__":
@@ -681,7 +680,7 @@ if __name__ == "__main__":
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
-    # benchmark()
+    benchmark()
 
     # sample_rate, samples = load_audio_and_normalize(
     #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
