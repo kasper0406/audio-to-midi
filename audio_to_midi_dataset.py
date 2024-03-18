@@ -248,35 +248,6 @@ def time_shift_audio_and_events(
     return frames, midi_events
 
 
-@partial(jax.jit, static_argnames=["duration_per_frame"])
-def perturb_midi_event_positions(
-    key: jax.random.PRNGKey,
-    midi_events: Float[Array, "num_events 3"],
-    duration_per_frame: float,
-):
-    """
-    It is unlikely that we will have positions inferred completely correctly all the time, for two main reasons:
-     1. Miliseconds of precision could be a bit skewed in training data and there may be a bit of variability between sampled instruments etc
-     2. In the training objectibe function because of 1 we predict with a prob dist around the dataset position
-    We will pick the new positions using a Gaussian prob distribution around the desired location, and make sure events
-    maintain the same order as in the training dataset by taking the commulative max
-    """
-    pertubation = jnp.round(
-        jax.random.normal(key, shape=(midi_events.shape[0],)) * 2 # Perturb with a normal distribution with a variance of 2 frames
-    ).astype(jnp.int16)
-    pertubation = pertubation + midi_events[:, 0]
-    # Make sure the new perturbated event positions are monotonically increasing
-    pertubation = jax.lax.cummax(pertubation)
-
-    # Do not alter special events
-    special_events = max(SEQUENCE_START, SEQUENCE_END, BLANK_MIDI_EVENT)
-    adjusted_event_positions = jnp.select(
-        [midi_events[:, 1] > special_events], [pertubation], midi_events[:, 0]
-    )
-
-    return midi_events.at[:, 0].set(adjusted_event_positions)
-
-
 @partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
@@ -291,8 +262,7 @@ def generate_batch(
         sample_key,
         midi_split_key,
         time_shift_key,
-        position_pertubation_key,
-    ) = jax.random.split(key, num=5)
+    ) = jax.random.split(key, num=4)
     # TODO: Re-structure these transformations in a nicer way
     timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
     selected_audio_frames, selected_midi_events = jax.vmap(
@@ -330,16 +300,6 @@ def generate_batch(
         [~seen_event_mask],
         [blank_events],
         selected_midi_events
-    )
-
-    # We only perturb the seen events, and leave the next event to predict non-perturbed
-    position_pertubation_keys = jax.random.split(
-        position_pertubation_key, num=seen_events.shape[0]
-    )
-    seen_events = jax.vmap(perturb_midi_event_positions, (0, 0, None))(
-        position_pertubation_keys,
-        seen_events,
-        float(duration_per_frame_in_secs),
     )
 
     # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
