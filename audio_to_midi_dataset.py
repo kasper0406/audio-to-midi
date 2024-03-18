@@ -87,17 +87,17 @@ def fft_audio(
 
 
 def events_from_sample(
-    dataset_dir: str, sample: str
+    dataset_dir: str, sample: str, duration_per_frame: float,
 ) -> Float[Array, "max_number_of_events 3"]:
     """
     Returns a numpy array with tuples of (timestamp in seconds, midi event id, velocity)
     """
-    epsilon = 0.05 # HACK: We want to make sure that because of numeic accuracy the release events
-                   # comes before potential subsequent attach events
+    epsilon = duration_per_frame # HACK: We want to make sure that because of numeic accuracy the release events
+                                 # comes before potential subsequent attack events
     def key_to_event(key: int):
         return 2 + (key - 21)
 
-    events = []
+    raw_events = []
     max_velocity = 0.0
     with open(f"{dataset_dir}/{sample}.csv", "r") as csvfile:
         reader = csv.reader(csvfile)
@@ -114,27 +114,36 @@ def events_from_sample(
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
             if attack_time < MAX_EVENT_TIMESTAMP:
-                events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
+                raw_events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
                 max_velocity = max(max_velocity, velocity)
             if attack_time + duration < MAX_EVENT_TIMESTAMP + 5 * epsilon:
                 # HACK: If `attack_time + duration > MAX_EVENT_TIMESTAMP` we will clamp it to `MAX_EVENT_TIMESTAMP`
                 #       This has to do with the generated dataset in that it has a quirk that the release may be
                 #       slightly beyond `MAX_EVENT_TIMESTAMP`, but in reality the note has been released
                 #       I should be able to delete this once I fix and re-generate the dataset
-                events.append(
+                raw_events.append(
                     (min(attack_time + duration - epsilon, MAX_EVENT_TIMESTAMP), key_to_event(key), BLANK_VELOCITY)
                 )  # Release
 
     # Re-normalize velocities as we normalize the audio level as well
-    if max_velocity != 0.0:
-        events = [ (event[0], event[1], event[2] / max_velocity) for event in events ]
+    events = []
+    for time_pos, key, velocity_float in raw_events:
+        # Real time to frame position
+        position = round(time_pos / duration_per_frame)
+
+        # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
+        normalized_velocity = velocity_float / max_velocity if max_velocity > 0.0 else velocity_float
+        velocity = round(normalized_velocity * NUM_VELOCITY_CATEGORIES)
+        
+        events.append((position, key, velocity))
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
     return jnp.array(
         [(0.0, SEQUENCE_START, BLANK_VELOCITY)]
         + sorted(events)
-        + [(0.0, SEQUENCE_END, BLANK_VELOCITY)]
+        + [(0.0, SEQUENCE_END, BLANK_VELOCITY)],
+        dtype=jnp.int16
     )
 
 
@@ -153,8 +162,8 @@ def time_shift_audio_and_events(
     # we will still include the event and reset its position to 0. This is because there's usually a slight delay in the
     # audio samples, and the FFT will aggregate information over a short time period.
     # This mainly occours when predicting the start of a new audio file and the audio starts right away (frequent in the training data).
-    epsilon = 2  # frames
-    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=-100, maxval=100)).astype(jnp.int16)
+    epsilon = 1  # frames
+    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=-30, maxval=30)).astype(jnp.int16)
 
     # Handle audio samples
     audio_frame_positions = jnp.arange(frames.shape[0])
@@ -266,29 +275,6 @@ def perturb_midi_event_positions(
     )
 
     return midi_events.at[:, 0].set(adjusted_event_positions)
-
-@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
-def convert_position_and_velocity(event: Float[Array, "3"], duration_per_frame_in_secs: float) -> Integer[Array, "3"]:
-    """
-    Positions and velocities are represented as floats in the dataset:
-        - position: The number of seconds since the beginning as a float
-        - velocity: A float between 0.0 and 1.0 indicating the velocity of the event
-    We convert both of them to integers so they can be understood by the model.
-    """
-    position = jnp.round(event[0] / duration_per_frame_in_secs).astype(jnp.int16)
-    velocity = jnp.round(event[2] * NUM_VELOCITY_CATEGORIES).astype(
-        jnp.int16
-    )  # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
-    return jnp.array([position, event[1], velocity]).astype(jnp.int16)
-
-@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
-def event_positions_to_frame_time(
-    selected_midi_events: Float[Array, "3"], duration_per_frame_in_secs: Float
-) -> Integer[Array, "3"]:
-    # Express midi event position in terms of frames and convert the array to an integer array
-    return jnp.apply_along_axis(
-        partial(convert_position_and_velocity, duration_per_frame_in_secs=duration_per_frame_in_secs), 2, selected_midi_events
-    ).astype(jnp.int16)
 
 
 @partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs"])
@@ -601,12 +587,12 @@ class AudioToMidiDatasetLoader:
         return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame
 
     @classmethod
-    def load_midi_events_real_time_positions(
-        cls, dataset_dir: Path, sample_names: [str], minimum_size: Optional[int] = None
+    def load_midi_events_frame_time_positions(
+        cls, dataset_dir: Path, sample_names: [str], duration_per_frame: float, minimum_size: Optional[int] = None
     ):
         with ThreadPoolExecutor(max_workers=64) as executor:
             unpadded_midi_events = list(
-                executor.map(lambda sample: events_from_sample(dataset_dir, sample), sample_names)
+                executor.map(lambda sample: events_from_sample(dataset_dir, sample, duration_per_frame), sample_names)
             )
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
         if minimum_size is not None:
@@ -629,19 +615,6 @@ class AudioToMidiDatasetLoader:
         ]
         stacked_events = np.stack(padded_midi_events, axis=0)
         return stacked_events
-
-    @classmethod
-    def load_midi_events_frame_time_positions(
-        cls, dataset_dir: Path, sample_names: [str], duration_per_frame: float, minimum_size: Optional[int] = None
-    ):
-        events_real_time_positions = (
-            AudioToMidiDatasetLoader.load_midi_events_real_time_positions(
-                dataset_dir, sample_names, minimum_size
-            )
-        )
-        return event_positions_to_frame_time(
-            events_real_time_positions, duration_per_frame
-        )
 
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
