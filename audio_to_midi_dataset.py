@@ -126,7 +126,8 @@ def events_from_sample(
                 )  # Release
 
     # Re-normalize velocities as we normalize the audio level as well
-    events = [ (event[0], event[1], event[2] / max_velocity) for event in events ]
+    if max_velocity != 0.0:
+        events = [ (event[0], event[1], event[2] / max_velocity) for event in events ]
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
     # TODO: Find a nicer way...
@@ -368,7 +369,7 @@ def generate_batch(
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 44100.0
+    SAMPLE_RATE = 20000.0 # Sample rate to allow frequencies up to 10k Hz
 
     def __init__(
         self,

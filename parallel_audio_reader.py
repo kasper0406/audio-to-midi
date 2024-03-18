@@ -9,11 +9,11 @@ from jaxtyping import Array, Float
 from pydub import AudioSegment
 
 
-def load_audio(file: Path, sample_rate, duration: Optional[int] = 5000, pad_to_fixed_duration: bool = True) -> Float[Array, "num_samples"]:
+def load_audio(file: Path, sample_rate: float, duration: Optional[int] = 5000, pad_to_fixed_duration: bool = True) -> Float[Array, "num_samples"]:
     """Loads an audio file and returns the sample rate along with the normalized samples."""
     audio = AudioSegment.from_file(file)
     audio = audio.set_frame_rate(
-        sample_rate
+        int(sample_rate)
     )  # Resample to the frequency we operate in
 
     # Make the audio be of length exactly `duration`
@@ -26,12 +26,14 @@ def load_audio(file: Path, sample_rate, duration: Optional[int] = 5000, pad_to_f
 
     samples = audio.split_to_mono()[0].get_array_of_samples()
     left_channel_samples = np.array(samples).T.astype(np.float16)
-    left_channel_samples = left_channel_samples / np.max(np.abs(left_channel_samples))
+    max_sample_value = np.max(np.abs(left_channel_samples))
+    if max_sample_value > 0.0: # Protect against silent audio files
+        left_channel_samples = left_channel_samples / max_sample_value
     return left_channel_samples
 
 
 def load_audio_files(
-    sample_rate, files_to_load: list[Path], duration: 5000
+    sample_rate: float, files_to_load: list[Path], duration: 5000
 ) -> Float[Array, "num_files num_samples"]:
     with ThreadPoolExecutor(max_workers=256) as executor:
         all_audio_frames = list(

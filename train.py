@@ -366,5 +366,5 @@ if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
     jax.config.update("jax_threefry_partitionable", True)
 
-    with jax.profiler.trace("/tmp/jax-trace"):
-        main()
+    # with jax.profiler.trace("/tmp/jax-trace"):
+    main()
