@@ -328,7 +328,7 @@ def main():
             args=ocp.args.StandardRestore(audio_to_midi),
         )
 
-    tx = optax.adam(learning_rate=learning_rate_schedule)
+    tx = optax.lion(learning_rate=learning_rate_schedule)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0), tx
     )  # TODO: Investigate clip by RMS
