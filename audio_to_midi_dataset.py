@@ -29,7 +29,7 @@ SEQUENCE_END = 0
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
-FRAME_BLANK_VALUE = -(4/3)
+FRAME_BLANK_VALUE = 0
 
 @partial(jax.jit, donate_argnames=["frames"])
 def perturb_audio_frames(
@@ -48,28 +48,34 @@ def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
 
-@partial(jax.jit, static_argnames=["samples_per_fft"])
+# Overlap is in the percentage of the `window_size`` and should be in ]0;1[
+@partial(jax.jit, static_argnames=["window_size", "overlap"])
 def fft_audio(
-    samples: NDArray[jnp.float32], samples_per_fft: int
+    signal: NDArray[jnp.float32], window_size: int, overlap: float = 0.5
 ) -> NDArray[jnp.float32]:
-    """Computes the fft of the audio samples
-    Returns a tuple of the frame duration in seconds, and the complex FFT components
-
-    Args:
-        fft_duration: The duration in ms to compute the fft for. It will be rounded to the next
-                      power of 2 samples
+    """Computes the spectrogram of an audio signal.
     """
-    if samples_per_fft != next_power_of_2(samples_per_fft):
+    if window_size != next_power_of_2(window_size):
         raise "samples_per_fft must be a power of 2"
+    hop_size = int(window_size * overlap)
 
-    num_padding_symbols = samples_per_fft - (samples.shape[0] % samples_per_fft)
-    if num_padding_symbols == samples_per_fft:
-        num_padding_symbols = 0
-    padded_data = jnp.pad(samples, (0, num_padding_symbols), constant_values=0)
-    data = padded_data.reshape(
-        (int(padded_data.shape[0] / samples_per_fft), samples_per_fft)
+    # Reshape the signal to match the expected input shape for conv_general_dilated_patches
+    # The function expects (batch, spatial_dims..., features), so we add extra dimensions to fit
+    signal = signal.reshape(1, -1, 1)  # Batch size = 1, 1 feature
+
+    # Window the input signal and apply a Hann window
+    hann_window = jnp.hanning(window_size)
+    patches = jax.lax.conv_general_dilated_patches(
+        lhs=signal,
+        filter_shape=(window_size,),
+        window_strides=(hop_size,),
+        padding='VALID',
+        dimension_numbers=('NWC', 'WIO', 'NWC'),
     )
-    fft = jnp.fft.fft(data)
+    windows = patches.squeeze(axis=(0,)) * hann_window
+
+    # Apply the FFT
+    fft = jnp.fft.fft(windows)
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
@@ -264,10 +270,10 @@ def generate_batch(
         time_shift_key,
     ) = jax.random.split(key, num=4)
     # TODO: Re-structure these transformations in a nicer way
-    timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
-    selected_audio_frames, selected_midi_events = jax.vmap(
-        time_shift_audio_and_events, (None, 0, 0, 0)
-    )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
+    # timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
+    # selected_audio_frames, selected_midi_events = jax.vmap(
+    #     time_shift_audio_and_events, (None, 0, 0, 0)
+    # )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
 
     sample_keys = jax.random.split(sample_key, num=batch_size)
     selected_audio_frames = jax.vmap(perturb_audio_frames, (0, 0))(
@@ -435,7 +441,7 @@ class AudioToMidiDatasetLoader:
         self,
         num_samples_to_load: int,
         num_samples_to_maintain: int,
-        sleep_time: int = 1 # seconds
+        sleep_time: int = 10 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -535,10 +541,10 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def _convert_samples(cls, samples: Float[Array, "count samples"]):
-        desired_fft_duration = 30 # ms
-        samples_per_fft = next_power_of_2(int(AudioToMidiDatasetLoader.SAMPLE_RATE * (desired_fft_duration / 1000)))
-        duration_per_frame = samples_per_fft / AudioToMidiDatasetLoader.SAMPLE_RATE
-        frames = jax.vmap(fft_audio, (0, None))(samples, samples_per_fft)
+        samples_per_fft = 2048
+        overlap = 0.5 # 50% overlap between frames
+        duration_per_frame = (samples_per_fft * overlap) / AudioToMidiDatasetLoader.SAMPLE_RATE
+        frames = jax.vmap(fft_audio, (0, None, None))(samples, samples_per_fft, overlap)
 
         # Select only the lowest 10_000 Hz frequencies
         cutoff_frame = int(10_000 * duration_per_frame)

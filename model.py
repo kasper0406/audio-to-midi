@@ -626,7 +626,7 @@ class OutputSequenceGenerator(eqx.Module):
     ) -> Float[
         Array, "midi_voccab_size"
     ]:  # Probability distribution over the midi events:
-        generated_output = OutputSequenceGenerator._trim_midi_event_to_context_size(
+        generated_output = OutputSequenceGenerator._truncate_midi_event_to_context_size(
             generated_output, context_size=self.midi_event_context_size)
         return self.call_model(input_frames, generated_output, key, enable_dropout)
 
@@ -668,12 +668,14 @@ class OutputSequenceGenerator(eqx.Module):
         return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
 
     @partial(jax.jit, static_argnames=["context_size"])
-    def _trim_midi_event_to_context_size(generated_output: Integer[Array, "midi_seq_len 3"], context_size: int) -> Integer[Array, "midi_event_context_size 3"]:
+    def _truncate_midi_event_to_context_size(generated_output: Integer[Array, "midi_seq_len 3"], context_size: int) -> Integer[Array, "midi_event_context_size 3"]:
+        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+
         num_events = jnp.count_nonzero(generated_output[:, 1] != BLANK_MIDI_EVENT, axis=0)
         offset = jnp.maximum(0, num_events - context_size)
         generated_output = jnp.roll(generated_output, shift=-offset, axis=0)
-        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
-        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < num_events
+        events_to_keep = num_events - offset
+        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < events_to_keep
         generated_output = jnp.where(mask, generated_output, blank_event)
         generated_output = generated_output[0:context_size, ...]
 

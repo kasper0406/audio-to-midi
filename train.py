@@ -18,6 +18,17 @@ from functools import reduce
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
 from model import OutputSequenceGenerator, model_config
 
+
+# List of ideas:
+#  - Double check logic for event context windows
+#  - Try to disable noise in audio frames
+#  - Try to changge audio frame offset to 0, to maybe give attention mechanism an easier time?
+#  - Give the model the list of currently playing notes
+#  - No extra midi keys for releases - play note at velocity 0
+#  - Try different optimizer (LAMB) allowing larger batch sizes on GPU
+
+
+
 @eqx.filter_jit
 def continous_probability_loss(probs, expected, variance):
     """
@@ -317,7 +328,7 @@ def main():
             args=ocp.args.StandardRestore(audio_to_midi),
         )
 
-    tx = optax.adam(learning_rate=learning_rate_schedule)
+    tx = optax.lion(learning_rate=learning_rate_schedule)
     tx = optax.chain(
         optax.clip_by_global_norm(1.0), tx
     )  # TODO: Investigate clip by RMS
