@@ -7,11 +7,11 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Integer, PRNGKeyArray
 
 import position_encoding
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE
 
 model_config = {
     "frame_size": 512,
-    "max_frame_sequence_length": 98,
+    "max_frame_sequence_length": 98 + 1,
     "attention_size": 256,
     "intermediate_size": 1024,
     "num_heads": 4,
@@ -64,11 +64,7 @@ class FrameEmbedding(eqx.Module):
 class MidiVocabulary(eqx.Module):
     """Takes midi events and creates an embedding of them:
 
-    Fixed representation. An event is described by: Type x Key
-       where
-            Type: { ATTACK, RELEASE, END_OF_SEQUENCE }
-            Key: [0..<88]
-            # Velocity: Float
+    A midi event with velocity 0 is taken to mean a release of the midi note.
 
     Notice we put releases prior to attacks in terms of midi event, this is to hopefully have
     to maintain as little context as possible in the model.
@@ -76,19 +72,20 @@ class MidiVocabulary(eqx.Module):
     Enumarate in the following way:
       0: SEQUENCE_END
       1: SEQUENCE_START
-      2: (RELEASE, 0)
-      3: (RELEASE, 1)
-      ...
-      90: (ATTACK, 0)
-      91: (ATTACK, 1)
+      3: ACTIVE_EVENT_SEPARATOR
       ...
 
-    For a total voccab size of 2 + 2 * 88 = 178
+    The `ACTIVE_EVENT_SEPARATOR` is a special token used to indicate to the model that all events listed
+    after are currently played notes that will at some point need to be released. This is to make it easier
+    for the model and avoid active events being lost due to the event context size.
+    The `ACTIVE_EVENT_SEPARATOR` event will be provided with the timestamp of the last seen event.
+
+    For a total voccab size of 3 + 88 = 91
     """
 
     @classmethod
     def voccab_size(cls):
-        return 178
+        return MIDI_EVENT_VOCCAB_SIZE
 
     @classmethod
     def num_velocities(cls):

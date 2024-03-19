@@ -23,9 +23,12 @@ import math
 import parallel_audio_reader
 
 # TODO: Clean this up
+MIDI_EVENT_VOCCAB_SIZE = 91
+
 MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1
 SEQUENCE_END = 0
+ACTIVE_EVENT_SEPARATOR = 2
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
@@ -101,7 +104,7 @@ def events_from_sample(
     epsilon = duration_per_frame # HACK: We want to make sure that because of numeic accuracy the release events
                                  # comes before potential subsequent attack events
     def key_to_event(key: int):
-        return 2 + (key - 21)
+        return 3 + (key - 21)
 
     raw_events = []
     max_velocity = 0.0
@@ -119,17 +122,21 @@ def events_from_sample(
 
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
-            if attack_time < MAX_EVENT_TIMESTAMP:
-                raw_events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
+            if attack_time < MAX_EVENT_TIMESTAMP - duration_per_frame:
+                raw_events.append((attack_time, key_to_event(key), velocity)) # Attack
                 max_velocity = max(max_velocity, velocity)
             if attack_time + duration < MAX_EVENT_TIMESTAMP + 5 * epsilon:
+                release_time = attack_time + duration
+                # Due to the way we sort the events, we can not have a release event in the same frame as the
+                # attack event. We therefore make sure the release time will fall into the next frame bucket.
+                release_time = max(release_time, attack_time + duration_per_frame)
                 # HACK: If `attack_time + duration > MAX_EVENT_TIMESTAMP` we will clamp it to `MAX_EVENT_TIMESTAMP`
                 #       This has to do with the generated dataset in that it has a quirk that the release may be
                 #       slightly beyond `MAX_EVENT_TIMESTAMP`, but in reality the note has been released
                 #       I should be able to delete this once I fix and re-generate the dataset
-                raw_events.append(
-                    (min(attack_time + duration - epsilon, MAX_EVENT_TIMESTAMP), key_to_event(key), BLANK_VELOCITY)
-                )  # Release
+                release_time = min(release_time, MAX_EVENT_TIMESTAMP)
+
+                raw_events.append((release_time, key_to_event(key), BLANK_VELOCITY)) # Release
 
     # Re-normalize velocities as we normalize the audio level as well
     events = []
@@ -138,9 +145,12 @@ def events_from_sample(
         position = round(time_pos / duration_per_frame)
 
         # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
-        normalized_velocity = velocity_float / max_velocity if max_velocity > 0.0 else velocity_float
-        velocity = round(normalized_velocity * NUM_VELOCITY_CATEGORIES)
         
+        velocity = 0
+        if velocity_float > 0.0:
+            normalized_velocity = velocity_float / max_velocity if max_velocity > 0.0 else velocity_float
+            velocity = max(1, round(normalized_velocity * NUM_VELOCITY_CATEGORIES))
+
         events.append((position, key, velocity))
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
@@ -253,6 +263,73 @@ def time_shift_audio_and_events(
 
     return frames, midi_events
 
+def find_active_events(carry, event: Integer[Array, "3"]):
+    index, active_events, released_keys = carry
+
+    next_active_events = jnp.select([
+        event[1] == BLANK_MIDI_EVENT,
+        event[2] == BLANK_VELOCITY,
+        ~released_keys[event[1]],
+    ],
+    [
+        active_events, # Blank event
+        active_events, # Release key event
+        active_events.at[index].set(True), # Attack event, and it has not been released! It is active!
+    ],
+    active_events).astype(jnp.bool_)
+
+    next_release_events = jnp.select([
+        event[1] == BLANK_MIDI_EVENT,
+        event[2] == BLANK_VELOCITY,
+    ],
+    [
+        released_keys, # Blank event
+        released_keys.at[event[1]].set(True), # Release key event
+    ],
+    released_keys).astype(jnp.bool_)
+
+    return (index - 1, next_active_events, next_release_events), jnp.zeros(0)
+
+
+@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
+def get_active_events(seen_events: Float[Array, "max_len 3"], duration_per_frame_in_secs: float):
+    # Find the indices of the active events within the `seen_events`array
+    empty_state = (
+        seen_events.shape[0] - 1, # index
+        jnp.zeros(seen_events.shape[0], dtype=jnp.bool_), # (active event indicator
+        jnp.zeros(MIDI_EVENT_VOCCAB_SIZE, dtype=jnp.bool_) # released keys indicator
+    )
+    (_, active_events, _), _ = jax.lax.scan(find_active_events, empty_state, seen_events, reverse=True)
+
+    # Using the indices, select them, and group them together
+    sorted_indices = jnp.argsort(active_events, kind='stable')
+    num_active = jnp.count_nonzero(active_events)
+    active_events = jnp.repeat(active_events[:, None], repeats=3, axis=1)
+    blank_events = jnp.repeat(jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[None, :], repeats=seen_events.shape[0], axis=0)
+    actual_active_events = jnp.where(active_events, seen_events, blank_events).astype(jnp.int16)
+    actual_active_events = actual_active_events[sorted_indices, ...]
+
+    # Place the active events at the position they should be appended to the `seen_events` array
+    # num_seen_events = jnp.count_nonzero(seen_events[:, 1] != BLANK_MIDI_EVENT)
+    # +1 to allow for the split event
+    # actual_active_events = jnp.roll(actual_active_events, shift=(num_active + num_seen_events + 1), axis=0)
+
+    # Place the active events at the beginning
+    actual_active_events = jnp.roll(actual_active_events, shift=num_active, axis=0)
+
+    # jax.debug.print("Found active events: {active} for seen events {seen}", active=actual_active_events, seen=seen_events)
+
+    # # Append the active events to the seen_events array
+    # end_position = int(MAX_EVENT_TIMESTAMP / duration_per_frame_in_secs) + 1
+    # actual_active_events = actual_active_events.at[:, 0].set(end_position) # Make all the non-closed events appear at the very end
+    # picking_mask = jnp.repeat((actual_active_events[:, 1] != 0)[:, None], repeats=3, axis=1)
+    # seen_events = jnp.where(picking_mask, actual_active_events, seen_events)
+    # active_event_separator = jnp.array([end_position, ACTIVE_EVENT_SEPARATOR, 0], dtype=jnp.int16)
+    # seen_events = seen_events.at[num_seen_events].set(active_event_separator)
+
+    # jax.debug.print("Seen events after {seen}", seen=seen_events)
+
+    return actual_active_events
 
 @partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
@@ -308,6 +385,9 @@ def generate_batch(
         selected_midi_events
     )
 
+    # Compute the set of active events so it can be used by the model
+    active_events = jax.vmap(get_active_events, (0, None))(seen_events, duration_per_frame_in_secs)
+
     # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
     # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
     # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
@@ -317,6 +397,7 @@ def generate_batch(
         "seen_events": seen_events,
         "next_event": next_events,
         "duration_per_frame_in_secs": duration_per_frame_in_secs,
+        "active_events": active_events,
     }
 
 
@@ -354,7 +435,7 @@ class AudioToMidiDatasetLoader:
 
         self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(
             num_samples_to_load,
-            minimum_midi_event_size=128)
+            minimum_midi_event_size=10)
         refresh_thread = threading.Thread(
             target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load, num_samples_to_maintain=num_samples_to_maintain),
             daemon=True,
@@ -644,12 +725,14 @@ def plot_frequency_domain_audio(
 def visualize_sample(
     frames: Float[Array, "num_samples"],
     seen_events: Integer[Array, "seen_array_length 2"],
-    next_event: Integer[Array, "2"],
+    next_event: Integer[Array, "3"],
+    active_events: Integer[Array, "3"],
     duration_per_frame_in_secs: float,
 ):
     print("Frames shape:", frames.shape)
     print("Duration per frame:", duration_per_frame_in_secs)
     print(f"Seen events: {seen_events}")
+    print(f"Active events: {active_events}")
     print(f"Next event: {next_event}")
     plot_frequency_domain_audio(duration_per_frame_in_secs, frames)
 
@@ -723,8 +806,8 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
-        batch_size=16,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v2"),
+        batch_size=1,
         prefetch_count=0,
         num_workers=1,
         key=key,
@@ -737,11 +820,13 @@ if __name__ == "__main__":
         print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
+        print(f"Active events shape: {num}", loaded_batch["active_events"].shape)
 
         batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
         visualize_sample(
             loaded_batch["audio_frames"][batch_idx],
             loaded_batch["seen_events"][batch_idx],
             loaded_batch["next_event"][batch_idx],
+            loaded_batch["active_events"][batch_idx],
             loaded_batch["duration_per_frame_in_secs"],
         )
