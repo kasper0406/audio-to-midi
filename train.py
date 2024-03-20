@@ -15,7 +15,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
 from functools import reduce
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
 
 
@@ -94,12 +94,12 @@ def compute_loss_from_output(
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
+def compute_loss(model, audio_frames, outputs_so_far, active_events, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-        model, in_axes=(0, 0, 0)
-    )(audio_frames, outputs_so_far, batched_keys)
+                model, in_axes=(0, 0, 0, 0)
+    )(audio_frames, outputs_so_far, active_events, batched_keys)
 
     loss, individual_losses = compute_loss_from_output(
         midi_logits, position_probs, velocity_probs, expected_next_output
@@ -109,13 +109,14 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
 
 @eqx.filter_jit
 def compute_training_step(
-    model, audio_frames, outputs_so_far, next_output, opt_state, key, tx
+    model, audio_frames, outputs_so_far, active_events, next_output, opt_state, key, tx
 ):
     key, new_key = jax.random.split(key)
     (loss, individual_losses), grads = compute_loss(
         model,
         audio_frames=audio_frames,
         outputs_so_far=outputs_so_far,
+        active_events=active_events,
         expected_next_output=next_output,
         key=key,
     )
@@ -156,10 +157,12 @@ def compute_test_loss(
     # Do not pick the last element with the full sequence, as there is nothing to predict
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
+    active_events = jax.vmap(get_active_events)(event_prefixes)
+
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-        model, (None, 0, 0)
-    )(audio_frames, event_prefixes, inference_keys)
+        model, (None, 0, 0, 0)
+    )(audio_frames, event_prefixes, active_events, inference_keys)
 
     losses, individual_losses = compute_loss_from_output(
         midi_logits,
@@ -218,8 +221,8 @@ def train(
 
     losses = []
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
-        (audio_frames, seen_events, next_event) = jax.device_put(
-            (batch["audio_frames"], batch["seen_events"], batch["next_event"]),
+        (audio_frames, seen_events, active_events, next_event) = jax.device_put(
+            (batch["audio_frames"], batch["seen_events"], batch["active_events"], batch["next_event"]),
             batch_sharding,
         )
 
@@ -227,6 +230,7 @@ def train(
             model,
             audio_frames,
             seen_events,
+            active_events,
             next_event,
             state,
             key,

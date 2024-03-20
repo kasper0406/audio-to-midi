@@ -23,7 +23,7 @@ import math
 import parallel_audio_reader
 
 # TODO: Clean this up
-MIDI_EVENT_VOCCAB_SIZE = 91
+MIDI_EVENT_VOCCAB_SIZE = 90
 
 MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1
@@ -291,8 +291,8 @@ def find_active_events(carry, event: Integer[Array, "3"]):
     return (index - 1, next_active_events, next_release_events), jnp.zeros(0)
 
 
-@partial(jax.jit, static_argnames=["duration_per_frame_in_secs"])
-def get_active_events(seen_events: Float[Array, "max_len 3"], duration_per_frame_in_secs: float):
+@jax.jit
+def get_active_events(seen_events: Float[Array, "max_len 3"]):
     # Find the indices of the active events within the `seen_events`array
     empty_state = (
         seen_events.shape[0] - 1, # index
@@ -386,7 +386,7 @@ def generate_batch(
     )
 
     # Compute the set of active events so it can be used by the model
-    active_events = jax.vmap(get_active_events, (0, None))(seen_events, duration_per_frame_in_secs)
+    active_events = jax.vmap(get_active_events)(seen_events)
 
     # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
     # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps

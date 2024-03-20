@@ -11,13 +11,13 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 
 model_config = {
     "frame_size": 512,
-    "max_frame_sequence_length": 98 + 1,
-    "attention_size": 256,
-    "intermediate_size": 1024,
-    "num_heads": 4,
-    "num_layers": 8,
+    "max_frame_sequence_length": 98,
+    "attention_size": 64,
+    "intermediate_size": 128,
+    "num_heads": 2,
+    "num_layers": 4,
     "dropout_rate": 0.05,
-    "midi_event_context_size": 10,
+    "midi_event_context_size": 15,
 }
 
 
@@ -72,15 +72,13 @@ class MidiVocabulary(eqx.Module):
     Enumarate in the following way:
       0: SEQUENCE_END
       1: SEQUENCE_START
-      3: ACTIVE_EVENT_SEPARATOR
       ...
+    
+    We want to provide the model with all currently played events, as well as a context window
+    into what is has already predicted. This is achieved using the `event_type_embedding` embedding,
+    which has two categories - one for active, and one for seen events.
 
-    The `ACTIVE_EVENT_SEPARATOR` is a special token used to indicate to the model that all events listed
-    after are currently played notes that will at some point need to be released. This is to make it easier
-    for the model and avoid active events being lost due to the event context size.
-    The `ACTIVE_EVENT_SEPARATOR` event will be provided with the timestamp of the last seen event.
-
-    For a total voccab size of 3 + 88 = 91
+    For a total voccab size of 2 + 88 = 90
     """
 
     @classmethod
@@ -94,6 +92,7 @@ class MidiVocabulary(eqx.Module):
     node_embedding: eqx.nn.Embedding
     position_embeddings: Float[Array, "seq_len output_shape"]
     velocity_embedding: eqx.nn.Embedding
+    event_type_embedding: eqx.nn.Embedding
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
@@ -104,7 +103,7 @@ class MidiVocabulary(eqx.Module):
         dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        node_key, velocity_key = jax.random.split(key, num=2)
+        node_key, velocity_key, event_type_key = jax.random.split(key, num=3)
         self.node_embedding = eqx.nn.Embedding(
             num_embeddings=self.voccab_size(), embedding_size=output_size, key=node_key
         )
@@ -116,22 +115,29 @@ class MidiVocabulary(eqx.Module):
             embedding_size=output_size,
             key=velocity_key,
         )
+        self.event_type_embedding = eqx.nn.Embedding(
+            num_embeddings=2, # Seen event = 0, or active event = 1
+            embedding_size=output_size,
+            key=event_type_key,
+        )
         self.layernorm = eqx.nn.LayerNorm(shape=output_size)
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(
         self,
-        midi_pair: Integer[
+        midi_event: Integer[
             Array, " 3"
         ],  # A numpy array of length 3. (midi event, position, velocity)
+        event_type: Integer, # 0 for a seen event, 1 for a currently active event
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        midi_embedding = self.node_embedding(midi_pair[1])
-        position_embedding = self.position_embeddings[midi_pair[0], :]
-        velocity_embedding = self.velocity_embedding(midi_pair[2])
+        midi_embedding = self.node_embedding(midi_event[1])
+        position_embedding = self.position_embeddings[midi_event[0], :]
+        velocity_embedding = self.velocity_embedding(midi_event[2])
+        event_type_embedding = self.event_type_embedding(event_type)
         combined = self.layernorm(
-            midi_embedding + position_embedding + velocity_embedding
+            midi_embedding + position_embedding + velocity_embedding + event_type_embedding
         )
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
@@ -615,47 +621,63 @@ class OutputSequenceGenerator(eqx.Module):
     def __call__(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
-        generated_output: Integer[
+        seen_events: Integer[
             Array, "midi_seq_len 3"  # Pair of (input_frame_position, midi_key, velocity)
         ],  # Index of midi event in the vocabulary
+        active_events: Integer[Array, "midi_seq_len 3"],
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ) -> Float[
         Array, "midi_voccab_size"
     ]:  # Probability distribution over the midi events:
-        generated_output = OutputSequenceGenerator._truncate_midi_event_to_context_size(
-            generated_output, context_size=self.midi_event_context_size)
-        return self.call_model(input_frames, generated_output, key, enable_dropout)
+        seen_events = OutputSequenceGenerator._truncate_midi_event_to_context_size(
+            seen_events, context_size=self.midi_event_context_size)
+        active_events = OutputSequenceGenerator._truncate_midi_event_to_context_size(
+            active_events, context_size=self.midi_event_context_size)
+        return self.call_model(input_frames, seen_events, active_events, key, enable_dropout)
 
     @partial(jax.jit, static_argnames=["enable_dropout"])
     def call_model(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
-        generated_output: Integer[
-            Array, "10 3"  # Pair of (input_frame_position, midi_key, velocity)
+        seen_events: Integer[
+            Array, "midi_context_size 3"  # Pair of (input_frame_position, midi_key, velocity)
         ],  # Index of midi event in the vocabulary
+        active_events: Integer[Array, "midi_context_size 3"],
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
-        encoder_key, decoder_key, midi_embedding_key = jax.random.split(key, num=3)
+        encoder_key, decoder_key, midi_embedding_key_seen, midi_embedding_key_active = jax.random.split(key, num=4)
 
         encoder_output = self.encoder(
             input_frames=input_frames, enable_dropout=enable_dropout, key=encoder_key
         )
 
-        midi_embeddings_so_far = jax.vmap(
+        midi_embeddings_seen = jax.vmap(
             partial(
                 self.midi_embedding,
+                event_type=0,
                 enable_dropout=enable_dropout,
-                key=midi_embedding_key,
+                key=midi_embedding_key_seen,
             )
-        )(generated_output)
+        )(seen_events)
+
+        midi_embeddings_active = jax.vmap(
+            partial(
+                self.midi_embedding,
+                event_type=1,
+                enable_dropout=enable_dropout,
+                key=midi_embedding_key_seen,
+            )
+        )(active_events)
+
+        all_midi_embeddings = jnp.concatenate([midi_embeddings_seen, midi_embeddings_active], axis=0)
 
         # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
-        mask = jnp.asarray(generated_output[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
+        mask = jnp.asarray(all_midi_embeddings[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
         midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = self.decoder(
-            decoder_output=midi_embeddings_so_far,
+            decoder_output=all_midi_embeddings,
             encoder_output=encoder_output,
             mask=mask,
             enable_dropout=enable_dropout,
