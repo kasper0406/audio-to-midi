@@ -109,8 +109,12 @@ def compute_loss(model, audio_frames, outputs_so_far, active_events, expected_ne
 
 @eqx.filter_jit
 def compute_training_step(
-    model, audio_frames, outputs_so_far, active_events, next_output, opt_state, key, tx
+    flat_model, audio_frames, outputs_so_far, active_events, next_output, flat_opt_state, key, tx,
+    treedef_model, treedef_opt_state
 ):
+    model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
+    opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
+
     key, new_key = jax.random.split(key)
     (loss, individual_losses), grads = compute_loss(
         model,
@@ -121,10 +125,13 @@ def compute_training_step(
         key=key,
     )
 
-    updates, opt_state = tx.update(grads, opt_state, model)
-    model = eqx.apply_updates(model, updates)
+    updates, update_opt_state = tx.update(grads, opt_state, model)
+    update_model = eqx.apply_updates(model, updates)
 
-    return (loss, individual_losses), model, opt_state, new_key
+    flat_update_model = jax.tree_util.tree_leaves(update_model)
+    flat_update_opt_state = jax.tree_util.tree_leaves(update_opt_state)
+
+    return (loss, individual_losses), flat_update_model, flat_update_opt_state, new_key
 
 
 @lru_cache(maxsize=1)
@@ -219,6 +226,9 @@ def train(
         ),
     )
 
+    flat_model, treedef_model = jax.tree_util.tree_flatten(model)
+    flat_state, treedef_state = jax.tree_util.tree_flatten(state)
+
     losses = []
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         (audio_frames, seen_events, active_events, next_event) = jax.device_put(
@@ -226,15 +236,17 @@ def train(
             batch_sharding,
         )
 
-        (loss, individual_losses), model, state, key = compute_training_step(
-            model,
+        (loss, individual_losses), flat_model, flat_state, key = compute_training_step(
+            flat_model,
             audio_frames,
             seen_events,
             active_events,
             next_event,
-            state,
+            flat_state,
             key,
             tx,
+            treedef_model,
+            treedef_state,
         )
         step_end_time = time.time()
 
@@ -242,7 +254,9 @@ def train(
             print(f"Encountered NAN loss at step {step}. Stopping the training!")
             break
 
-        checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
+        if checkpoint_manager.should_save(step):
+            model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
+            checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
         losses.append((loss, individual_losses))
         if step % print_every == 0:
@@ -259,12 +273,15 @@ def train(
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")
+            model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             eval_key, key = jax.random.split(key, num=2)
             testset_loss = compute_testset_loss(model, testset_dir, eval_key)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Test loss: {testset_loss}")
 
+    model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
+    state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
     return model, state
 
 def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, cosine_decay_steps: int):
@@ -333,11 +350,9 @@ def main():
         )
 
     tx = optax.lion(learning_rate=learning_rate_schedule)
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0), tx
-    )  # TODO: Investigate clip by RMS
-    # state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
-    state = tx.init(audio_to_midi)
+    tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
+    # The filtering is necessary to have the opt-state flattening working
+    state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
 
     print("Setting up dataset loader...")
     dataset_loader = AudioToMidiDatasetLoader(

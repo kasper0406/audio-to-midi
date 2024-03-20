@@ -381,6 +381,7 @@ class Encoder(eqx.Module):
 
     frame_embedding: FrameEmbedding
     encoder_layers: list[TransformerLayer]
+    num_layers: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -403,19 +404,18 @@ class Encoder(eqx.Module):
             dropout_rate=dropout_rate,
         )
 
-        self.encoder_layers = []
+        self.num_layers = num_layers
         layer_keys = jax.random.split(transformer_key, num_layers)
-        for layer_key in layer_keys:
-            self.encoder_layers.append(
-                TransformerLayer(
-                    attention_size=attention_size,
-                    intermediate_size=intermediate_size,
-                    num_heads=num_heads,
-                    dropout_rate=dropout_rate,
-                    allocate_encoder_attention=False,
-                    key=layer_key,
-                )
+        def make_encoder_layer(layer_key):
+            return TransformerLayer(
+                attention_size=attention_size,
+                intermediate_size=intermediate_size,
+                num_heads=num_heads,
+                dropout_rate=dropout_rate,
+                allocate_encoder_attention=False,
+                key=layer_key,
             )
+        self.encoder_layers = jax.vmap(make_encoder_layer)(layer_keys)
 
     def __call__(
         self,
@@ -429,17 +429,21 @@ class Encoder(eqx.Module):
             input_frames, enable_dropout=enable_dropout, key=frame_embedder_key
         )
 
-        encoder_output = embeddings
-        for layer in self.encoder_layers:
-            transformer_key, layer_key = jax.random.split(transformer_key, num=2)
-            encoder_output = layer(
-                inputs=encoder_output,
-                mask=None,  # TODO: Implement masking
+        dynamic_layers, static_layers = eqx.partition(self.encoder_layers, eqx.is_array)
+        layer_keys = jax.random.split(transformer_key, num=self.num_layers)
+        def compute_layer(current_state, current_dynamic_layer):
+            idx, current_output = current_state
+            layer_key = layer_keys[idx]
+            layer = eqx.combine(current_dynamic_layer, static_layers)
+            return (idx + 1, layer(
+                inputs=current_output,
+                mask=None, # There is no masking for the frame encoder
                 encoder_output=None,
                 enable_dropout=enable_dropout,
                 key=layer_key,
-            )
+            )), None
 
+        (_, encoder_output), _ = jax.lax.scan(compute_layer, (0, embeddings), dynamic_layers)
         return encoder_output
 
 
@@ -452,6 +456,7 @@ class Decoder(eqx.Module):
     midi_decoder_pooling: eqx.nn.Linear
     position_decoder_pooling: eqx.nn.Linear
     velocity_decoder_pooling: eqx.nn.Linear
+    num_layers: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -470,19 +475,18 @@ class Decoder(eqx.Module):
             velocity_pooling_key,
         ) = jax.random.split(key, num=4)
 
-        self.decoder_layers = []
-        layer_keys = jax.random.split(transformer_key, num_layers)
-        for layer_key in layer_keys:
-            self.decoder_layers.append(
-                TransformerLayer(
-                    attention_size=attention_size,
-                    intermediate_size=intermediate_size,
-                    num_heads=num_heads,
-                    dropout_rate=dropout_rate,
-                    allocate_encoder_attention=True,
-                    key=layer_key,
-                )
+        def make_decoder_layer(layer_key):
+            return TransformerLayer(
+                attention_size=attention_size,
+                intermediate_size=intermediate_size,
+                num_heads=num_heads,
+                dropout_rate=dropout_rate,
+                allocate_encoder_attention=True,
+                key=layer_key,
             )
+        layer_keys = jax.random.split(transformer_key, num_layers)
+        self.num_layers = num_layers
+        self.decoder_layers = jax.vmap(make_decoder_layer)(layer_keys)
 
         self.midi_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
@@ -525,15 +529,21 @@ class Decoder(eqx.Module):
             velocity_decoder_key,
         ) = jax.random.split(key, num=4)
 
-        for layer in self.decoder_layers:
-            transformer_key, layer_key = jax.random.split(transformer_key, 2)
-            decoder_output = layer(
-                inputs=decoder_output,
+        dynamic_layers, static_layers = eqx.partition(self.decoder_layers, eqx.is_array)
+        layer_keys = jax.random.split(transformer_key, num=self.num_layers)
+        def compute_layer(current_state, current_dynamic_layer):
+            idx, current_output = current_state
+            layer_key = layer_keys[idx]
+            layer = eqx.combine(current_dynamic_layer, static_layers)
+            return (idx + 1, layer(
+                inputs=current_output,
                 mask=mask,
                 encoder_output=encoder_output,
                 enable_dropout=enable_dropout,
                 key=layer_key,
-            )
+            )), None
+
+        (_, decoder_output), _ = jax.lax.scan(compute_layer, (0, decoder_output), dynamic_layers)
 
         # We take the first token in the last decoder layer to have information necessary for two
         # different pooling layers to extract both the midi event and the position
