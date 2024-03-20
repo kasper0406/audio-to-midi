@@ -229,7 +229,9 @@ def train(
     flat_model, treedef_model = jax.tree_util.tree_flatten(model)
     flat_state, treedef_state = jax.tree_util.tree_flatten(state)
 
-    losses = []
+    loss_sum = jnp.array([0.0], dtype=jnp.float32)
+    idv_loss_sum = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
+
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         (audio_frames, seen_events, active_events, next_event) = jax.device_put(
             (batch["audio_frames"], batch["seen_events"], batch["active_events"], batch["next_event"]),
@@ -258,18 +260,21 @@ def train(
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
 
-        losses.append((loss, individual_losses))
+        loss_sum = loss_sum + loss
+        idv_loss_sum = idv_loss_sum + individual_losses
+
         if step % print_every == 0:
             learning_rate = learning_rate_schedule(step)
 
-            averaged_loss = reduce(lambda cumulative, loss: cumulative + loss[0], losses, 0) / len(losses)
-            averaged_individual_losses = reduce(lambda cumulative, loss: cumulative + loss[1], losses, 0) / len(losses)
+            averaged_loss = (loss_sum / print_every)[0]
+            averaged_individual_losses = idv_loss_sum / print_every
 
             if trainloss_csv is not None:
                 trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}, Idv.loss = {averaged_individual_losses}")
 
-            losses = []
+            loss_sum = jnp.array([0.0], dtype=jnp.float32)
+            idv_loss_sum = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")
