@@ -672,9 +672,9 @@ class OutputSequenceGenerator(eqx.Module):
         )(active_events)
 
         all_midi_embeddings = jnp.concatenate([midi_embeddings_seen, midi_embeddings_active], axis=0)
-
         # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
-        mask = jnp.asarray(all_midi_embeddings[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
+        all_midi_events = jnp.concatenate([seen_events, active_events], axis=0, dtype=jnp.int16)
+        mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
         midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = self.decoder(
             decoder_output=all_midi_embeddings,

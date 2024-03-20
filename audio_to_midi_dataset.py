@@ -104,7 +104,7 @@ def events_from_sample(
     epsilon = duration_per_frame # HACK: We want to make sure that because of numeic accuracy the release events
                                  # comes before potential subsequent attack events
     def key_to_event(key: int):
-        return 3 + (key - 21)
+        return 2 + (key - 21)
 
     raw_events = []
     max_velocity = 0.0
