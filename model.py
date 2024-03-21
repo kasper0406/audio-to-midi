@@ -10,8 +10,8 @@ import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE
 
 model_config = {
-    "frame_size": 512,
-    "max_frame_sequence_length": 98,
+    "frame_size": 327,
+    "max_frame_sequence_length": 103 + 1,
     "attention_size": 64,
     "intermediate_size": 128,
     "num_heads": 2,
