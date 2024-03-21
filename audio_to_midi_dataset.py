@@ -34,9 +34,9 @@ BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 14
-WINDOW_OVERLAP = 0.95
-COMPRESSION_FACTOR = 1
+SAMPLES_PER_FFT = 2 ** 15
+WINDOW_OVERLAP = 0.98
+COMPRESSION_FACTOR = 2
 FREQUENCY_CUTOFF = 8000
 
 
@@ -106,8 +106,6 @@ def events_from_sample(
     """
     Returns a numpy array with tuples of (timestamp in seconds, midi event id, velocity)
     """
-    epsilon = duration_per_frame # HACK: We want to make sure that because of numeic accuracy the release events
-                                 # comes before potential subsequent attack events
     def key_to_event(key: int):
         return 2 + (key - 21)
 
@@ -598,6 +596,7 @@ class AudioToMidiDatasetLoader:
         window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
         overlap = round(WINDOW_OVERLAP * AudioToMidiDatasetLoader.SAMPLE_RATE)
 
+        # TODO: Fix and improve this!
         step = window_size - overlap
         n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
         windows = []
@@ -631,10 +630,13 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def _convert_samples(cls, samples: Float[Array, "count samples"]):
-        samples_per_fft = SAMPLES_PER_FFT
-        overlap = WINDOW_OVERLAP
-        duration_per_frame = (samples_per_fft * (1 - overlap)) / AudioToMidiDatasetLoader.SAMPLE_RATE
-        frames = jax.vmap(fft_audio, (0, None, None))(samples, samples_per_fft, overlap)
+        # Pad the signals with half the window size on each side to make sure the center of the Hann
+        # window hits the full signal.
+        padding_width = int(SAMPLES_PER_FFT / 2)
+        padded_samples = jnp.pad(samples, ((0, 0), (padding_width, padding_width)), mode='constant', constant_values=0)
+        frames = jax.vmap(fft_audio, (0, None, None))(padded_samples, SAMPLES_PER_FFT, WINDOW_OVERLAP)
+
+        duration_per_frame = MAX_EVENT_TIMESTAMP / frames.shape[2]
 
         # Select only the lowest FREQUENCY_CUTOFF frequencies
         cutoff_frame = int(FREQUENCY_CUTOFF * duration_per_frame)
@@ -826,7 +828,7 @@ if __name__ == "__main__":
         prefetch_count=0,
         num_workers=1,
         key=key,
-        num_samples_to_load=5,
+        num_samples_to_load=16,
         num_samples_to_maintain=200,
     )
     dataset_loader_iter = iter(dataset_loader)
