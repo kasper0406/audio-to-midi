@@ -482,7 +482,10 @@ class AudioToMidiDatasetLoader:
             )
             selected_samples = jax.device_put(current_loaded_audio_samples[indexes], self.sharding)
             selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
-            selected_sample_names = [ current_loaded_sample_names[i] for i in indexes ]
+
+            # Computing these selected samples in Python is super slow, and results in bottle necks
+            # during training. If this is really important, do it in Rust...
+            # selected_sample_names = [ current_loaded_sample_names[i] for i in indexes ]
 
             batch = generate_batch(
                 batch_key,
@@ -494,7 +497,7 @@ class AudioToMidiDatasetLoader:
             )
 
             # It is a bit hacky to inject this, but we can not send strings to JAX jit'ted functions
-            batch["sample_names"] = selected_sample_names
+            # batch["sample_names"] = selected_sample_names
 
             success = False
             while not success and not self._stop_event.is_set():

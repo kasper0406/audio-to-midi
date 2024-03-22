@@ -14,6 +14,7 @@ import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
 from functools import reduce
+from more_itertools import chunked
 
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
@@ -135,19 +136,25 @@ def compute_training_step(
 
 
 @lru_cache(maxsize=1)
-def load_test_set(testset_dir: Path):
+def load_test_set(testset_dir: Path, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
-    (
-        frames,
-        _,
-        duration_per_frame,
-    ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(testset_dir, sample_names)
-    midi_events = (
-        AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
-            testset_dir, sample_names, duration_per_frame
+    chunks = chunked(sample_names, batch_size)
+
+    batches = []
+    for chunk in chunks:
+        (
+            frames,
+            _,
+            duration_per_frame,
+            _frame_width,
+        ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(testset_dir, sample_names)
+        midi_events = (
+            AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
+                testset_dir, sample_names, duration_per_frame
+            )
         )
-    )
-    return frames, midi_events
+        batches.append((frames, midi_events))
+    return batches
 
 @jax.jit
 def compute_test_loss(
@@ -163,8 +170,10 @@ def compute_test_loss(
     blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
     # Do not pick the last element with the full sequence, as there is nothing to predict
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
+    jax.debug.print("Seen events: {seen}", seen=event_prefixes)
 
     active_events = jax.vmap(get_active_events)(event_prefixes)
+    jax.debug.print("Active events: {active}", active=active_events)
 
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
@@ -184,14 +193,18 @@ def compute_test_loss(
     return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
 
 
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey):
-    frames, midi_events = load_test_set(testset_dir)
-
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, batch_size=32):
+    batches = load_test_set(testset_dir, batch_size=batch_size)
     print("Loaded test set")
-    test_loss_keys = jax.random.split(key, num=frames.shape[0])
-    test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+
+    test_loss = jnp.array([0.0], dtype=jnp.float32)
+    for frames, midi_events in batches:
+        test_loss_keys = jax.random.split(key, num=frames.shape[0])
+        test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+        test_loss += jnp.mean(test_losses)
+
     print("Finished evaluating test loss")
-    return jnp.mean(test_losses)
+    return test_loss[0] / len(batches)
 
 
 def train(
@@ -353,6 +366,10 @@ def main():
             step_to_restore,
             args=ocp.args.StandardRestore(audio_to_midi),
         )
+
+    # loss = compute_testset_loss(audio_to_midi, testset_dir, key)
+    # print(f"Testset loss: {loss}")
+    # return
 
     tx = optax.lion(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
