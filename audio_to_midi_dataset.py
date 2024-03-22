@@ -1,6 +1,6 @@
 import csv
 import glob
-import queue
+from collections import deque
 import random
 import threading
 import time
@@ -416,7 +416,8 @@ class AudioToMidiDatasetLoader:
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
-        self.queue = queue.Queue(prefetch_count + 1)
+        self.prefetch_count = prefetch_count
+        self.queue = deque([], prefetch_count + 1)
         self.sample_load_lock = Lock()
         self._stop_event = threading.Event()
         self._threads = []
@@ -463,7 +464,11 @@ class AudioToMidiDatasetLoader:
 
     def __iter__(self):
         while True:
-            yield self.queue.get()
+            try:
+                yield self.queue.popleft()
+            except IndexError:
+                print("WARNING: No elements in queue, should not really happen much...")
+                time.sleep(0.1)
 
     def _generate_batch(self, key: jax.random.PRNGKey):
         while not self._stop_event.is_set():
@@ -499,14 +504,11 @@ class AudioToMidiDatasetLoader:
             # It is a bit hacky to inject this, but we can not send strings to JAX jit'ted functions
             # batch["sample_names"] = selected_sample_names
 
-            success = False
-            while not success and not self._stop_event.is_set():
-                try:
-                    self.queue.put(batch, timeout=1)
-                    success = True
-                except queue.Full:
-                    # This was not successful
-                    pass
+            while len(self.queue) >= self.prefetch_count:
+                # print("Backing off, as the queue is full")
+                # Backoff mechanism
+                time.sleep(1)
+            self.queue.append(batch)
 
 
     def _load_frames_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
@@ -831,10 +833,10 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v2"),
-        batch_size=1,
-        prefetch_count=0,
-        num_workers=1,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set"),
+        batch_size=16,
+        prefetch_count=20,
+        num_workers=2,
         key=key,
         num_samples_to_load=16,
         num_samples_to_maintain=200,

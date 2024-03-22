@@ -328,8 +328,8 @@ def main():
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 0
-    dataset_num_workers = 1
+    dataset_prefetch_count = 20
+    dataset_num_workers = 2
 
     num_samples_to_load=10
     num_samples_to_maintain=batch_size * 10
