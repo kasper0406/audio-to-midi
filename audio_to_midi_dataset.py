@@ -834,7 +834,7 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v2"),
         batch_size=16,
         prefetch_count=20,
         num_workers=2,

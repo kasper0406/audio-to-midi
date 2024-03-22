@@ -317,8 +317,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v2")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/debug2")
 
     num_devices = len(jax.devices())
 
@@ -331,8 +331,8 @@ def main():
     dataset_prefetch_count = 20
     dataset_num_workers = 2
 
-    num_samples_to_load=10
-    num_samples_to_maintain=batch_size * 10
+    num_samples_to_load=16
+    num_samples_to_maintain=batch_size * 8
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
