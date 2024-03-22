@@ -1,6 +1,6 @@
 import csv
 import glob
-import queue
+from collections import deque
 import random
 import threading
 import time
@@ -8,6 +8,7 @@ import numpy as np
 from functools import partial
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 import jax
 import jax.experimental.mesh_utils as mesh_utils
@@ -23,13 +24,22 @@ import math
 import parallel_audio_reader
 
 # TODO: Clean this up
+MIDI_EVENT_VOCCAB_SIZE = 90
+
 MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1
 SEQUENCE_END = 0
+ACTIVE_EVENT_SEPARATOR = 2
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
+
+SAMPLES_PER_FFT = 2 ** 13
+WINDOW_OVERLAP = 0.90
+COMPRESSION_FACTOR = 1
+FREQUENCY_CUTOFF = 8000
+
 
 @partial(jax.jit, donate_argnames=["frames"])
 def perturb_audio_frames(
@@ -57,7 +67,7 @@ def fft_audio(
     """
     if window_size != next_power_of_2(window_size):
         raise "samples_per_fft must be a power of 2"
-    hop_size = int(window_size * overlap)
+    hop_size = int(window_size * (1 - overlap))
 
     # Reshape the signal to match the expected input shape for conv_general_dilated_patches
     # The function expects (batch, spatial_dims..., features), so we add extra dimensions to fit
@@ -79,11 +89,10 @@ def fft_audio(
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
-    compression_factor = 255
     compressed_amplitudes = (
         jnp.sign(transposed_amplitudes)
-        * jnp.log1p(compression_factor * jnp.abs(transposed_amplitudes))
-        / jnp.log1p(compression_factor)
+        * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(transposed_amplitudes))
+        / jnp.log1p(COMPRESSION_FACTOR)
     )
 
     # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
@@ -98,8 +107,6 @@ def events_from_sample(
     """
     Returns a numpy array with tuples of (timestamp in seconds, midi event id, velocity)
     """
-    epsilon = duration_per_frame # HACK: We want to make sure that because of numeic accuracy the release events
-                                 # comes before potential subsequent attack events
     def key_to_event(key: int):
         return 2 + (key - 21)
 
@@ -119,17 +126,16 @@ def events_from_sample(
 
             # TODO: Make the event calculation nicer using the Midi dictionary
             # Notice we put releases prior to attacks in terms of midi event index
-            if attack_time < MAX_EVENT_TIMESTAMP:
-                raw_events.append((attack_time, key_to_event(key) + 88, velocity))  # Attack
+            if attack_time < MAX_EVENT_TIMESTAMP - duration_per_frame:
+                raw_events.append((attack_time, key_to_event(key), velocity)) # Attack
                 max_velocity = max(max_velocity, velocity)
-            if attack_time + duration < MAX_EVENT_TIMESTAMP + 5 * epsilon:
-                # HACK: If `attack_time + duration > MAX_EVENT_TIMESTAMP` we will clamp it to `MAX_EVENT_TIMESTAMP`
-                #       This has to do with the generated dataset in that it has a quirk that the release may be
-                #       slightly beyond `MAX_EVENT_TIMESTAMP`, but in reality the note has been released
-                #       I should be able to delete this once I fix and re-generate the dataset
-                raw_events.append(
-                    (min(attack_time + duration - epsilon, MAX_EVENT_TIMESTAMP), key_to_event(key), BLANK_VELOCITY)
-                )  # Release
+            if attack_time + duration < MAX_EVENT_TIMESTAMP:
+                release_time = attack_time + duration
+                # Due to the way we sort the events, we can not have a release event in the same frame as the
+                # attack event. We therefore make sure the release time will fall into the next frame bucket.
+                release_time = max(release_time, attack_time + duration_per_frame)
+
+                raw_events.append((release_time, key_to_event(key), BLANK_VELOCITY)) # Release
 
     # Re-normalize velocities as we normalize the audio level as well
     events = []
@@ -138,9 +144,12 @@ def events_from_sample(
         position = round(time_pos / duration_per_frame)
 
         # Convert it into a group of `NUM_VELOCITY_CATEGORIES` velocities
-        normalized_velocity = velocity_float / max_velocity if max_velocity > 0.0 else velocity_float
-        velocity = round(normalized_velocity * NUM_VELOCITY_CATEGORIES)
         
+        velocity = 0
+        if velocity_float > 0.0:
+            normalized_velocity = velocity_float / max_velocity if max_velocity > 0.0 else velocity_float
+            velocity = max(1, round(normalized_velocity * NUM_VELOCITY_CATEGORIES))
+
         events.append((position, key, velocity))
 
     # Append the SEQUENCE_START and SEQUENCE_EVENT events outside the sorting
@@ -253,13 +262,81 @@ def time_shift_audio_and_events(
 
     return frames, midi_events
 
+def find_active_events(carry, event: Integer[Array, "3"]):
+    index, active_events, released_keys = carry
 
-@partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs"])
+    next_active_events = jnp.select([
+        event[1] == BLANK_MIDI_EVENT,
+        event[2] == BLANK_VELOCITY,
+        ~released_keys[event[1]],
+    ],
+    [
+        active_events, # Blank event
+        active_events, # Release key event
+        active_events.at[index].set(True), # Attack event, and it has not been released! It is active!
+    ],
+    active_events).astype(jnp.bool_)
+
+    next_release_events = jnp.select([
+        event[1] == BLANK_MIDI_EVENT,
+        event[2] == BLANK_VELOCITY,
+    ],
+    [
+        released_keys, # Blank event
+        released_keys.at[event[1]].set(True), # Release key event
+    ],
+    released_keys).astype(jnp.bool_)
+
+    return (index - 1, next_active_events, next_release_events), jnp.zeros(0)
+
+
+@jax.jit
+def get_active_events(seen_events: Float[Array, "max_len 3"]):
+    # Find the indices of the active events within the `seen_events`array
+    empty_state = (
+        seen_events.shape[0] - 1, # index
+        jnp.zeros(seen_events.shape[0], dtype=jnp.bool_), # (active event indicator
+        jnp.zeros(MIDI_EVENT_VOCCAB_SIZE, dtype=jnp.bool_) # released keys indicator
+    )
+    (_, active_events, _), _ = jax.lax.scan(find_active_events, empty_state, seen_events, reverse=True)
+
+    # Using the indices, select them, and group them together
+    sorted_indices = jnp.argsort(active_events, kind='stable')
+    num_active = jnp.count_nonzero(active_events)
+    active_events = jnp.repeat(active_events[:, None], repeats=3, axis=1)
+    blank_events = jnp.repeat(jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[None, :], repeats=seen_events.shape[0], axis=0)
+    actual_active_events = jnp.where(active_events, seen_events, blank_events).astype(jnp.int16)
+    actual_active_events = actual_active_events[sorted_indices, ...]
+
+    # Place the active events at the position they should be appended to the `seen_events` array
+    # num_seen_events = jnp.count_nonzero(seen_events[:, 1] != BLANK_MIDI_EVENT)
+    # +1 to allow for the split event
+    # actual_active_events = jnp.roll(actual_active_events, shift=(num_active + num_seen_events + 1), axis=0)
+
+    # Place the active events at the beginning
+    actual_active_events = jnp.roll(actual_active_events, shift=num_active, axis=0)
+
+    # jax.debug.print("Found active events: {active} for seen events {seen}", active=actual_active_events, seen=seen_events)
+
+    # # Append the active events to the seen_events array
+    # end_position = int(MAX_EVENT_TIMESTAMP / duration_per_frame_in_secs) + 1
+    # actual_active_events = actual_active_events.at[:, 0].set(end_position) # Make all the non-closed events appear at the very end
+    # picking_mask = jnp.repeat((actual_active_events[:, 1] != 0)[:, None], repeats=3, axis=1)
+    # seen_events = jnp.where(picking_mask, actual_active_events, seen_events)
+    # active_event_separator = jnp.array([end_position, ACTIVE_EVENT_SEPARATOR, 0], dtype=jnp.int16)
+    # seen_events = seen_events.at[num_seen_events].set(active_event_separator)
+
+    # jax.debug.print("Seen events after {seen}", seen=seen_events)
+
+    return actual_active_events
+
+@partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs", "frame_width_in_secs"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
     key: jax.random.PRNGKey,
     batch_size: int,
     duration_per_frame_in_secs: float,
+    frame_width_in_secs: float,
     selected_midi_events: Integer[Array, "batch_size max_len 3"],
     selected_audio_frames: Float[Array, "batch_size frames"],
 ):
@@ -308,6 +385,9 @@ def generate_batch(
         selected_midi_events
     )
 
+    # Compute the set of active events so it can be used by the model
+    active_events = jax.vmap(get_active_events)(seen_events)
+
     # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
     # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
     # seen_events = seen_events[:, 0 : jnp.max(picked_midi_splits)]
@@ -317,11 +397,13 @@ def generate_batch(
         "seen_events": seen_events,
         "next_event": next_events,
         "duration_per_frame_in_secs": duration_per_frame_in_secs,
+        "frame_width_in_secs": frame_width_in_secs,
+        "active_events": active_events,
     }
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 20000.0 # Sample rate to allow frequencies up to 10k Hz
+    SAMPLE_RATE = 16000.0 # Sample rate to allow frequencies up to 8k Hz
 
     def __init__(
         self,
@@ -335,7 +417,8 @@ class AudioToMidiDatasetLoader:
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
-        self.queue = queue.Queue(prefetch_count + 1)
+        self.prefetch_count = prefetch_count
+        self.queue = deque([], prefetch_count + 1)
         self.sample_load_lock = Lock()
         self._stop_event = threading.Event()
         self._threads = []
@@ -352,7 +435,7 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(
+        self.loaded_sample_names, self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame, self.frame_width = self._load_frames_from_disk(
             num_samples_to_load,
             minimum_midi_event_size=128)
         refresh_thread = threading.Thread(
@@ -382,13 +465,18 @@ class AudioToMidiDatasetLoader:
 
     def __iter__(self):
         while True:
-            yield self.queue.get()
+            try:
+                yield self.queue.popleft()
+            except IndexError:
+                print("WARNING: No elements in queue, should not really happen much...")
+                time.sleep(0.1)
 
     def _generate_batch(self, key: jax.random.PRNGKey):
         while not self._stop_event.is_set():
             with self.sample_load_lock:
                 current_loaded_midi_events = self.loaded_midi_events
                 current_loaded_audio_samples = self.loaded_audio_frames
+                current_loaded_sample_names = self.loaded_sample_names
 
             batch_key, indexes_key, key = jax.random.split(key, num=3)
             indexes = jax.random.randint(
@@ -401,21 +489,27 @@ class AudioToMidiDatasetLoader:
             selected_samples = jax.device_put(current_loaded_audio_samples[indexes], self.sharding)
             selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
 
+            # Computing these selected samples in Python is super slow, and results in bottle necks
+            # during training. If this is really important, do it in Rust...
+            # selected_sample_names = [ current_loaded_sample_names[i] for i in indexes ]
+
             batch = generate_batch(
                 batch_key,
                 self.batch_size,
                 self.duration_per_frame,
+                self.frame_width,
                 selected_midi_events,
                 selected_samples,
             )
-            success = False
-            while not success and not self._stop_event.is_set():
-                try:
-                    self.queue.put(batch, timeout=1)
-                    success = True
-                except queue.Full:
-                    # This was not successful
-                    pass
+
+            # It is a bit hacky to inject this, but we can not send strings to JAX jit'ted functions
+            # batch["sample_names"] = selected_sample_names
+
+            while len(self.queue) >= self.prefetch_count:
+                # print("Backing off, as the queue is full")
+                # Backoff mechanism
+                time.sleep(1)
+            self.queue.append(batch)
 
 
     def _load_frames_from_disk(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
@@ -423,7 +517,7 @@ class AudioToMidiDatasetLoader:
 
         # TODO: These two loading steps could be done in parallel, but before the midi events dependence on
         #       `duration_per_frame` must be removed and applied later.
-        loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
+        loaded_audio_frames, sample_rate, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
             self.dataset_dir,
             picked_samples,
             sharding=self.sharding,
@@ -435,7 +529,7 @@ class AudioToMidiDatasetLoader:
             )
         )
 
-        return loaded_midi_events, loaded_audio_frames, duration_per_frame
+        return picked_samples, loaded_midi_events, loaded_audio_frames, duration_per_frame, frame_width
 
     def _periodic_refresh_samples(
         self,
@@ -453,9 +547,10 @@ class AudioToMidiDatasetLoader:
                 # Try to avoid unncessary JIT's due to different midi event lengths
                 current_events = self.loaded_midi_events
                 current_frames = self.loaded_audio_frames
+                current_sample_names = self.loaded_sample_names
             
             print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-            loaded_midi_events, loaded_audio_frames, _duration_per_frame = self._load_frames_from_disk(num_samples_to_load, current_events.shape[1])
+            sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_frames_from_disk(num_samples_to_load, current_events.shape[1])
 
             current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
             current_events = current_events[current_amount_to_evict:, ...]
@@ -478,10 +573,12 @@ class AudioToMidiDatasetLoader:
                 current_frames,
                 loaded_audio_frames,
             ], axis=0)
+            new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
 
             with self.sample_load_lock:
                 self.loaded_midi_events = new_events
                 self.loaded_audio_frames = new_frames
+                self.loaded_sample_names = new_sample_names
 
     @classmethod
     def load_audio_frames(cls, filenames: [Path], sharding = None):
@@ -493,12 +590,12 @@ class AudioToMidiDatasetLoader:
         if sharding is not None:
             audio_samples = jax.device_put(audio_samples, sharding)
 
-        frames, duration_per_frame = AudioToMidiDatasetLoader._convert_samples(audio_samples)
+        frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
 
-        return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame
+        return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame, frame_width
     
     @classmethod
-    def load_and_slice_full_audio(cls, filename: Path, overlap: float = 0.5):
+    def load_and_slice_full_audio(cls, filename: Path):
         audio_samples = parallel_audio_reader.load_audio(
             filename,
             AudioToMidiDatasetLoader.SAMPLE_RATE,
@@ -506,8 +603,9 @@ class AudioToMidiDatasetLoader:
         )
 
         window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
-        overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
+        overlap = round(WINDOW_OVERLAP * AudioToMidiDatasetLoader.SAMPLE_RATE)
 
+        # TODO: Fix and improve this!
         step = window_size - overlap
         n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
         windows = []
@@ -537,20 +635,24 @@ class AudioToMidiDatasetLoader:
             if not found:
                 raise ValueError(f"Did not find audio file for sample named {sample}")
 
-        return AudioToMidiDatasetLoader.load_audio_frames(filenames)
+        return AudioToMidiDatasetLoader.load_audio_frames(filenames, sharding=sharding)
 
     @classmethod
     def _convert_samples(cls, samples: Float[Array, "count samples"]):
-        samples_per_fft = 2048
-        overlap = 0.5 # 50% overlap between frames
-        duration_per_frame = (samples_per_fft * overlap) / AudioToMidiDatasetLoader.SAMPLE_RATE
-        frames = jax.vmap(fft_audio, (0, None, None))(samples, samples_per_fft, overlap)
+        # Pad the signals with half the window size on each side to make sure the center of the Hann
+        # window hits the full signal.
+        padding_width = int(SAMPLES_PER_FFT / 2)
+        padded_samples = jnp.pad(samples, ((0, 0), (padding_width, padding_width)), mode='constant', constant_values=0)
+        frames = jax.vmap(fft_audio, (0, None, None))(padded_samples, SAMPLES_PER_FFT, WINDOW_OVERLAP)
 
-        # Select only the lowest 10_000 Hz frequencies
-        cutoff_frame = int(10_000 * duration_per_frame)
+        duration_per_frame = MAX_EVENT_TIMESTAMP / frames.shape[2]
+
+        # Select only the lowest FREQUENCY_CUTOFF frequencies
+        frame_width_in_secs = SAMPLES_PER_FFT / AudioToMidiDatasetLoader.SAMPLE_RATE
+        cutoff_frame = int(FREQUENCY_CUTOFF * frame_width_in_secs)
         frames = frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame
+        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame, frame_width_in_secs
 
     @classmethod
     def load_midi_events_frame_time_positions(
@@ -619,7 +721,7 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 
 
 def plot_frequency_domain_audio(
-    duration_per_frame: float, frames: NDArray[jnp.float32]
+    sample_name: str, duration_per_frame: float, frames: NDArray[jnp.float32]
 ):
     fig, ax1 = plt.subplots()
 
@@ -633,25 +735,34 @@ def plot_frequency_domain_audio(
     ax1.set(
         xlabel="Time [s]",
         ylabel="Frequency [Hz]",
-        title="Audio signal in frequency-domain",
+        title=f"Audio signal in frequency-domain\n{sample_name}",
     )
 
     ax2 = ax1.twiny()
     ax2.set_xlim(0, frames.shape[0])
     ax2.set_xlabel("Frame count")
 
+def _remove_zeros(arr: Integer[Array, "len 3"]):
+    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], jnp.int16)
+    mask = ~(jnp.all(arr == blank_event, axis=1))
+    return arr[mask]
 
 def visualize_sample(
+    sample_name: str,
     frames: Float[Array, "num_samples"],
     seen_events: Integer[Array, "seen_array_length 2"],
-    next_event: Integer[Array, "2"],
+    next_event: Integer[Array, "3"],
+    active_events: Integer[Array, "3"],
     duration_per_frame_in_secs: float,
+    frame_width: float,
 ):
+    print(f"Sample name: {sample_name}")
     print("Frames shape:", frames.shape)
     print("Duration per frame:", duration_per_frame_in_secs)
-    print(f"Seen events: {seen_events}")
+    print(f"Seen events: {_remove_zeros(seen_events)}")
+    print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
-    plot_frequency_domain_audio(duration_per_frame_in_secs, frames)
+    plot_frequency_domain_audio(sample_name, frame_width, frames)
 
     plt.show()
 
@@ -683,7 +794,7 @@ def benchmark():
 
 
 if __name__ == "__main__":
-    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
@@ -723,12 +834,12 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set"),
         batch_size=16,
-        prefetch_count=0,
-        num_workers=1,
+        prefetch_count=20,
+        num_workers=2,
         key=key,
-        num_samples_to_load=5,
+        num_samples_to_load=16,
         num_samples_to_maintain=200,
     )
     dataset_loader_iter = iter(dataset_loader)
@@ -737,11 +848,15 @@ if __name__ == "__main__":
         print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
+        print(f"Active events shape: {num}", loaded_batch["active_events"].shape)
 
         batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
         visualize_sample(
+            "",
             loaded_batch["audio_frames"][batch_idx],
             loaded_batch["seen_events"][batch_idx],
             loaded_batch["next_event"][batch_idx],
+            loaded_batch["active_events"][batch_idx],
             loaded_batch["duration_per_frame_in_secs"],
+            loaded_batch["frame_width_in_secs"],
         )
