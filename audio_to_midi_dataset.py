@@ -849,7 +849,7 @@ if __name__ == "__main__":
 
         batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
         visualize_sample(
-            loaded_batch["sample_names"][batch_idx],
+            "",
             loaded_batch["audio_frames"][batch_idx],
             loaded_batch["seen_events"][batch_idx],
             loaded_batch["next_event"][batch_idx],
