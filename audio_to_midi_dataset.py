@@ -34,9 +34,9 @@ BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 11
-WINDOW_OVERLAP = 0.70
-COMPRESSION_FACTOR = 2
+SAMPLES_PER_FFT = 2 ** 13
+WINDOW_OVERLAP = 0.90
+COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 8000
 
 
@@ -329,12 +329,13 @@ def get_active_events(seen_events: Float[Array, "max_len 3"]):
 
     return actual_active_events
 
-@partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs"])
+@partial(jax.jit, static_argnames=["batch_size", "duration_per_frame_in_secs", "frame_width_in_secs"])
 @partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
 def generate_batch(
     key: jax.random.PRNGKey,
     batch_size: int,
     duration_per_frame_in_secs: float,
+    frame_width_in_secs: float,
     selected_midi_events: Integer[Array, "batch_size max_len 3"],
     selected_audio_frames: Float[Array, "batch_size frames"],
 ):
@@ -395,12 +396,13 @@ def generate_batch(
         "seen_events": seen_events,
         "next_event": next_events,
         "duration_per_frame_in_secs": duration_per_frame_in_secs,
+        "frame_width_in_secs": frame_width_in_secs,
         "active_events": active_events,
     }
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 20000.0 # Sample rate to allow frequencies up to 10k Hz
+    SAMPLE_RATE = 16000.0 # Sample rate to allow frequencies up to 8k Hz
 
     def __init__(
         self,
@@ -431,7 +433,7 @@ class AudioToMidiDatasetLoader:
 
         self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        self.loaded_sample_names, self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame = self._load_frames_from_disk(
+        self.loaded_sample_names, self.loaded_midi_events, self.loaded_audio_frames, self.duration_per_frame, self.frame_width = self._load_frames_from_disk(
             num_samples_to_load,
             minimum_midi_event_size=128)
         refresh_thread = threading.Thread(
@@ -486,6 +488,7 @@ class AudioToMidiDatasetLoader:
                 batch_key,
                 self.batch_size,
                 self.duration_per_frame,
+                self.frame_width,
                 selected_midi_events,
                 selected_samples,
             )
@@ -508,7 +511,7 @@ class AudioToMidiDatasetLoader:
 
         # TODO: These two loading steps could be done in parallel, but before the midi events dependence on
         #       `duration_per_frame` must be removed and applied later.
-        loaded_audio_frames, sample_rate, duration_per_frame = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
+        loaded_audio_frames, sample_rate, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(
             self.dataset_dir,
             picked_samples,
             sharding=self.sharding,
@@ -520,7 +523,7 @@ class AudioToMidiDatasetLoader:
             )
         )
 
-        return picked_samples, loaded_midi_events, loaded_audio_frames, duration_per_frame
+        return picked_samples, loaded_midi_events, loaded_audio_frames, duration_per_frame, frame_width
 
     def _periodic_refresh_samples(
         self,
@@ -541,7 +544,7 @@ class AudioToMidiDatasetLoader:
                 current_sample_names = self.loaded_sample_names
             
             print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-            sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame = self._load_frames_from_disk(num_samples_to_load, current_events.shape[1])
+            sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_frames_from_disk(num_samples_to_load, current_events.shape[1])
 
             current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
             current_events = current_events[current_amount_to_evict:, ...]
@@ -581,9 +584,9 @@ class AudioToMidiDatasetLoader:
         if sharding is not None:
             audio_samples = jax.device_put(audio_samples, sharding)
 
-        frames, duration_per_frame = AudioToMidiDatasetLoader._convert_samples(audio_samples)
+        frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
 
-        return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame
+        return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame, frame_width
     
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path):
@@ -639,10 +642,11 @@ class AudioToMidiDatasetLoader:
         duration_per_frame = MAX_EVENT_TIMESTAMP / frames.shape[2]
 
         # Select only the lowest FREQUENCY_CUTOFF frequencies
-        cutoff_frame = int(FREQUENCY_CUTOFF * duration_per_frame)
+        frame_width_in_secs = SAMPLES_PER_FFT / AudioToMidiDatasetLoader.SAMPLE_RATE
+        cutoff_frame = int(FREQUENCY_CUTOFF * frame_width_in_secs)
         frames = frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame
+        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame, frame_width_in_secs
 
     @classmethod
     def load_midi_events_frame_time_positions(
@@ -744,6 +748,7 @@ def visualize_sample(
     next_event: Integer[Array, "3"],
     active_events: Integer[Array, "3"],
     duration_per_frame_in_secs: float,
+    frame_width: float,
 ):
     print(f"Sample name: {sample_name}")
     print("Frames shape:", frames.shape)
@@ -751,7 +756,7 @@ def visualize_sample(
     print(f"Seen events: {_remove_zeros(seen_events)}")
     print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
-    plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frames)
+    plot_frequency_domain_audio(sample_name, frame_width, frames)
 
     plt.show()
 
@@ -847,4 +852,5 @@ if __name__ == "__main__":
             loaded_batch["next_event"][batch_idx],
             loaded_batch["active_events"][batch_idx],
             loaded_batch["duration_per_frame_in_secs"],
+            loaded_batch["frame_width_in_secs"],
         )
