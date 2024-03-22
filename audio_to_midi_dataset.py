@@ -8,6 +8,7 @@ import numpy as np
 from functools import partial
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 import jax
 import jax.experimental.mesh_utils as mesh_utils
@@ -634,7 +635,7 @@ class AudioToMidiDatasetLoader:
             if not found:
                 raise ValueError(f"Did not find audio file for sample named {sample}")
 
-        return AudioToMidiDatasetLoader.load_audio_frames(filenames)
+        return AudioToMidiDatasetLoader.load_audio_frames(filenames, sharding=sharding)
 
     @classmethod
     def _convert_samples(cls, samples: Float[Array, "count samples"]):
@@ -793,7 +794,7 @@ def benchmark():
 
 
 if __name__ == "__main__":
-    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
