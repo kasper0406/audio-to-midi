@@ -1,6 +1,10 @@
+use std::path::Path;
+use std::fmt;
+
 use numpy::PyArray1;
 use numpy::PyArray2;
 use numpy::ToPyArray;
+use numpy::IntoPyArray;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use pyo3::types::PyList;
@@ -9,9 +13,14 @@ use pyo3::exceptions::PyTypeError;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
+use tokio::process::Command;
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 use serde::Deserialize;
+use uuid::Uuid;
+use std::process::Stdio;
+
+use log::{debug, error, info, trace, warn};
 
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -49,12 +58,11 @@ async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEve
         match result {
             Ok(record) => {
                 if record.time < max_event_time {
-                    events.push( (record.time, key_to_event(record.key) + 88, record.velocity) );
+                    events.push( (record.time, key_to_event(record.key), record.velocity) );
                     max_velocity = max_velocity.max(record.velocity)
                 }
-                if record.time + record.duration < max_event_time + 5.0 * epsilon {
-                    let release_time = max_event_time.min(record.time + record.duration - epsilon);
-                    events.push( (release_time, key_to_event(record.key), 0.0) );
+                if record.time + record.duration < max_event_time {
+                    events.push( (record.time + record.duration, key_to_event(record.key), 0.0) );
                 }
             },
             Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
@@ -140,8 +148,75 @@ fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, m
     Ok(PyList::new(py, &numpy_results).into())
 }
 
-async fn load_audio_sample(file: &str, max_duration: f32) -> Result<Vec<f32>, std::io::Error> {
-    Ok(vec![])
+#[derive(Debug)]
+enum AudioLoadingError {
+    IoError(std::io::Error),
+    FfmpegError(i32),
+}
+impl std::error::Error for AudioLoadingError {}
+impl fmt::Display for AudioLoadingError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AudioLoadingError::IoError(err) => write!(f, "IO error: {}", err),
+            AudioLoadingError::FfmpegError(status) => write!(f, "ffmpeg terminated with status: {}", status),
+        }
+    }
+}
+
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
+    let sample_rate = 16_000; // Hz
+
+    let status = Command::new("ffmpeg")
+        .arg("-i")
+        .arg(input_file)
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(format!["{}", sample_rate])
+        .arg("-f")
+        .arg("f32le")
+        .arg(output_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => {
+            if !status.success() {
+                return Err(AudioLoadingError::FfmpegError(status.code().unwrap_or(-1)));
+            }
+        }
+        Err(err) => return Err(AudioLoadingError::IoError(err)),
+    }
+
+    let mut file = File::open(output_file).await.map_err(AudioLoadingError::IoError)?;
+    let mut bytes = vec![];
+    file.read_to_end(&mut bytes).await.map_err(AudioLoadingError::IoError)?;
+
+    let mut samples: Vec<_> = bytes.chunks_exact(4)
+        .map(|chunk| {
+            let buf: [u8; 4] = chunk.try_into().unwrap();
+            f32::from_le_bytes(buf)
+        })
+        .collect();
+
+    // Ensure the number of samples is exactly max_duration * sample_rate!
+    let desired_sample_count = ((sample_rate as f32) * max_duration) as usize;
+    samples.resize(desired_sample_count, 0.0);
+
+    Ok(samples)
+}
+
+async fn load_audio_sample(file_path: &str, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
+    let path = Path::new(file_path);
+    
+    let uuid = Uuid::new_v4();
+    let output_file = format!["/tmp/audio-to-midi-{}.raw", uuid];
+    
+    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &output_file, max_duration).await;
+
+    tokio::fs::remove_file(output_file).await.map_err(AudioLoadingError::IoError)?;
+    audio_sampels
 }
 
 #[pyfunction]
@@ -153,7 +228,8 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
             let mut futures = vec![];
 
             for sample_file in sample_files {
-                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&sample_file, max_duration).await });
+                let filename = format!["{}.aac", sample_file];
+                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&filename, max_duration).await });
                 futures.push(future);
             }
 
@@ -177,20 +253,15 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
 
     let mut numpy_results = vec![];
     for samples in all_samples {
-        let mut np_array = PyArray1::<f32>::zeros(py, samples.len(), false);
-        {
-            let mut array_read_write = np_array.readwrite();
-            for i in 0..samples.len() {
-                *array_read_write.get_mut(i).unwrap() = samples[i];
-            }
-        }
-        numpy_results.push(np_array);
+        numpy_results.push(samples.into_pyarray(py).to_owned());
     }
     Ok(PyList::new(py, &numpy_results).into())
 }
 
 #[pymodule]
 fn rust_plugins(py: Python, m: &PyModule) -> PyResult<()> {
+    env_logger::init();
+
     m.add_function(wrap_pyfunction!(events_from_samples, m)?)?;
     m.add_function(wrap_pyfunction!(load_audio_samples, m)?)?;
     Ok(())
