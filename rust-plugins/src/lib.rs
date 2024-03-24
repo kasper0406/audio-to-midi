@@ -1,3 +1,6 @@
+use std::path::Path;
+use std::fmt;
+
 use numpy::PyArray1;
 use numpy::PyArray2;
 use numpy::ToPyArray;
@@ -12,6 +15,15 @@ use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 use tokio::task::JoinSet;
 use serde::Deserialize;
+
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+use log::{debug, error, info, trace, warn};
 
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
@@ -49,12 +61,11 @@ async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEve
         match result {
             Ok(record) => {
                 if record.time < max_event_time {
-                    events.push( (record.time, key_to_event(record.key) + 88, record.velocity) );
+                    events.push( (record.time, key_to_event(record.key), record.velocity) );
                     max_velocity = max_velocity.max(record.velocity)
                 }
-                if record.time + record.duration < max_event_time + 5.0 * epsilon {
-                    let release_time = max_event_time.min(record.time + record.duration - epsilon);
-                    events.push( (release_time, key_to_event(record.key), 0.0) );
+                if record.time + record.duration < max_event_time {
+                    events.push( (record.time + record.duration, key_to_event(record.key), 0.0) );
                 }
             },
             Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
@@ -140,7 +151,99 @@ fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, m
     Ok(PyList::new(py, &numpy_results).into())
 }
 
-async fn load_audio_sample(file: &str, max_duration: f32) -> Result<Vec<f32>, std::io::Error> {
+#[derive(Debug)]
+enum AudioLoadingError {
+    IoError(std::io::Error),
+    AudioLoadingError(symphonia::core::errors::Error),
+    CodecNotFound(),
+}
+impl std::error::Error for AudioLoadingError {}
+impl fmt::Display for AudioLoadingError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AudioLoadingError::IoError(err) => write!(f, "IO error: {}", err),
+            AudioLoadingError::AudioLoadingError(err) => write!(f, "Audio processing error: {}", err),
+            AudioLoadingError::CodecNotFound() => write!(f, "Did not find a suitable audio codec"),
+        }
+    }
+}
+
+async fn load_audio_sample(file_path: &str, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
+    let path = Path::new(file_path);
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+
+    // Open the sample file and read the sample
+    // let mut file = File::open(path).await.map_err(AudioLoadingError::IoError)?;
+    // let mut buffer = Vec::new();
+    // file.read_to_end(&mut buffer).await.map_err(AudioLoadingError::IoError)?;
+
+    // // Decode the audio and get the samples
+    // use std::io::Cursor;
+    // let mss = MediaSourceStream::new(Box::new(Cursor::new(buffer)), Default::default());
+
+    let file = Box::new(std::fs::File::open(Path::new(&file_path)).unwrap());
+    let mss = MediaSourceStream::new(file, Default::default());
+
+    let mut hint = Hint::new();
+    hint.with_extension(extension);
+
+    let meta_opts: MetadataOptions = Default::default();
+    let fmt_opts: FormatOptions = Default::default();
+
+    debug!("Using extension hint {}", extension);
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &fmt_opts, &meta_opts)
+        .map_err(AudioLoadingError::AudioLoadingError)?;
+    
+    debug!("bar!");
+
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(AudioLoadingError::CodecNotFound)?;
+    let track_id = track.id;
+
+    debug!("Found a track!");
+
+    let dec_opts: DecoderOptions = Default::default();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &dec_opts)
+        .map_err(AudioLoadingError::AudioLoadingError)?;
+
+    debug!("Found a decoder!");
+
+    loop {
+        // Get the next packet from the media format.
+        let packet = format.next_packet().map_err(AudioLoadingError::AudioLoadingError)?;
+        // If the packet does not belong to the selected track, skip over it.
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        // Decode the packet into audio samples.
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                info!("Decoded {} bytes", decoded.capacity());
+            }
+            Err(Error::IoError(err)) => {
+                // The packet failed to decode due to an IO error, skip the packet.
+                warn!("Skipping package: {}", err);
+                continue;
+            }
+            Err(Error::DecodeError(err)) => {
+                // The packet failed to decode due to invalid data, skip the packet.
+                warn!("Skipping package: {}", err);
+                continue;
+            }
+            Err(err) => {
+                return Err(AudioLoadingError::AudioLoadingError(err));
+            }
+        }
+    }
+
     Ok(vec![])
 }
 
@@ -153,7 +256,8 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
             let mut futures = vec![];
 
             for sample_file in sample_files {
-                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&sample_file, max_duration).await });
+                let filename = format!["{}.aac", sample_file];
+                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&filename, max_duration).await });
                 futures.push(future);
             }
 
@@ -191,6 +295,8 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
 
 #[pymodule]
 fn rust_plugins(py: Python, m: &PyModule) -> PyResult<()> {
+    env_logger::init();
+
     m.add_function(wrap_pyfunction!(events_from_samples, m)?)?;
     m.add_function(wrap_pyfunction!(load_audio_samples, m)?)?;
     Ok(())

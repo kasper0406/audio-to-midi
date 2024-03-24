@@ -9,6 +9,9 @@ edition = "2021"
 name = "rust_plugins"
 crate-type = ["cdylib"]
 
+[build]
+rustflags = ["-C", "target-feature=+avx", "-C", "opt-level=3", "-C", "target-cpu=native"]
+
 [dependencies]
 pyo3 = { version = "0.20.3", features = ["extension-module"] }
 numpy = "0.20.0"
@@ -16,3 +19,6 @@ tokio = { version = "1.36", features = ["full"] }
 once_cell = "1.19.0"
 csv = "1.3"
 serde = { version = "1.0", features = ["derive"] }
+symphonia = { version = "0.5.4", features = ["opt-simd", "aac", "aiff"] }
+log = "0.4"
+env_logger = "0.11"
