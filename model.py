@@ -239,22 +239,16 @@ class AttentionBlock(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "seq_len attention_size"],
-        encoder_output: Optional[Float[Array, "seq_len attention_size"]],
-        input_mask: Optional[
-            Integer[Array, "seq_len"]
-        ] = None,  # The mask on the attention inputs, notice we allow all encoder outputs to be attended to
+        kv_context: Optional[Float[Array, "seq_len attention_size"]],
+        input_mask: Optional[Integer[Array, "seq_len"]] = None,
+        kv_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        mask = None
-        if input_mask is not None:
-            mask = self.make_attention_mask(
-                input_mask,
-                encoder_output.shape[0]
-                if encoder_output is not None
-                else inputs.shape[0],
-                encoder_output is None,
-            )
+        if kv_context is None:
+            kv_mask = input_mask
+        kv_seq_len = kv_context.shape[0] if kv_context is not None else inputs.shape[0]
+        mask = self.make_attention_mask(inputs.shape[0], kv_seq_len, input_mask, kv_mask)
 
         attention_key, dropout_key = jax.random.split(key)
 
@@ -262,8 +256,8 @@ class AttentionBlock(eqx.Module):
         # when decoding, we use the encoder outputs for the key and value
         result = self.attention(
             query=inputs,
-            key_=encoder_output if encoder_output is not None else inputs,
-            value=encoder_output if encoder_output is not None else inputs,
+            key_=kv_context if kv_context is not None else inputs,
+            value=kv_context if kv_context is not None else inputs,
             mask=mask,
             inference=not enable_dropout,
             key=attention_key,
@@ -277,19 +271,17 @@ class AttentionBlock(eqx.Module):
 
     def make_attention_mask(
         self,
-        input_mask: Integer[Array, " q_seq"],
-        key_value_sequence_length: int,
-        # TODO: Consider a nicer way of doing this
-        mask_key_values: bool,  # If inputs are used as kv sequences, we need to mask those too!
+        input_sequence_length: int,
+        kv_sequence_length: int,
+        input_mask: Optional[Integer[Array, "seq_len"]] = None,
+        kv_mask: Optional[Integer[Array, "seq_len"]] = None,
     ) -> Float[Array, "q_seq kv_seq"]:
         """Create self-attention mask from sequence-level mask."""
 
-        # In a non-self-attention layer where the kv arrays are the outputs of the encoder, we allow
-        # the decoder to attend everywhere. Otherwise if the kv arrays are the seen inputs so far, we
-        # mask out events not seen yet.
-        kv_mask = jnp.ones(key_value_sequence_length, dtype=jnp.int32)
-        if mask_key_values:
-            kv_mask = input_mask
+        if input_mask is None:
+            input_mask = jnp.ones(input_sequence_length, dtype=jnp.int32)
+        if kv_mask is None:
+            kv_mask = jnp.ones(kv_sequence_length, dtype=jnp.int32)
 
         mask = jnp.multiply(
             jnp.expand_dims(input_mask, axis=-1),
@@ -347,8 +339,9 @@ class TransformerLayer(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "seq_len attention_size"],
-        encoder_output: Optional[Float[Array, "seq_len attention_size"]],
-        mask: Optional[Integer[Array, "seq_len"]] = None,
+        kv_context: Optional[Float[Array, "seq_len attention_size"]],
+        input_mask: Optional[Integer[Array, "seq_len"]] = None,
+        kv_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
@@ -356,22 +349,23 @@ class TransformerLayer(eqx.Module):
             key, num=3
         )
 
+        # None as kv_context means that the input will be used for attention KV, so we need to m
         output = self.self_attention_block(
-            inputs, None, mask, enable_dropout, key=self_attention_key
+            inputs, None, input_mask=input_mask, enable_dropout=enable_dropout, key=self_attention_key
         )
 
-        if encoder_output is not None:
+        if kv_context is not None:
             output = self.encoder_attention_block(
-                output, encoder_output, mask, enable_dropout, key=encoder_attention_key
+                output, kv_context, input_mask=input_mask, kv_mask=kv_mask, enable_dropout=enable_dropout, key=encoder_attention_key
             )
 
         seq_len = inputs.shape[0]
         feed_forward_keys = jax.random.split(feed_forward_key, num=seq_len)
 
-        if mask is None:
-            mask = jnp.ones((seq_len,), dtype=jnp.bool_)
+        if input_mask is None:
+            input_mask = jnp.ones((seq_len,), dtype=jnp.bool_)
         output = jax.vmap(self.feed_forward_block, in_axes=(0, 0, None, 0))(
-            output, mask, enable_dropout, feed_forward_keys
+            output, input_mask, enable_dropout, feed_forward_keys
         )
         return output
 
@@ -412,7 +406,7 @@ class Encoder(eqx.Module):
                 intermediate_size=intermediate_size,
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
-                allocate_encoder_attention=False,
+                allocate_encoder_attention=True,
                 key=layer_key,
             )
         self.encoder_layers = jax.vmap(make_encoder_layer)(layer_keys)
@@ -420,6 +414,10 @@ class Encoder(eqx.Module):
     def __call__(
         self,
         input_frames: Float[Array, "seq_len frame_size"],
+        midi_embeddings: Float[
+            Array, "midi_seq_len attention_size"
+        ],  # The decoder output produced so far
+        mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
@@ -437,8 +435,8 @@ class Encoder(eqx.Module):
             layer = eqx.combine(current_dynamic_layer, static_layers)
             return (idx + 1, layer(
                 inputs=current_output,
-                mask=None, # There is no masking for the frame encoder
-                encoder_output=None,
+                kv_context=midi_embeddings,
+                kv_mask=mask,
                 enable_dropout=enable_dropout,
                 key=layer_key,
             )), None
@@ -509,7 +507,7 @@ class Decoder(eqx.Module):
     # TODO: Consider a different attention_size for midi and frame embeddings
     def __call__(
         self,
-        decoder_output: Float[
+        midi_embeddings: Float[
             Array, "midi_seq_len attention_size"
         ],  # The decoder output produced so far
         encoder_output: Float[Array, "frame_seq_len attention_size"],
@@ -537,13 +535,13 @@ class Decoder(eqx.Module):
             layer = eqx.combine(current_dynamic_layer, static_layers)
             return (idx + 1, layer(
                 inputs=current_output,
-                mask=mask,
-                encoder_output=encoder_output,
+                input_mask=mask,
+                kv_context=encoder_output,
                 enable_dropout=enable_dropout,
                 key=layer_key,
             )), None
 
-        (_, decoder_output), _ = jax.lax.scan(compute_layer, (0, decoder_output), dynamic_layers)
+        (_, midi_embeddings), _ = jax.lax.scan(compute_layer, (0, midi_embeddings), dynamic_layers)
 
         # We take the first token in the last decoder layer to have information necessary for two
         # different pooling layers to extract both the midi event and the position
@@ -551,7 +549,7 @@ class Decoder(eqx.Module):
         #         not give any meaningful result.
         #         This padding is handled by our start of sequence token which is always pre-pended to the
         #         seen events, causing the mask for the first position to never be masked out.
-        first_token_last_layer = decoder_output[0, :]
+        first_token_last_layer = midi_embeddings[0, :]
         midi_logits = self.midi_decoder_pooling(
             first_token_last_layer, key=midi_decoder_key
         )
@@ -659,10 +657,6 @@ class OutputSequenceGenerator(eqx.Module):
     ):
         encoder_key, decoder_key, midi_embedding_key_seen, midi_embedding_key_active = jax.random.split(key, num=4)
 
-        encoder_output = self.encoder(
-            input_frames=input_frames, enable_dropout=enable_dropout, key=encoder_key
-        )
-
         midi_embeddings_seen = jax.vmap(
             partial(
                 self.midi_embedding,
@@ -677,7 +671,7 @@ class OutputSequenceGenerator(eqx.Module):
                 self.midi_embedding,
                 event_type=1,
                 enable_dropout=enable_dropout,
-                key=midi_embedding_key_seen,
+                key=midi_embedding_key_active,
             )
         )(active_events)
 
@@ -686,8 +680,12 @@ class OutputSequenceGenerator(eqx.Module):
         all_midi_events = jnp.concatenate([seen_events, active_events], axis=0, dtype=jnp.int16)
         mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
+        encoder_output = self.encoder(
+            input_frames=input_frames, midi_embeddings=all_midi_embeddings, mask=mask, enable_dropout=enable_dropout, key=encoder_key
+        )
+
         midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = self.decoder(
-            decoder_output=all_midi_embeddings,
+            midi_embeddings=all_midi_embeddings,
             encoder_output=encoder_output,
             mask=mask,
             enable_dropout=enable_dropout,

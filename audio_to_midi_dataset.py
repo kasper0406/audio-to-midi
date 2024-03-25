@@ -482,6 +482,7 @@ class AudioToMidiDatasetLoader:
         audio_samples = jnp.stack(audio_samples)
 
         if sharding is not None:
+            # TODO: Fix the case where audio_samples.shape[0] does not align with the sharding
             audio_samples = jax.device_put(audio_samples, sharding)
 
         frames, calculated_duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
@@ -513,7 +514,7 @@ class AudioToMidiDatasetLoader:
                 current_frames = self.loaded_audio_frames
                 current_sample_names = self.loaded_sample_names
             
-            print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
+            # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
             sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events.shape[1])
 
             current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
