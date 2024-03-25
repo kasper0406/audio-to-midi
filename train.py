@@ -142,17 +142,7 @@ def load_test_set(testset_dir: Path, batch_size: int):
 
     batches = []
     for chunk in chunks:
-        (
-            frames,
-            _,
-            duration_per_frame,
-            _frame_width,
-        ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(testset_dir, chunk)
-        midi_events = (
-            AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
-                testset_dir, chunk, duration_per_frame
-            )
-        )
+        midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk)
         batches.append((frames, midi_events))
     return batches
 
@@ -273,7 +263,7 @@ def train(
         loss_sum = loss_sum + loss
         idv_loss_sum = idv_loss_sum + individual_losses
 
-        if step % print_every == 0:
+        if step % print_every == 0 and step != 0:
             learning_rate = learning_rate_schedule(step)
 
             averaged_loss = (loss_sum / print_every)[0]

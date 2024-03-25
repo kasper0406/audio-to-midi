@@ -19,6 +19,7 @@ use tokio::task::JoinSet;
 use serde::Deserialize;
 use uuid::Uuid;
 use std::process::Stdio;
+use futures::future::join_all;
 
 use log::{debug, error, info, trace, warn};
 
@@ -38,9 +39,14 @@ fn key_to_event(key: u32) -> u32 {
     2 + (key - 21) as u32
 }
 
-type MidiEvents = Vec<(f32, u32, f32)>;
+fn frame_position(time: f32, duration_per_frame: f32) -> u32 {
+    (time / duration_per_frame).round() as u32
+}
 
-async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEvents, std::io::Error> {
+type MidiEvents = Vec<(u32, u32, u32)>;
+const VELOCITY_CATEGORIES: f32 = 10.0;
+
+async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
@@ -53,16 +59,18 @@ async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEve
     reader.set_headers(csv::StringRecord::from(vec!["time", "duration", "key", "velocity"]));
 
     let mut events = vec![];
-    let mut max_velocity: f32 = 0.0;
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
+                let key = key_to_event(record.key);
                 if record.time < max_event_time {
-                    events.push( (record.time, key_to_event(record.key), record.velocity) );
-                    max_velocity = max_velocity.max(record.velocity)
+                    let frame_pos = frame_position(record.time, duration_per_frame);
+                    let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
+                    events.push( (frame_pos, key, velocity) );
                 }
                 if record.time + record.duration < max_event_time {
-                    events.push( (record.time + record.duration, key_to_event(record.key), 0.0) );
+                    let frame_pos = frame_position(record.time + record.duration, duration_per_frame);
+                    events.push( (frame_pos, key, 0) );
                 }
             },
             Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
@@ -70,18 +78,10 @@ async fn get_events_from_file(path: &str, max_event_time: f32) -> Result<MidiEve
     }
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
 
-    // Normalize the velocity. TODO: Refactor this
-    if max_velocity != 0.0 {
-        for i in 0..events.len() {
-            let (time, key, velocity) = events[i];
-            events[i] = (time, key, velocity / max_velocity);
-        }
-    }
-
     let mut events_with_padding: MidiEvents = vec![];
-    events_with_padding.push((0.0, 1, 0.0));
+    events_with_padding.push((0, 1, 0));
     events_with_padding.append(&mut events);
-    events_with_padding.push((0.0, 0, 0.0));
+    events_with_padding.push((0, 0, 0));
     Ok(events_with_padding)
 }
 
@@ -101,53 +101,6 @@ fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> R
     Ok(sample_files)
 }
 
-#[pyfunction]
-fn events_from_samples(py: Python, dataset_dir: String, sample_names: &PyList, max_event_time: f32) -> PyResult<Py<PyList>> {
-    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
-
-    let all_events = py.allow_threads(move || {
-        TOKIO_RUNTIME.block_on(async {
-            let mut futures = vec![];
-
-            for sample_file in sample_files {
-                let future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&format!["{}.csv", sample_file], max_event_time).await });
-                futures.push(future);
-            }
-
-            let mut all_events = vec![];
-            for future in futures {
-                match future.await {
-                    Ok(Ok(events)) => {
-                        all_events.push(events);
-                    },
-                    Ok(Err(err)) => {
-                        return Err(PyTypeError::new_err(format!("Failed to read sample: {:?}", err)))
-                    },
-                    Err(err) => {
-                        return Err(PyTypeError::new_err(format!("Error during processing: {:?}", err)))
-                    }
-                }
-            }
-            Ok(all_events)
-        })
-    }).unwrap();
-
-    let mut numpy_results = vec![];
-    for events in all_events {
-        let mut np_array = PyArray2::<f32>::zeros(py, [events.len(), 3], false);
-        {
-            let mut array_read_write = np_array.readwrite();
-            for (row, (time, key, velocity)) in events.into_iter().enumerate() {
-                *array_read_write.get_mut([row, 0]).unwrap() = time as f32;
-                *array_read_write.get_mut([row, 1]).unwrap() = key as f32;
-                *array_read_write.get_mut([row, 2]).unwrap() = velocity as f32;
-            }
-        }
-        numpy_results.push(np_array);
-    }
-    Ok(PyList::new(py, &numpy_results).into())
-}
-
 #[derive(Debug)]
 enum AudioLoadingError {
     IoError(std::io::Error),
@@ -163,10 +116,10 @@ impl fmt::Display for AudioLoadingError {
     }
 }
 
-async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
-    let sample_rate = 16_000; // Hz
-
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
     let status = Command::new("ffmpeg")
+        .arg("-t")
+        .arg(format!["{}", max_duration])
         .arg("-i")
         .arg(input_file)
         .arg("-ac")
@@ -207,20 +160,20 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, ma
     Ok(samples)
 }
 
-async fn load_audio_sample(file_path: &str, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
+async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
     let path = Path::new(file_path);
     
     let uuid = Uuid::new_v4();
     let output_file = format!["/tmp/audio-to-midi-{}.raw", uuid];
     
-    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &output_file, max_duration).await;
+    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &output_file, sample_rate, max_duration).await;
 
     tokio::fs::remove_file(output_file).await.map_err(AudioLoadingError::IoError)?;
     audio_sampels
 }
 
 #[pyfunction]
-fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, max_duration: f32) -> PyResult<Py<PyList>> {
+fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32) -> PyResult<Py<PyList>> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let all_samples = py.allow_threads(move || {
@@ -229,7 +182,7 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
 
             for sample_file in sample_files {
                 let filename = format!["{}.aac", sample_file];
-                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&filename, max_duration).await });
+                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&filename, sample_rate, max_duration).await });
                 futures.push(future);
             }
 
@@ -258,11 +211,66 @@ fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, ma
     Ok(PyList::new(py, &numpy_results).into())
 }
 
+#[pyfunction]
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>)> {
+    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+
+    let all_samples = py.allow_threads(move || {
+        TOKIO_RUNTIME.block_on(async {
+            let mut audio_futures = vec![];
+            let mut event_futures = vec![];
+
+            for sample_file in sample_files {
+                let audio_filename = format!["{}.aac", sample_file];
+                let audio_future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&audio_filename, sample_rate, max_duration).await });
+                audio_futures.push(audio_future);
+
+                let event_filename = format!["{}.csv", sample_file];
+                let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, max_duration, duration_per_frame).await });
+                event_futures.push(event_future);
+            }
+
+            let audio_samples: Vec<Vec<f32>> = join_all(audio_futures).await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .map(|result| result.unwrap())
+                .collect();
+            let events: Vec<MidiEvents> = join_all(event_futures).await
+                .into_iter()
+                .map(|result| result.unwrap())
+                .map(|result| result.unwrap())
+                .collect();
+
+            (audio_samples, events)
+        })
+    });
+
+    let mut audio_results = vec![];
+    let mut event_results = vec![];
+    let (all_audio_samples, all_events) = all_samples;
+    for (audio_samples, events) in all_audio_samples.into_iter().zip(all_events.into_iter()) {
+        let audio_array = audio_samples.into_pyarray(py).to_owned();
+        audio_results.push(audio_array);
+
+        let mut event_array = PyArray2::<u16>::zeros(py, [events.len(), 3], false);
+        {
+            let mut event_array_read_write = event_array.readwrite();
+            for (row, (time, key, velocity)) in events.into_iter().enumerate() {
+                *event_array_read_write.get_mut([row, 0]).unwrap() = time as u16;
+                *event_array_read_write.get_mut([row, 1]).unwrap() = key as u16;
+                *event_array_read_write.get_mut([row, 2]).unwrap() = velocity as u16;
+            }
+        }
+        event_results.push(event_array);
+    }
+    Ok((PyList::new(py, &audio_results).into(), PyList::new(py, &event_results).into()))
+}
+
 #[pymodule]
 fn rust_plugins(py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::init();
 
-    m.add_function(wrap_pyfunction!(events_from_samples, m)?)?;
     m.add_function(wrap_pyfunction!(load_audio_samples, m)?)?;
+    m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
     Ok(())
 }
