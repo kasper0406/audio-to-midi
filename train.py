@@ -136,13 +136,13 @@ def compute_training_step(
 
 
 @lru_cache(maxsize=1)
-def load_test_set(testset_dir: Path, batch_size: int):
+def load_test_set(testset_dir: Path, sharding, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
     chunks = chunked(sample_names, batch_size)
 
     batches = []
     for chunk in chunks:
-        midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk)
+        midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
         batches.append((frames, midi_events))
     return batches
 
@@ -180,8 +180,8 @@ def compute_test_loss(
     return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
 
 
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, batch_size=32):
-    batches = load_test_set(testset_dir, batch_size=batch_size)
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
 
     test_loss = jnp.array([0.0], dtype=jnp.float32)
@@ -280,7 +280,7 @@ def train(
             print("Evaluating test loss...")
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             eval_key, key = jax.random.split(key, num=2)
-            testset_loss = compute_testset_loss(model, testset_dir, eval_key)
+            testset_loss = compute_testset_loss(model, testset_dir, eval_key, batch_sharding)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Test loss: {testset_loss}")
