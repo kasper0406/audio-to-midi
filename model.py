@@ -15,8 +15,7 @@ model_config = {
     "attention_size": 64,
     "intermediate_size": 128,
     "num_heads": 2,
-    "num_encoder_layers": 3,
-    "num_decoder_layers": 2,
+    "num_layers": 3,
     "dropout_rate": 0.05,
     "midi_event_context_size": 15,
 }
@@ -561,7 +560,7 @@ class OutputSequenceGenerator(eqx.Module):
         ping_pong_key, frame_embedding_key, midi_embedding_key, decoder_key = jax.random.split(key, 4)
 
         self.ping_pong = PingPong(
-            num_layers=conf["num_encoder_layers"],
+            num_layers=conf["num_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
