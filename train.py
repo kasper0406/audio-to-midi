@@ -238,6 +238,10 @@ def train(
             batch_sharding,
         )
 
+        # Keep the old model state in memory until we are sure the loss is not nan
+        recovery_flat_model = flat_model
+        recovery_flat_state = flat_state
+
         (loss, individual_losses), flat_model, flat_state, key = compute_training_step(
             flat_model,
             audio_frames,
@@ -253,8 +257,10 @@ def train(
         step_end_time = time.time()
 
         if jnp.isnan(loss):
-            print(f"Encountered NAN loss at step {step}. Stopping the training!")
-            break
+            print(f"Encountered NAN loss at step {step}. Trying to recover!")
+            flat_model = recovery_flat_model
+            flat_state = recovery_flat_state
+            continue
 
         if checkpoint_manager.should_save(step):
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
