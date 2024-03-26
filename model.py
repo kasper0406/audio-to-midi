@@ -15,7 +15,8 @@ model_config = {
     "attention_size": 64,
     "intermediate_size": 128,
     "num_heads": 2,
-    "num_layers": 3,
+    "num_encoder_layers": 3,
+    "num_decoder_layers": 2,
     "dropout_rate": 0.05,
     "midi_event_context_size": 15,
 }
@@ -603,12 +604,12 @@ class OutputSequenceGenerator(eqx.Module):
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
             dropout_rate=conf["dropout_rate"],
-            num_layers=conf["num_layers"],
+            num_layers=conf["num_encoder_layers"],
             key=encoder_key,
         )
 
         self.decoder = Decoder(
-            num_layers=conf["num_layers"],
+            num_layers=conf["num_decoder_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
