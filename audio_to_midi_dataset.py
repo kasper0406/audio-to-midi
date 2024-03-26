@@ -660,7 +660,7 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 
 
 def plot_frequency_domain_audio(
-    sample_name: str, duration_per_frame: float, frames: NDArray[jnp.float32]
+    sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32]
 ):
     fig, ax1 = plt.subplots()
 
@@ -668,7 +668,7 @@ def plot_frequency_domain_audio(
     # transposed_reals = jnp.transpose(jnp.real(frames))
     # transformed_data = transposed_reals[0:int(transposed_reals.shape[0] / 2), :]
     X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
-    Y = jnp.linspace(0.0, frames.shape[1] / duration_per_frame, frames.shape[1])
+    Y = jnp.linspace(0.0, frames.shape[1] / frame_width, frames.shape[1])
     ax1.pcolor(X, Y, jnp.transpose(frames))
 
     ax1.set(
@@ -702,7 +702,7 @@ def visualize_sample(
     print(f"Seen events: {_remove_zeros(seen_events)}")
     print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
-    plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frames)
+    plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
     plt.show()
 

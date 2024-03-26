@@ -60,6 +60,108 @@ class FrameEmbedding(eqx.Module):
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
+class NoteEmbedding(eqx.Module):
+    special_note_embedding: eqx.nn.Embedding
+    linear_note_embedding: eqx.nn.Linear
+
+    def __init__(
+        self,
+        output_size: int,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        special_notes_key, linear_notes_key = jax.random.split(key, num=2)
+
+        self.special_note_embedding = eqx.nn.Embedding(
+            num_embeddings=2,
+            embedding_size=output_size,
+            key=special_notes_key,
+        )
+
+        self.linear_note_embedding = eqx.nn.Linear(
+            in_features=1,
+            out_features=output_size,
+            key=linear_notes_key,
+        )
+    
+    def __call__(
+        self, 
+        note: int,
+    ):
+        """
+        Two special notes:
+        0: SEQUENCE_END
+        1: SEQUENCE_START
+
+        These are handled with all custom embeddings.
+        The rest of the notes in the interval [2..MIDI_EVENT_VOCCAB_SIZE] are generated using a
+        single linear layer potentially with a continous non-linear function after, to make sure
+        they are continous and follow a nice pattern. This is to hope for better generalization.
+        """
+        num_special = self.special_note_embedding.num_embeddings
+
+        def special_note(special_note):
+            return self.special_note_embedding(special_note)
+        def normal_note(normal_note):
+            scaled_note = jnp.array([(normal_note - num_special) / (MidiVocabulary.voccab_size() - num_special)], dtype=jnp.float16)
+            return self.linear_note_embedding(scaled_note)
+
+        return jax.lax.cond(
+            note <= num_special,
+            special_note,
+            normal_note,
+            note
+        )
+
+class VelocityEmbedding(eqx.Module):
+    special_velocity_embedding: eqx.nn.Embedding
+    linear_velocity_embedding: eqx.nn.Linear
+
+    def __init__(
+        self,
+        output_size: int,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        special_vel_key, linear_vel_key = jax.random.split(key, num=2)
+
+        self.special_velocity_embedding = eqx.nn.Embedding(
+            num_embeddings=1,
+            embedding_size=output_size,
+            key=special_vel_key
+        )
+
+        self.linear_velocity_embedding = eqx.nn.Linear(
+            in_features=1,
+            out_features=output_size,
+            key=linear_vel_key,
+        )
+
+    def __call__(
+        self, 
+        velocity: int,
+    ):
+        """
+        One special velocity:
+        0: BLANK_VELOCITY
+
+        These are handled with all custom embeddings.
+        The rest of the notes in the interval [1..num_velocities()] are generated using a single linear layer
+        potentially with a continous non-linear function after, to make sure they are continous
+        and follow a nice pattern. This is to hope for better generalization.
+        """
+        num_special = self.special_velocity_embedding.num_embeddings
+
+        def special_velocity(special_vel):
+            return self.special_velocity_embedding(special_vel)
+        def normal_velocity(normal_vel):
+            scaled_vel = jnp.array([(normal_vel - num_special) / (MidiVocabulary.num_velocities() - num_special)], dtype=jnp.float16)
+            return self.linear_velocity_embedding(scaled_vel)
+
+        return jax.lax.cond(
+            velocity <= num_special,
+            special_velocity,
+            normal_velocity,
+            velocity
+        )
 
 class MidiVocabulary(eqx.Module):
     """Takes midi events and creates an embedding of them:
@@ -89,9 +191,9 @@ class MidiVocabulary(eqx.Module):
     def num_velocities(cls):
         return 10
 
-    node_embedding: eqx.nn.Embedding
+    note_embedding: NoteEmbedding
     position_embeddings: Float[Array, "seq_len output_shape"]
-    velocity_embedding: eqx.nn.Embedding
+    velocity_embedding: VelocityEmbedding
     event_type_embedding: eqx.nn.Embedding
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
@@ -104,15 +206,14 @@ class MidiVocabulary(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         node_key, velocity_key, event_type_key = jax.random.split(key, num=3)
-        self.node_embedding = eqx.nn.Embedding(
-            num_embeddings=self.voccab_size(), embedding_size=output_size, key=node_key
+        self.note_embedding = NoteEmbedding(
+            output_size=output_size, key=node_key
         )
         self.position_embeddings = position_encoding.for_input_frame(
             max_frame_sequence_length, output_size
         )
-        self.velocity_embedding = eqx.nn.Embedding(
-            num_embeddings=self.num_velocities(),
-            embedding_size=output_size,
+        self.velocity_embedding = VelocityEmbedding(
+            output_size=output_size,
             key=velocity_key,
         )
         self.event_type_embedding = eqx.nn.Embedding(
@@ -132,7 +233,7 @@ class MidiVocabulary(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        midi_embedding = self.node_embedding(midi_event[1])
+        midi_embedding = self.note_embedding(midi_event[1])
         position_embedding = self.position_embeddings[midi_event[0], :]
         velocity_embedding = self.velocity_embedding(midi_event[2])
         event_type_embedding = self.event_type_embedding(event_type)
@@ -141,7 +242,7 @@ class MidiVocabulary(eqx.Module):
         )
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
-
+# TODO: Consider using eqx.nn.MLP here instead to simplify the code
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
     This applies to every output (count of them are attention_size) of the attention mechanism
