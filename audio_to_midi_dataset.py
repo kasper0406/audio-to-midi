@@ -481,11 +481,18 @@ class AudioToMidiDatasetLoader:
         audio_samples, midi_events = rust_plugins.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
         audio_samples = jnp.stack(audio_samples)
 
+        required_padding = 0
         if sharding is not None:
-            # TODO: Fix the case where audio_samples.shape[0] does not align with the sharding
+            # Make sure the audio_samples array is shardable
+            required_padding = (sharding.mesh.shape["batch"] - audio_samples.shape[0]) % sharding.mesh.shape["batch"]
+            if required_padding != 0:
+                audio_samples = jnp.repeat(audio_samples, repeats=required_padding, axis=0)
             audio_samples = jax.device_put(audio_samples, sharding)
 
         frames, calculated_duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
+        if required_padding > 0:
+            frames = frames[:-required_padding, ...]
+
         midi_events = AudioToMidiDatasetLoader._pad_and_stack_midi_events(midi_events, minimum_midi_event_size)
 
         assert calculated_duration_per_frame == duration_per_frame, "Duration per frame values must line up!"
@@ -774,8 +781,8 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v2"),
-        batch_size=16,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v3_small"),
+        batch_size=32,
         prefetch_count=20,
         num_workers=2,
         key=key,
@@ -784,11 +791,21 @@ if __name__ == "__main__":
     )
     dataset_loader_iter = iter(dataset_loader)
 
-    for num, loaded_batch in zip(range(0, 100), dataset_loader_iter):
+    # agg_histogram = jnp.zeros(100, dtype=jnp.int32)
+    for num, loaded_batch in zip(range(0, 200), dataset_loader_iter):
         print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
         print(f"Active events shape: {num}", loaded_batch["active_events"].shape)
+
+        # seen_events = loaded_batch["seen_events"][:, :, 1] + 1 # +1 to make the blank event -1 appear as a 0
+        # flattened_events = jnp.reshape(seen_events, (seen_events.shape[0] * seen_events.shape[1]))
+        # special_mask = flattened_events < 3
+        # print(f"Seen events max: {jnp.max(flattened_events)}")
+        # print(f"Seen events min: {jnp.min(flattened_events[~special_mask])}")
+        # histogram = jnp.bincount(flattened_events, length=agg_histogram.shape[0])
+        # agg_histogram = agg_histogram + histogram
+        # print(f"Histogram: {agg_histogram}")
 
         batch_idx = random.randint(0, loaded_batch["audio_frames"].shape[0] - 1)
         visualize_sample(

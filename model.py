@@ -72,7 +72,7 @@ class NoteEmbedding(eqx.Module):
         special_notes_key, linear_notes_key = jax.random.split(key, num=2)
 
         self.special_note_embedding = eqx.nn.Embedding(
-            num_embeddings=2,
+            num_embeddings=3,
             embedding_size=output_size,
             key=special_notes_key,
         )
@@ -89,6 +89,7 @@ class NoteEmbedding(eqx.Module):
     ):
         """
         Two special notes:
+        -1: BLANK_MIDI_EVENT
         0: SEQUENCE_END
         1: SEQUENCE_START
 
@@ -98,15 +99,16 @@ class NoteEmbedding(eqx.Module):
         they are continous and follow a nice pattern. This is to hope for better generalization.
         """
         num_special = self.special_note_embedding.num_embeddings
+        note = note + 1 # Add 1 to adjust for the -1 BLANK event
 
         def special_note(special_note):
             return self.special_note_embedding(special_note)
         def normal_note(normal_note):
-            scaled_note = jnp.array([(normal_note - num_special) / (MidiVocabulary.voccab_size() - num_special)], dtype=jnp.float16)
+            scaled_note = jnp.array([(normal_note - num_special) / (MidiVocabulary.voccab_size() + 1 - num_special)], dtype=jnp.float16)
             return self.linear_note_embedding(scaled_note)
 
         return jax.lax.cond(
-            note <= num_special,
+            note < num_special,
             special_note,
             normal_note,
             note
@@ -157,7 +159,7 @@ class VelocityEmbedding(eqx.Module):
             return self.linear_velocity_embedding(scaled_vel)
 
         return jax.lax.cond(
-            velocity <= num_special,
+            velocity < num_special,
             special_velocity,
             normal_velocity,
             velocity
