@@ -33,9 +33,9 @@ BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 13
-WINDOW_OVERLAP = 0.90
-COMPRESSION_FACTOR = 2
+SAMPLES_PER_FFT = 2 ** 11
+WINDOW_OVERLAP = 0.60
+COMPRESSION_FACTOR = 256
 FREQUENCY_CUTOFF = 8000
 
 
@@ -83,7 +83,7 @@ def fft_audio(
     windows = patches.squeeze(axis=(0,)) * hann_window
 
     # Apply the FFT
-    fft = jnp.fft.fft(windows)
+    fft = jax.vmap(jnp.fft.rfft)(windows)
     transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
@@ -569,30 +569,23 @@ class AudioToMidiDatasetLoader:
         # return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame, frame_width
 
     @classmethod
-    def load_and_slice_full_audio(cls, filename: Path):
-        raise NotImplementedError()
+    def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
+        audio_samples = rust_plugins.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
 
-        # audio_samples = parallel_audio_reader.load_audio(
-        #     filename,
-        #     AudioToMidiDatasetLoader.SAMPLE_RATE,
-        #     duration=None,
-        # )
+        window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
+        overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
 
-        # window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
-        # overlap = round(WINDOW_OVERLAP * AudioToMidiDatasetLoader.SAMPLE_RATE)
-
-        # # TODO: Fix and improve this!
-        # step = window_size - overlap
-        # n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
-        # windows = []
-        # for i in range(n_windows):
-        #     window_samples = audio_samples[i * step:i * step + window_size]
-        #     # Make sure the window has the exact length (i.e. pad the last window if necessary)
-        #     window_samples = jnp.pad(window_samples, ((0,window_size - window_samples.shape[0])), constant_values=(0,))
-        #     windows.append(window_samples)
-        # windowed = jnp.stack(windows)
+        step = window_size - overlap
+        n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
+        windows = []
+        for i in range(n_windows):
+            window_samples = audio_samples[i * step:i * step + window_size]
+            # Make sure the window has the exact length (i.e. pad the last window if necessary)
+            window_samples = jnp.pad(window_samples, ((0,window_size - window_samples.shape[0])), constant_values=(0,))
+            windows.append(window_samples)
+        windowed = jnp.stack(windows)
         
-        # return AudioToMidiDatasetLoader._convert_samples(windowed)
+        return AudioToMidiDatasetLoader._convert_samples(windowed)
 
 
     @classmethod

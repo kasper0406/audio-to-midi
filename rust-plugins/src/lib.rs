@@ -15,7 +15,6 @@ use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 use tokio::process::Command;
 use once_cell::sync::Lazy;
-use tokio::task::JoinSet;
 use serde::Deserialize;
 use uuid::Uuid;
 use std::process::Stdio;
@@ -116,24 +115,25 @@ impl fmt::Display for AudioLoadingError {
     }
 }
 
-async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
-    let status = Command::new("ffmpeg")
-        .arg("-t")
-        .arg(format!["{}", max_duration])
-        .arg("-i")
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
+    // TODO: Consider sending back all audio channels
+    let mut command = Command::new("ffmpeg");
+    if let Some(max_duration) = maybe_max_duration {
+        command.arg("-t").arg(format!["{}", max_duration]);
+    }
+    command.arg("-i")
         .arg(input_file)
-        .arg("-ac")
-        .arg("1")
+        .arg("-af")
+        .arg("pan=mono|c0=c0")
         .arg("-ar")
         .arg(format!["{}", sample_rate])
         .arg("-f")
         .arg("f32le")
         .arg(output_file)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    match status {
+        .stderr(Stdio::null());
+
+    match command.status().await {
         Ok(status) => {
             if !status.success() {
                 return Err(AudioLoadingError::FfmpegError(status.code().unwrap_or(-1)));
@@ -153,14 +153,16 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sa
         })
         .collect();
 
-    // Ensure the number of samples is exactly max_duration * sample_rate!
-    let desired_sample_count = ((sample_rate as f32) * max_duration) as usize;
-    samples.resize(desired_sample_count, 0.0);
+    if let Some(max_duration) = maybe_max_duration {
+        // Ensure the number of samples is exactly max_duration * sample_rate!
+        let desired_sample_count = ((sample_rate as f32) * max_duration) as usize;
+        samples.resize(desired_sample_count, 0.0);
+    }
 
     Ok(samples)
 }
 
-async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: f32) -> Result<Vec<f32>, AudioLoadingError> {
+async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
     let path = Path::new(file_path);
     
     let uuid = Uuid::new_v4();
@@ -173,42 +175,25 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: f32)
 }
 
 #[pyfunction]
-fn load_audio_samples(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32) -> PyResult<Py<PyList>> {
-    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
-
-    let all_samples = py.allow_threads(move || {
+fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<PyArray1<f32>>> {
+    let samples = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
-            let mut futures = vec![];
-
-            for sample_file in sample_files {
-                let filename = format!["{}.aac", sample_file];
-                let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&filename, sample_rate, max_duration).await });
-                futures.push(future);
-            }
-
-            let mut all_samples = vec![];
-            for future in futures {
-                match future.await {
-                    Ok(Ok(samples)) => {
-                        all_samples.push(samples);
-                    },
-                    Ok(Err(err)) => {
-                        return Err(PyTypeError::new_err(format!("Failed to read sample: {:?}", err)))
-                    },
-                    Err(err) => {
-                        return Err(PyTypeError::new_err(format!("Error during processing: {:?}", err)))
-                    }
+            let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate, None).await });
+            match future.await {
+                Ok(Ok(samples)) => {
+                    Ok(samples)
+                },
+                Ok(Err(err)) => {
+                    Err(PyTypeError::new_err(format!("Failed to read sample: {:?}", err)))
+                },
+                Err(err) => {
+                    Err(PyTypeError::new_err(format!("Error during processing: {:?}", err)))
                 }
             }
-            Ok(all_samples)
         })
     }).unwrap();
 
-    let mut numpy_results = vec![];
-    for samples in all_samples {
-        numpy_results.push(samples.into_pyarray(py).to_owned());
-    }
-    Ok(PyList::new(py, &numpy_results).into())
+    Ok(samples.into_pyarray(py).to_owned())
 }
 
 #[pyfunction]
@@ -222,7 +207,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
             for sample_file in sample_files {
                 let audio_filename = format!["{}.aac", sample_file];
-                let audio_future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&audio_filename, sample_rate, max_duration).await });
+                let audio_future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&audio_filename, sample_rate, Some(max_duration)).await });
                 audio_futures.push(audio_future);
 
                 let event_filename = format!["{}.csv", sample_file];
@@ -252,7 +237,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         let audio_array = audio_samples.into_pyarray(py).to_owned();
         audio_results.push(audio_array);
 
-        let mut event_array = PyArray2::<u16>::zeros(py, [events.len(), 3], false);
+        let event_array = PyArray2::<u16>::zeros(py, [events.len(), 3], false);
         {
             let mut event_array_read_write = event_array.readwrite();
             for (row, (time, key, velocity)) in events.into_iter().enumerate() {
@@ -267,10 +252,10 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 }
 
 #[pymodule]
-fn rust_plugins(py: Python, m: &PyModule) -> PyResult<()> {
+fn rust_plugins(_py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::init();
 
-    m.add_function(wrap_pyfunction!(load_audio_samples, m)?)?;
+    m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
     Ok(())
 }
