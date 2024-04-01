@@ -196,6 +196,33 @@ fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<Py
     Ok(samples.into_pyarray(py).to_owned())
 }
 
+async fn file_exists(file: &str) -> bool {
+    match tokio::fs::metadata(file).await {
+        Ok(metadata) => {
+            true
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                false
+            } else {
+                error!["Failed to check file existence: {}", file];
+                false
+            }
+        }
+    }
+}
+
+async fn resolve_audio_samples(sample_file: &str) -> String {
+    // This is kind of sucky, but ¯\_(ツ)_/¯
+    if file_exists(&format!["{}.aac", sample_file]).await {
+        return format!["{}.aac", sample_file]
+    }
+    if file_exists(&format!["{}.aif", sample_file]).await {
+        return format!["{}.aif", sample_file]
+    }
+    panic!["Audio not found for sample: {}", sample_file];
+}
+
 #[pyfunction]
 fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
@@ -206,11 +233,15 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
             let mut event_futures = vec![];
 
             for sample_file in sample_files {
-                let audio_filename = format!["{}.aac", sample_file];
-                let audio_future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&audio_filename, sample_rate, Some(max_duration)).await });
+                let sampel_file_clone = sample_file.clone();
+
+                let audio_future = TOKIO_RUNTIME.spawn(async move {
+                    let audio_filename = resolve_audio_samples(&sampel_file_clone).await;
+                    load_audio_sample(&audio_filename, sample_rate, Some(max_duration)).await
+                });
                 audio_futures.push(audio_future);
 
-                let event_filename = format!["{}.csv", sample_file];
+                let event_filename = format!["{}.csv", sample_file.clone()];
                 let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, max_duration, duration_per_frame).await });
                 event_futures.push(event_future);
             }

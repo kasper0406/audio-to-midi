@@ -313,8 +313,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v2")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/debug2")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v4_small")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set")
 
     num_devices = len(jax.devices())
 
