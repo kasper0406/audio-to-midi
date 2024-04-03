@@ -20,14 +20,14 @@ audio_file = Path(args.audio_file)
 if not audio_file.exists():
     raise f"The specified audio file {audio_file} does not exist!"
 
-frames, duration_per_frame = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=0.5)
+frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=0.5)
+print("Loaded samples")
 if args.visualize:
     for frame in frames:
-        plot_frequency_domain_audio(duration_per_frame, frame)
-    plt.show(block=False)
+        plot_frequency_domain_audio(str(audio_file), duration_per_frame, frame_width, frame)
+    plt.show(block=True)
 
 current_directory = Path(__file__).resolve().parent
-dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v0")
 
 checkpoint_path = current_directory / "audio_to_midi_checkpoints"
 audio_to_midi = load_newest_checkpoint(checkpoint_path)

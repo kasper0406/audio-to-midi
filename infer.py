@@ -16,17 +16,18 @@ from audio_to_midi_dataset import (
     SEQUENCE_END,
     SEQUENCE_START,
     AudioToMidiDatasetLoader,
-    plot_frequency_domain_audio
+    plot_frequency_domain_audio,
+    get_active_events
 )
 from model import OutputSequenceGenerator, model_config
 
 
 @eqx.filter_jit
-def forward(model, audio_frames, outputs_so_far, key):
+def forward(model, audio_frames, outputs_so_far, active_notes, key):
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
     midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = jax.vmap(
-        model, (0, 0, 0)
-    )(audio_frames, outputs_so_far, inference_keys)
+        model, (0, 0, 0, 0)
+    )(audio_frames, outputs_so_far, active_notes, inference_keys)
     return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
 
 
@@ -110,6 +111,12 @@ def batch_infer(
         #     "Padded seen events {padded_seen_events}",
         #     padded_seen_events=padded_seen_events,
         # )
+        active_notes = jax.vmap(get_active_events)(padded_seen_events)
+        # jax.debug.print(
+        #     "Active notes {active_notes}",
+        #     active_notes=active_notes,
+        # )
+
         (
             midi_logits,
             midi_probs,
@@ -121,6 +128,7 @@ def batch_infer(
             model,
             frames,
             padded_seen_events,
+            active_notes,
             inference_key,
         )
 

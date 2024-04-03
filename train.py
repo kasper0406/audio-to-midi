@@ -136,23 +136,13 @@ def compute_training_step(
 
 
 @lru_cache(maxsize=1)
-def load_test_set(testset_dir: Path, batch_size: int):
+def load_test_set(testset_dir: Path, sharding, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
     chunks = chunked(sample_names, batch_size)
 
     batches = []
     for chunk in chunks:
-        (
-            frames,
-            _,
-            duration_per_frame,
-            _frame_width,
-        ) = AudioToMidiDatasetLoader.load_audio_frames_from_sample_name(testset_dir, chunk)
-        midi_events = (
-            AudioToMidiDatasetLoader.load_midi_events_frame_time_positions(
-                testset_dir, chunk, duration_per_frame
-            )
-        )
+        midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
         batches.append((frames, midi_events))
     return batches
 
@@ -190,8 +180,8 @@ def compute_test_loss(
     return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
 
 
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, batch_size=32):
-    batches = load_test_set(testset_dir, batch_size=batch_size)
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
 
     test_loss = jnp.array([0.0], dtype=jnp.float32)
@@ -248,6 +238,10 @@ def train(
             batch_sharding,
         )
 
+        # Keep the old model state in memory until we are sure the loss is not nan
+        recovery_flat_model = flat_model
+        recovery_flat_state = flat_state
+
         (loss, individual_losses), flat_model, flat_state, key = compute_training_step(
             flat_model,
             audio_frames,
@@ -263,8 +257,10 @@ def train(
         step_end_time = time.time()
 
         if jnp.isnan(loss):
-            print(f"Encountered NAN loss at step {step}. Stopping the training!")
-            break
+            print(f"Encountered NAN loss at step {step}. Trying to recover!")
+            flat_model = recovery_flat_model
+            flat_state = recovery_flat_state
+            continue
 
         if checkpoint_manager.should_save(step):
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
@@ -273,7 +269,7 @@ def train(
         loss_sum = loss_sum + loss
         idv_loss_sum = idv_loss_sum + individual_losses
 
-        if step % print_every == 0:
+        if step % print_every == 0 and step != 0:
             learning_rate = learning_rate_schedule(step)
 
             averaged_loss = (loss_sum / print_every)[0]
@@ -290,7 +286,7 @@ def train(
             print("Evaluating test loss...")
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             eval_key, key = jax.random.split(key, num=2)
-            testset_loss = compute_testset_loss(model, testset_dir, eval_key)
+            testset_loss = compute_testset_loss(model, testset_dir, eval_key, batch_sharding)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Test loss: {testset_loss}")
@@ -317,8 +313,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1-test-set")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v4_small")
+    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set")
 
     num_devices = len(jax.devices())
 
@@ -331,8 +327,8 @@ def main():
     dataset_prefetch_count = 20
     dataset_num_workers = 2
 
-    num_samples_to_load=10
-    num_samples_to_maintain=batch_size * 10
+    num_samples_to_load=16
+    num_samples_to_maintain=batch_size * 8
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
