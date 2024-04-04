@@ -114,8 +114,10 @@ def time_shift_audio_and_events(
     # we will still include the event and reset its position to 0. This is because there's usually a slight delay in the
     # audio samples, and the FFT will aggregate information over a short time period.
     # This mainly occours when predicting the start of a new audio file and the audio starts right away (frequent in the training data).
-    epsilon = 1  # frames
-    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=-30, maxval=30)).astype(jnp.int16)
+    epsilon = 0  # frames
+
+    # Due to active events, for now we only shift audio to the right
+    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=0, maxval=35)).astype(jnp.int16)
 
     # Handle audio samples
     audio_frame_positions = jnp.arange(frames.shape[0])
@@ -284,10 +286,10 @@ def generate_batch(
         time_shift_key,
     ) = jax.random.split(key, num=4)
     # TODO: Re-structure these transformations in a nicer way
-    # timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
-    # selected_audio_frames, selected_midi_events = jax.vmap(
-    #     time_shift_audio_and_events, (None, 0, 0, 0)
-    # )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
+    timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
+    selected_audio_frames, selected_midi_events = jax.vmap(
+        time_shift_audio_and_events, (None, 0, 0, 0)
+    )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
 
     sample_keys = jax.random.split(sample_key, num=batch_size)
     selected_audio_frames = jax.vmap(perturb_audio_frames, (0, 0))(

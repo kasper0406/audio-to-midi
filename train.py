@@ -146,7 +146,7 @@ def load_test_set(testset_dir: Path, sharding, batch_size: int):
         batches.append((frames, midi_events))
     return batches
 
-@jax.jit
+@eqx.filter_jit
 def compute_test_loss(
     model,
     key: jax.random.PRNGKey,
@@ -264,7 +264,8 @@ def train(
 
         if checkpoint_manager.should_save(step):
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
-            checkpoint_manager.save(step, args=ocp.args.StandardSave(model))
+            filtered_model = eqx.filter(model, eqx.is_array)
+            checkpoint_manager.save(step, args=ocp.args.StandardSave(filtered_model))
 
         loss_sum = loss_sum + loss
         idv_loss_sum = idv_loss_sum + individual_losses
@@ -342,7 +343,10 @@ def main():
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
     mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
     replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
-    audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
+
+    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+    model_params = jax.device_put(model_params, replicate_everywhere)
+    audio_to_midi = eqx.combine(model_params, static_model)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
@@ -355,10 +359,12 @@ def main():
     step_to_restore = checkpoint_manager.latest_step()
     if step_to_restore is not None:
         print(f"Restoring saved model at step {step_to_restore}")
-        audio_to_midi = checkpoint_manager.restore(
+        model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+        model_params = checkpoint_manager.restore(
             step_to_restore,
-            args=ocp.args.StandardRestore(audio_to_midi),
+            args=ocp.args.StandardRestore(model_params),
         )
+        audio_to_midi = eqx.combine(model_params, static_model)
 
     tx = optax.lion(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
