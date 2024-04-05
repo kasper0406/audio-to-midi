@@ -24,7 +24,7 @@ model_config = {
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
-    frame_embedder: eqx.nn.MLP
+    frame_embedder: eqx.nn.Linear
     frame_size: int
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
@@ -40,12 +40,7 @@ class FrameEmbedding(eqx.Module):
         key: PRNGKeyArray,
     ):
         self.frame_size = frame_size
-        self.frame_embedder = eqx.nn.MLP(
-            in_size=self.frame_size,
-            out_size=output_shape,
-            width_size=2 * output_shape,
-            depth=4,
-            key=key)
+        self.frame_embedder = eqx.nn.Linear(self.frame_size, output_shape, key=key)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
