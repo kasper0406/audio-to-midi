@@ -10,13 +10,13 @@ import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE
 
 model_config = {
-    "frame_size": 4096,
+    "frame_size": 1024,
     "max_frame_sequence_length": 98 + 1,
-    "attention_size": 512,
-    "intermediate_size": 1024,
+    "attention_size": 64,
+    "intermediate_size": 128,
     "num_heads": 2,
-    "num_layers": 8,
-    "dropout_rate": 0.05,
+    "num_layers": 2,
+    "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
 
@@ -712,7 +712,7 @@ class OutputSequenceGenerator(eqx.Module):
             active_events, context_size=self.midi_event_context_size)
         return self.call_model(input_frames, seen_events, active_events, key, enable_dropout)
 
-    @partial(jax.jit, static_argnames=["enable_dropout"])
+    @eqx.filter_jit
     def call_model(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
