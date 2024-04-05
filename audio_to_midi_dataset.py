@@ -497,7 +497,7 @@ class AudioToMidiDatasetLoader:
 
         midi_events = AudioToMidiDatasetLoader._pad_and_stack_midi_events(midi_events, minimum_midi_event_size)
 
-        assert calculated_duration_per_frame == duration_per_frame, "Duration per frame values must line up!"
+        assert abs(calculated_duration_per_frame - duration_per_frame) < 0.001, "Duration per frame values must line up!"
         return midi_events, frames, calculated_duration_per_frame, frame_width
 
     def _load_random_samples(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
