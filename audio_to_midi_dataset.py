@@ -33,10 +33,10 @@ BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 11
-WINDOW_OVERLAP = 0.60
-COMPRESSION_FACTOR = 256
-FREQUENCY_CUTOFF = 8000
+SAMPLES_PER_FFT = 2 ** 12
+WINDOW_OVERLAP = 0.80
+COMPRESSION_FACTOR = 1
+FREQUENCY_CUTOFF = 4000
 
 
 @partial(jax.jit, donate_argnames=["frames"])
@@ -84,12 +84,12 @@ def fft_audio(
 
     # Apply the FFT
     fft = jax.vmap(jnp.fft.rfft)(windows)
-    transposed_amplitudes = jnp.transpose(jnp.absolute(fft))
+    absolute_values = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
     compressed_amplitudes = (
-        jnp.sign(transposed_amplitudes)
-        * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(transposed_amplitudes))
+        jnp.sign(absolute_values)
+        * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
         / jnp.log1p(COMPRESSION_FACTOR)
     )
 
@@ -665,10 +665,6 @@ def plot_frequency_domain_audio(
     sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32]
 ):
     fig, ax1 = plt.subplots()
-
-    # TODO(knielsen): Extract this so it can be used for training, as it is probably better signal?
-    # transposed_reals = jnp.transpose(jnp.real(frames))
-    # transformed_data = transposed_reals[0:int(transposed_reals.shape[0] / 2), :]
     X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
     Y = jnp.linspace(0.0, frames.shape[1] / frame_width, frames.shape[1])
     ax1.pcolor(X, Y, jnp.transpose(frames))
@@ -676,6 +672,55 @@ def plot_frequency_domain_audio(
     ax1.set(
         xlabel="Time [s]",
         ylabel="Frequency [Hz]",
+        title=f"Audio signal in frequency-domain\n{sample_name}",
+    )
+
+    ax2 = ax1.twiny()
+    ax2.set_xlim(0, frames.shape[0])
+    ax2.set_xlabel("Frame count")
+
+@jax.jit
+def calculate_bin(frame, note_frequency, width_in_fft_bin, fft_bandwidth):
+    fft_idx = note_frequency / fft_bandwidth
+    # start_idx = jnp.int16(fft_idx - width_in_fft_bin)
+    # length = jnp.int16(width_in_fft_bin * 2 + 1)
+    start_idx = fft_idx
+    length = 1
+    mask = (jnp.arange(frame.shape[0]) >= start_idx) & (jnp.arange(frame.shape[0]) <= start_idx + length)
+    return jnp.sum(frame * mask)
+
+@jax.jit
+def calculate_bins_for_frames(frames, note_frequencies, width_in_fft_bins, fft_bandwidth):
+    @jax.jit
+    def internal_calc(frame):
+        return jax.vmap(calculate_bin, (None, 0, 0, None))(frame, note_frequencies[:-1], width_in_fft_bins, fft_bandwidth)
+    return jax.vmap(internal_calc)(frames)
+
+@jax.jit
+def bin_audio_frames_to_notes(frames: Float[Array, "seq_len frame_size"]):
+    bins = jnp.arange(99) + 1
+    note_frequencies = jnp.power(2, (bins - 49) / 12) * 440
+    # print(f"Note frequencies: {note_frequencies}")
+    bin_widths = jnp.diff(note_frequencies) / 2
+    # print(f"Bin widths: {bin_widths}")
+
+    fft_bandwidth = FREQUENCY_CUTOFF / frames.shape[1]
+    width_in_fft_bins = bin_widths / fft_bandwidth
+    return calculate_bins_for_frames(frames, note_frequencies, width_in_fft_bins, fft_bandwidth)
+
+def plot_with_frequency_normalization_domain_audio(
+    sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32]
+):
+    fig, ax1 = plt.subplots()
+
+    binned = bin_audio_frames_to_notes(frames)
+    X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
+    Y = jnp.arange(binned.shape[1])
+    ax1.pcolor(X, Y, jnp.transpose(binned))
+
+    ax1.set(
+        xlabel="Time [s]",
+        ylabel="Note",
         title=f"Audio signal in frequency-domain\n{sample_name}",
     )
 
@@ -705,6 +750,7 @@ def visualize_sample(
     print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
+    plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
     plt.show()
 
@@ -736,7 +782,7 @@ def benchmark():
 
 
 if __name__ == "__main__":
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
@@ -776,10 +822,10 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v3_small"),
-        batch_size=32,
-        prefetch_count=20,
-        num_workers=2,
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v4_small"),
+        batch_size=1,
+        prefetch_count=1,
+        num_workers=1,
         key=key,
         num_samples_to_load=16,
         num_samples_to_maintain=200,

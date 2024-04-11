@@ -25,7 +25,7 @@ print("Loaded samples")
 if args.visualize:
     for frame in frames:
         plot_frequency_domain_audio(str(audio_file), duration_per_frame, frame_width, frame)
-    plt.show(block=True)
+    plt.show(block=False)
 
 current_directory = Path(__file__).resolve().parent
 
