@@ -679,6 +679,20 @@ def plot_frequency_domain_audio(
     ax2.set_xlim(0, frames.shape[0])
     ax2.set_xlabel("Frame count")
 
+def plot_embedding(
+    sample_name: str, embeddings: Float[Array, "frame_count embedding_size"]
+):
+    fig, ax1 = plt.subplots()
+    X = jnp.arange(embeddings.shape[0]) + 1
+    Y = jnp.arange(embeddings.shape[1])
+    ax1.pcolor(X, Y, jnp.transpose(embeddings))
+
+    ax1.set(
+        xlabel="Frame",
+        ylabel="Embedding",
+        title=f"Audio frame embeddings\n{sample_name}",
+    )
+
 @jax.jit
 def calculate_bin(frame, note_frequency, width_in_fft_bin, fft_bandwidth):
     fft_idx = note_frequency / fft_bandwidth
