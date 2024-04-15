@@ -185,13 +185,15 @@ def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, shar
     print("Loaded test set")
 
     test_loss = jnp.array([0.0], dtype=jnp.float32)
+    count = jnp.array(0, dtype=jnp.int32)
     for frames, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=frames.shape[0])
         test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
-        test_loss += jnp.mean(test_losses)
+        test_loss += jnp.sum(test_losses)
+        count += test_losses.shape[0]
 
     print("Finished evaluating test loss")
-    return test_loss[0] / len(batches)
+    return (test_loss / count)[0]
 
 
 def train(

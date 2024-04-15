@@ -11,11 +11,12 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 
 model_config = {
     "frame_size": 2048,
-    "max_frame_sequence_length": 98 + 1,
+    "max_frame_sequence_length": 48 + 1,
     "attention_size": 256,
     "intermediate_size": 256,
     "num_heads": 1,
-    "num_layers": 6,
+    "frame_processor_layers": 8,
+    "event_processor_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
@@ -44,7 +45,7 @@ class FrameEmbedding(eqx.Module):
             in_size=self.frame_size,
             out_size=output_shape,
             width_size=self.frame_size,
-            depth=1,
+            depth=0,
             key=key)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
@@ -644,7 +645,7 @@ class OutputSequenceGenerator(eqx.Module):
         frame_processor_key, event_processor_key, frame_embedding_key, midi_embedding_key, decoder_key = jax.random.split(key, 5)
 
         self.frame_processor = TransformerStack(
-            num_layers=conf["num_layers"],
+            num_layers=conf["frame_processor_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
@@ -653,7 +654,7 @@ class OutputSequenceGenerator(eqx.Module):
         )
 
         self.event_processor = TransformerStack(
-            num_layers=conf["num_layers"],
+            num_layers=conf["event_processor_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
