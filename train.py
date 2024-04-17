@@ -90,7 +90,7 @@ def compute_loss_from_output(
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     individual_losses = jnp.array([ midi_event_loss, position_loss, velocity_loss ])
-    return midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss, individual_losses
+    return midi_event_loss + 0.3 * position_loss + 0.8 * velocity_loss, individual_losses
 
 
 @eqx.filter_jit

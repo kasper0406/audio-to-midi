@@ -37,7 +37,7 @@ SAMPLES_PER_FFT = 2 ** 12
 WINDOW_OVERLAP = 0.80
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
-
+LINEAR_SCALING = 10
 
 @partial(jax.jit, donate_argnames=["frames"])
 def perturb_audio_frames(
@@ -47,7 +47,7 @@ def perturb_audio_frames(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 10  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 20  # Randomize the level of noise
     gaussian_noise = jnp.abs(sigma * jax.random.normal(key2, frames.shape))
     return frames + gaussian_noise
 
@@ -94,7 +94,7 @@ def fft_audio(
     )
 
     # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
-    standardized_amplitudes = compressed_amplitudes + FRAME_BLANK_VALUE
+    standardized_amplitudes = (compressed_amplitudes + FRAME_BLANK_VALUE) / LINEAR_SCALING
 
     return standardized_amplitudes
 
@@ -667,13 +667,14 @@ def plot_frequency_domain_audio(
     fig, ax1 = plt.subplots()
     X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
     Y = jnp.linspace(0.0, frames.shape[1] / frame_width, frames.shape[1])
-    ax1.pcolor(X, Y, jnp.transpose(frames))
+    c = ax1.pcolor(X, Y, jnp.transpose(frames))
 
     ax1.set(
         xlabel="Time [s]",
         ylabel="Frequency [Hz]",
         title=f"Audio signal in frequency-domain\n{sample_name}",
     )
+    fig.colorbar(c)
 
     ax2 = ax1.twiny()
     ax2.set_xlim(0, frames.shape[0])
@@ -764,7 +765,7 @@ def visualize_sample(
     print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
-    plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
+    # plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
     plt.show()
 
@@ -836,7 +837,10 @@ if __name__ == "__main__":
     # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/v4_small"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,
