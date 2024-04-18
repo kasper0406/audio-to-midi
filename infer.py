@@ -203,9 +203,6 @@ def load_newest_checkpoint(checkpoint_path: Path):
     # The randomness does not matter as we will load a checkpoint model anyways
     key = jax.random.PRNGKey(1234)
     audio_to_midi = OutputSequenceGenerator(model_config, key)
-    abstract_audio_to_midi = jax.tree_util.tree_map(
-        ocp.utils.to_shape_dtype_struct, audio_to_midi
-    )
     checkpoint_manager = ocp.CheckpointManager(checkpoint_path)
 
     step_to_restore = checkpoint_manager.latest_step()
@@ -213,16 +210,21 @@ def load_newest_checkpoint(checkpoint_path: Path):
         raise "There is no checkpoint to load! Inference will be useless"
 
     print(f"Restoring saved model at step {step_to_restore}")
-    audio_to_midi = checkpoint_manager.restore(
+    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+    model_params = checkpoint_manager.restore(
         step_to_restore,
-        args=ocp.args.StandardRestore(abstract_audio_to_midi),
+        args=ocp.args.StandardRestore(model_params),
     )
+    audio_to_midi = eqx.combine(model_params, static_model)
 
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
     mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
     replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
-    audio_to_midi = jax.device_put(audio_to_midi, replicate_everywhere)
+
+    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+    model_params = jax.device_put(model_params, replicate_everywhere)
+    audio_to_midi = eqx.combine(model_params, static_model)
 
     return audio_to_midi
 

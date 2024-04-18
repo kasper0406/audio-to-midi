@@ -90,7 +90,7 @@ def compute_loss_from_output(
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     individual_losses = jnp.array([ midi_event_loss, position_loss, velocity_loss ])
-    return midi_event_loss + 0.3 * position_loss + 0.2 * velocity_loss, individual_losses
+    return midi_event_loss + 0.3 * position_loss + 0.8 * velocity_loss, individual_losses
 
 
 @eqx.filter_jit
@@ -99,8 +99,8 @@ def compute_loss(model, audio_frames, outputs_so_far, active_events, expected_ne
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-                model, in_axes=(0, 0, 0, 0)
-    )(audio_frames, outputs_so_far, active_events, batched_keys)
+                model, in_axes=(0, 0, 0, 0, None)
+    )(audio_frames, outputs_so_far, active_events, batched_keys, True)
 
     loss, individual_losses = compute_loss_from_output(
         midi_logits, position_probs, velocity_probs, expected_next_output
@@ -185,13 +185,15 @@ def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, shar
     print("Loaded test set")
 
     test_loss = jnp.array([0.0], dtype=jnp.float32)
+    count = jnp.array(0, dtype=jnp.int32)
     for frames, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=frames.shape[0])
         test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
-        test_loss += jnp.mean(test_losses)
+        test_loss += jnp.sum(test_losses)
+        count += test_losses.shape[0]
 
     print("Finished evaluating test loss")
-    return test_loss[0] / len(batches)
+    return (test_loss / count)[0]
 
 
 def train(

@@ -10,12 +10,13 @@ import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE
 
 model_config = {
-    "frame_size": 1024,
-    "max_frame_sequence_length": 98 + 1,
-    "attention_size": 128,
-    "intermediate_size": 128,
+    "frame_size": 2048,
+    "max_frame_sequence_length": 48 + 1,
+    "attention_size": 256,
+    "intermediate_size": 256,
     "num_heads": 1,
-    "num_layers": 6,
+    "frame_processor_layers": 8,
+    "event_processor_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
@@ -44,12 +45,12 @@ class FrameEmbedding(eqx.Module):
             in_size=self.frame_size,
             out_size=output_shape,
             width_size=self.frame_size,
-            depth=1,
+            depth=0,
             key=key)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
-            max_frame_sequence_length, output_shape
+            max_frame_sequence_length, frame_size
         )
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
@@ -60,9 +61,9 @@ class FrameEmbedding(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        frame_embeddings = jax.vmap(self.frame_embedder)(input_frames)
         position_embeddings = self.position_embeddings[0 : input_frames.shape[0]]
-        combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
+        frame_embeddings = jax.vmap(self.frame_embedder)(input_frames + position_embeddings)
+        combined = jax.vmap(self.layernorm)(frame_embeddings)
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
 class NoteEmbedding(eqx.Module):
@@ -477,7 +478,7 @@ class TransformerLayer(eqx.Module):
         )
         return output
 
-class PingPong(eqx.Module):
+class TransformerStack(eqx.Module):
 
     layers: list[(TransformerLayer, TransformerLayer)]
     num_layers: int = eqx.field(static=True)
@@ -494,75 +495,50 @@ class PingPong(eqx.Module):
         self.num_layers = num_layers
 
         def make_transformer(layer_key):
-            ping_key, pong_key = jax.random.split(layer_key, 2)
-            ping = TransformerLayer(
+            return TransformerLayer(
                 attention_size=attention_size,
                 intermediate_size=intermediate_size,
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
                 allocate_encoder_attention=True,
-                key=ping_key,
+                key=layer_key,
             )
-            pong = TransformerLayer(
-                attention_size=attention_size,
-                intermediate_size=intermediate_size,
-                num_heads=num_heads,
-                dropout_rate=dropout_rate,
-                allocate_encoder_attention=True,
-                key=pong_key,
-            )
-            return (ping, pong)
-        
+
         layer_keys = jax.random.split(key, num_layers)
         self.layers = jax.vmap(make_transformer)(layer_keys)
 
     def __call__(
         self,
-        frame_embeddings: Float[Array, "frames attention_size"],
-        midi_embeddings: Float[Array, "num_events attention_size"],
-        mask: Optional[Integer[Array, "seq_len"]] = None,
+        inputs: Float[Array, "frames attention_size"],
+        inputs_mask: Optional[Integer[Array, "seq_len"]] = None,
+        context: Float[Array, "num_events attention_size"] = None,
+        context_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        ping_key, pong_key = jax.random.split(key, 2)
-        ping_keys = jax.random.split(ping_key, num=self.num_layers)
-        pong_keys = jax.random.split(pong_key, num=self.num_layers)
+        layer_keys = jax.random.split(key, num=self.num_layers)
 
         dynamic_layers, static_layers = eqx.partition(self.layers, eqx.is_array)
 
         def compute_layer(current_state, current_layer):
-            idx, (ping_state, pong_state) = current_state
-            ping_key = ping_keys[idx]
-            pong_key = pong_keys[idx]
-            ping_layer, pong_layer = eqx.combine(current_layer, static_layers)
+            idx, transformer_state = current_state
+            leyer_key = layer_keys[idx]
+            transformer_layer = eqx.combine(current_layer, static_layers)
 
-            ping_output = ping_layer(
-                inputs=ping_state,
-                kv_context=pong_state,
-                kv_mask=mask,
+            transformer_output = transformer_layer(
+                inputs=transformer_state,
+                input_mask=inputs_mask,
+                kv_context=context,
+                kv_mask=context_mask,
                 enable_dropout=enable_dropout,
-                key=ping_key,
+                key=leyer_key,
             )
 
-            pong_output = pong_layer(
-                inputs=pong_state,
-                input_mask=mask,
-                kv_context=ping_output,
-                enable_dropout=enable_dropout,
-                key=pong_key,
-            )
+            return (idx + 1, transformer_output), None
 
-            return (idx + 1, (ping_output, pong_output)), None
+        (_, output), _ = jax.lax.scan(compute_layer, (0, inputs), dynamic_layers)
 
-        (_, (_, output)), _ = jax.lax.scan(compute_layer, (0, (frame_embeddings, midi_embeddings)), dynamic_layers)
-
-        # We take the first token in the last decoder layer to have information necessary for two
-        # different pooling layers to extract both the midi event and the position
-        # Notice: The first token must always be attendable by the mask! If not, the output of the token will
-        #         not give any meaningful result.
-        #         This padding is handled by our start of sequence token which is always pre-pended to the
-        #         seen events, causing the mask for the first position to never be masked out.
-        return output[0, :]
+        return output
 
 class Decoder(eqx.Module):
     """Using encoder outputs, the generated input sequence, apply decoder transformers to
@@ -655,7 +631,8 @@ class OutputSequenceGenerator(eqx.Module):
     midi_embedding: MidiVocabulary
     frame_embedding: FrameEmbedding
 
-    ping_pong: PingPong
+    frame_processor: TransformerStack
+    event_processor: TransformerStack
     decoder: Decoder
 
     midi_event_context_size: int = eqx.field(static=True)
@@ -665,15 +642,24 @@ class OutputSequenceGenerator(eqx.Module):
         conf: Dict[str, any],
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        ping_pong_key, frame_embedding_key, midi_embedding_key, decoder_key = jax.random.split(key, 4)
+        frame_processor_key, event_processor_key, frame_embedding_key, midi_embedding_key, decoder_key = jax.random.split(key, 5)
 
-        self.ping_pong = PingPong(
-            num_layers=conf["num_layers"],
+        self.frame_processor = TransformerStack(
+            num_layers=conf["frame_processor_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
             dropout_rate=conf["dropout_rate"],
-            key=ping_pong_key,
+            key=frame_processor_key,
+        )
+
+        self.event_processor = TransformerStack(
+            num_layers=conf["event_processor_layers"],
+            attention_size=conf["attention_size"],
+            intermediate_size=conf["intermediate_size"],
+            num_heads=conf["num_heads"],
+            dropout_rate=conf["dropout_rate"],
+            key=event_processor_key,
         )
 
         self.frame_embedding = FrameEmbedding(
@@ -728,7 +714,7 @@ class OutputSequenceGenerator(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
-        pingpong_key, frame_embedding_key, midi_embedding_key_seen, midi_embedding_key_active, decoder_key = jax.random.split(key, num=5)
+        frame_processor_key, event_processor_key, frame_embedding_key, midi_embedding_key_seen, midi_embedding_key_active, decoder_key = jax.random.split(key, num=6)
 
         frame_embeddings = self.frame_embedding(
             input_frames, enable_dropout=enable_dropout, key=frame_embedding_key
@@ -757,15 +743,23 @@ class OutputSequenceGenerator(eqx.Module):
         all_midi_events = jnp.concatenate([seen_events, active_events], axis=0, dtype=jnp.int16)
         mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
 
-        output = self.ping_pong(
-            frame_embeddings=frame_embeddings,
-            midi_embeddings=all_midi_embeddings,
-            mask=mask,
+        frame_context = self.frame_processor(
+            inputs=frame_embeddings,
+            context=all_midi_embeddings,
+            context_mask=mask,
             enable_dropout=enable_dropout,
-            key=pingpong_key,
+            key=frame_processor_key,
         )
 
-        return self.decoder(output, decoder_key)
+        output = self.event_processor(
+            inputs=all_midi_embeddings,
+            inputs_mask=mask,
+            context=frame_context,
+            enable_dropout=enable_dropout,
+            key=event_processor_key,
+        )
+
+        return self.decoder(output[0, :], decoder_key)
 
     @partial(jax.jit, static_argnames=["context_size"])
     def _truncate_midi_event_to_context_size(
