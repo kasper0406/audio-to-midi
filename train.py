@@ -99,8 +99,8 @@ def compute_loss(model, audio_frames, outputs_so_far, active_events, expected_ne
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-                model, in_axes=(0, 0, 0, 0)
-    )(audio_frames, outputs_so_far, active_events, batched_keys)
+                model, in_axes=(0, 0, 0, 0, None)
+    )(audio_frames, outputs_so_far, active_events, batched_keys, True)
 
     loss, individual_losses = compute_loss_from_output(
         midi_logits, position_probs, velocity_probs, expected_next_output
