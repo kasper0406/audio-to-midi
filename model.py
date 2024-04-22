@@ -12,11 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 48 + 1,
-    "attention_size": 256,
-    "intermediate_size": 256,
-    "num_heads": 1,
-    "frame_processor_layers": 8,
-    "event_processor_layers": 4,
+    "attention_size": 64,
+    "intermediate_size": 64,
+    "num_heads": 2,
+    "num_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
@@ -50,7 +49,7 @@ class FrameEmbedding(eqx.Module):
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
-            max_frame_sequence_length, frame_size
+            max_frame_sequence_length, output_shape
         )
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
@@ -62,8 +61,9 @@ class FrameEmbedding(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         position_embeddings = self.position_embeddings[0 : input_frames.shape[0]]
-        frame_embeddings = jax.vmap(self.frame_embedder)(input_frames + position_embeddings)
-        combined = jax.vmap(self.layernorm)(frame_embeddings)
+        frame_embeddings = jax.vmap(self.frame_embedder)(input_frames)
+        frame_embeddings = jax.vmap(self.layernorm)(frame_embeddings)
+        combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
 class NoteEmbedding(eqx.Module):
@@ -304,7 +304,7 @@ class FeedForwardBlock(eqx.Module):
             intermediate
         )  # TODO: Consider trying a ReLU activation
 
-        # Project back top attention space
+        # Project back to attention space
         output = self.intermediate_to_attention_proj(intermediate)
         output = self.dropout(output, inference=not enable_dropout, key=key)
 
@@ -361,8 +361,6 @@ class AttentionBlock(eqx.Module):
 
         attention_key, dropout_key = jax.random.split(key)
 
-        # For encoding we use inputs as both the query, key and value in the attention mechanism
-        # when decoding, we use the encoder outputs for the key and value
         result = self.attention(
             query=inputs,
             key_=kv_context if kv_context is not None else inputs,
@@ -405,8 +403,7 @@ class TransformerLayer(eqx.Module):
     2. Feed-Forward NN to process the attention output in a non-linear fashion
     """
 
-    self_attention_block: AttentionBlock
-    encoder_attention_block: Optional[AttentionBlock]
+    attention_block: AttentionBlock
     feed_forward_block: FeedForwardBlock
 
     def __init__(
@@ -415,28 +412,18 @@ class TransformerLayer(eqx.Module):
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
-        allocate_encoder_attention: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         self_attention_key, encoder_attention_key, feed_forward_key = jax.random.split(
             key, num=3
         )
 
-        self.self_attention_block = AttentionBlock(
+        self.attention_block = AttentionBlock(
             attention_size=attention_size,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             key=self_attention_key,
         )
-
-        self.encoder_attention_block = None
-        if allocate_encoder_attention:
-            self.encoder_attention_block = AttentionBlock(
-                attention_size=attention_size,
-                num_heads=num_heads,
-                dropout_rate=dropout_rate,
-                key=encoder_attention_key,
-            )
 
         self.feed_forward_block = FeedForwardBlock(
             attention_size=attention_size,
@@ -448,9 +435,7 @@ class TransformerLayer(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "seq_len attention_size"],
-        kv_context: Optional[Float[Array, "seq_len attention_size"]],
         input_mask: Optional[Integer[Array, "seq_len"]] = None,
-        kv_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
@@ -458,15 +443,9 @@ class TransformerLayer(eqx.Module):
             key, num=3
         )
 
-        # None as kv_context means that the input will be used for attention KV, so we need to m
-        output = self.self_attention_block(
-            inputs, None, input_mask=input_mask, enable_dropout=enable_dropout, key=self_attention_key
+        output = self.attention_block(
+            inputs, inputs, input_mask=input_mask, kv_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
-
-        if kv_context is not None:
-            output = self.encoder_attention_block(
-                output, kv_context, input_mask=input_mask, kv_mask=kv_mask, enable_dropout=enable_dropout, key=encoder_attention_key
-            )
 
         seq_len = inputs.shape[0]
         feed_forward_keys = jax.random.split(feed_forward_key, num=seq_len)
@@ -500,7 +479,6 @@ class TransformerStack(eqx.Module):
                 intermediate_size=intermediate_size,
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
-                allocate_encoder_attention=True,
                 key=layer_key,
             )
 
@@ -511,8 +489,6 @@ class TransformerStack(eqx.Module):
         self,
         inputs: Float[Array, "frames attention_size"],
         inputs_mask: Optional[Integer[Array, "seq_len"]] = None,
-        context: Float[Array, "num_events attention_size"] = None,
-        context_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
@@ -528,8 +504,6 @@ class TransformerStack(eqx.Module):
             transformer_output = transformer_layer(
                 inputs=transformer_state,
                 input_mask=inputs_mask,
-                kv_context=context,
-                kv_mask=context_mask,
                 enable_dropout=enable_dropout,
                 key=leyer_key,
             )
@@ -599,16 +573,19 @@ class Decoder(eqx.Module):
         midi_logits = self.midi_decoder_pooling(
             pingpong_output, key=midi_decoder_key
         )
+        midi_logits = jnp.tanh(midi_logits)
         midi_probabilities = jax.nn.softmax(midi_logits)
 
         position_logits = self.position_decoder_pooling(
             pingpong_output, key=position_decoder_key
         )
+        position_logits = jnp.tanh(position_logits)
         position_probabilities = jax.nn.softmax(position_logits)
 
         velocity_logits = self.velocity_decoder_pooling(
             pingpong_output, key=velocity_decoder_key
         )
+        velocity_logits = jnp.tanh(velocity_logits)
         velocity_probabilities = jax.nn.softmax(velocity_logits)
 
         return (
@@ -631,7 +608,6 @@ class OutputSequenceGenerator(eqx.Module):
     midi_embedding: MidiVocabulary
     frame_embedding: FrameEmbedding
 
-    frame_processor: TransformerStack
     event_processor: TransformerStack
     decoder: Decoder
 
@@ -644,17 +620,8 @@ class OutputSequenceGenerator(eqx.Module):
     ):
         frame_processor_key, event_processor_key, frame_embedding_key, midi_embedding_key, decoder_key = jax.random.split(key, 5)
 
-        self.frame_processor = TransformerStack(
-            num_layers=conf["frame_processor_layers"],
-            attention_size=conf["attention_size"],
-            intermediate_size=conf["intermediate_size"],
-            num_heads=conf["num_heads"],
-            dropout_rate=conf["dropout_rate"],
-            key=frame_processor_key,
-        )
-
         self.event_processor = TransformerStack(
-            num_layers=conf["event_processor_layers"],
+            num_layers=conf["num_layers"],
             attention_size=conf["attention_size"],
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
@@ -741,20 +708,14 @@ class OutputSequenceGenerator(eqx.Module):
         all_midi_embeddings = jnp.concatenate([midi_embeddings_seen, midi_embeddings_active], axis=0)
         # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
         all_midi_events = jnp.concatenate([seen_events, active_events], axis=0, dtype=jnp.int16)
-        mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int32)
+        event_mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int8)
 
-        frame_context = self.frame_processor(
-            inputs=frame_embeddings,
-            context=all_midi_embeddings,
-            context_mask=mask,
-            enable_dropout=enable_dropout,
-            key=frame_processor_key,
-        )
+        all_inputs = jnp.concatenate([all_midi_embeddings, frame_embeddings], axis=0)
+        total_mask = jnp.concatenate([event_mask, jnp.ones(frame_embeddings.shape[0], dtype=jnp.int8)], axis=0)
 
         output = self.event_processor(
-            inputs=all_midi_embeddings,
-            inputs_mask=mask,
-            context=frame_context,
+            inputs=all_inputs,
+            inputs_mask=total_mask,
             enable_dropout=enable_dropout,
             key=event_processor_key,
         )
