@@ -575,19 +575,16 @@ class Decoder(eqx.Module):
         midi_logits = self.midi_decoder_pooling(
             pingpong_output, key=midi_decoder_key
         )
-        midi_logits = jnp.tanh(midi_logits)
         midi_probabilities = jax.nn.softmax(midi_logits)
 
         position_logits = self.position_decoder_pooling(
             pingpong_output, key=position_decoder_key
         )
-        position_logits = jnp.tanh(position_logits)
         position_probabilities = jax.nn.softmax(position_logits)
 
         velocity_logits = self.velocity_decoder_pooling(
             pingpong_output, key=velocity_decoder_key
         )
-        velocity_logits = jnp.tanh(velocity_logits)
         velocity_probabilities = jax.nn.softmax(velocity_logits)
 
         return (
