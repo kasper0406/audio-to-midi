@@ -338,7 +338,6 @@ def main():
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
 
-    # TODO: Enable dropout for training
     audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
 
     # Replicate the model on all JAX devices

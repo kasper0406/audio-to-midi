@@ -25,6 +25,7 @@ class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
     frame_embedder: eqx.nn.MLP
+    frame_normalizer: eqx.nn.LayerNorm
     frame_size: int
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
@@ -46,6 +47,7 @@ class FrameEmbedding(eqx.Module):
             width_size=self.frame_size,
             depth=0,
             key=key)
+        self.frame_normalizer = eqx.nn.LayerNorm(shape=output_shape)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
@@ -62,7 +64,7 @@ class FrameEmbedding(eqx.Module):
     ):
         position_embeddings = self.position_embeddings[0 : input_frames.shape[0]]
         frame_embeddings = jax.vmap(self.frame_embedder)(input_frames)
-        frame_embeddings = jax.vmap(self.layernorm)(frame_embeddings)
+        frame_embeddings = jax.vmap(self.frame_normalizer)(frame_embeddings)
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
