@@ -19,7 +19,6 @@ from more_itertools import chunked
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
 
-
 # List of ideas:
 #  - Double check logic for event context windows
 #  - Try to disable noise in audio frames
@@ -367,8 +366,8 @@ def main():
         )
         audio_to_midi = eqx.combine(model_params, static_model)
 
-    tx = optax.lion(learning_rate=learning_rate_schedule)
-    tx = optax.chain(optax.clip_by_global_norm(1.0), tx)
+    tx = optax.adamw(learning_rate=learning_rate_schedule)
+    tx = optax.chain(optax.clip_by_global_norm(5.0), tx)
     # The filtering is necessary to have the opt-state flattening working
     state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
 

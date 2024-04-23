@@ -117,7 +117,7 @@ def time_shift_audio_and_events(
     epsilon = 0  # frames
 
     # Due to active events, for now we only shift audio to the right
-    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=0, maxval=35)).astype(jnp.int16)
+    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=0, maxval=10)).astype(jnp.int16)
 
     # Handle audio samples
     audio_frame_positions = jnp.arange(frames.shape[0])
@@ -838,9 +838,10 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/narrowed_keys_6"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,

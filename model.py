@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 48 + 1,
-    "attention_size": 256,
-    "intermediate_size": 256,
+    "attention_size": 64,
+    "intermediate_size": 64,
     "num_heads": 1,
-    "num_layers": 20,
+    "num_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
@@ -69,58 +69,24 @@ class FrameEmbedding(eqx.Module):
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
 class NoteEmbedding(eqx.Module):
-    special_note_embedding: eqx.nn.Embedding
-    linear_note_embedding: eqx.nn.Linear
+    embedding: eqx.nn.Embedding
 
     def __init__(
         self,
         output_size: int,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        special_notes_key, linear_notes_key = jax.random.split(key, num=2)
-
-        self.special_note_embedding = eqx.nn.Embedding(
-            num_embeddings=3,
+        self.embedding = eqx.nn.Embedding(
+            num_embeddings=MidiVocabulary.voccab_size(),
             embedding_size=output_size,
-            key=special_notes_key,
-        )
-
-        self.linear_note_embedding = eqx.nn.Linear(
-            in_features=1,
-            out_features=output_size,
-            key=linear_notes_key,
+            key=key,
         )
     
     def __call__(
         self, 
         note: int,
     ):
-        """
-        Two special notes:
-        -1: BLANK_MIDI_EVENT
-        0: SEQUENCE_END
-        1: SEQUENCE_START
-
-        These are handled with all custom embeddings.
-        The rest of the notes in the interval [2..MIDI_EVENT_VOCCAB_SIZE] are generated using a
-        single linear layer potentially with a continous non-linear function after, to make sure
-        they are continous and follow a nice pattern. This is to hope for better generalization.
-        """
-        num_special = self.special_note_embedding.num_embeddings
-        note = note + 1 # Add 1 to adjust for the -1 BLANK event
-
-        def special_note(special_note):
-            return self.special_note_embedding(special_note)
-        def normal_note(normal_note):
-            scaled_note = jnp.array([(normal_note - num_special) / (MidiVocabulary.voccab_size() + 1 - num_special)], dtype=jnp.float16)
-            return self.linear_note_embedding(scaled_note)
-
-        return jax.lax.cond(
-            note < num_special,
-            special_note,
-            normal_note,
-            note
-        )
+        return self.embedding(note)
 
 class VelocityEmbedding(eqx.Module):
     special_velocity_embedding: eqx.nn.Embedding
@@ -238,21 +204,20 @@ class MidiVocabulary(eqx.Module):
         self,
         midi_event: Integer[
             Array, " 3"
-        ],  # A numpy array of length 3. (midi event, position, velocity)
+        ],  # A numpy array of length 3. (position, note, velocity)
         event_type: Integer, # 0 for a seen event, 1 for a currently active event
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        midi_embedding = self.note_embedding(midi_event[1])
+        note_embedding = self.note_embedding(midi_event[1])
         position_embedding = self.position_embeddings[midi_event[0], :]
         velocity_embedding = self.velocity_embedding(midi_event[2])
         event_type_embedding = self.event_type_embedding(event_type)
         combined = self.layernorm(
-            midi_embedding + position_embedding + velocity_embedding + event_type_embedding
+            note_embedding + position_embedding + velocity_embedding + event_type_embedding
         )
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
-# TODO: Consider using eqx.nn.MLP here instead to simplify the code
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
     This applies to every output (count of them are attention_size) of the attention mechanism
@@ -296,7 +261,6 @@ class FeedForwardBlock(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "attention_size"],
-        mask: Bool,
         enable_dropout: bool = True,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "attention_size"]:
@@ -304,14 +268,13 @@ class FeedForwardBlock(eqx.Module):
         intermediate = self.attention_to_intermediate_proj(inputs)
         intermediate = jax.nn.gelu(
             intermediate
-        )  # TODO: Consider trying a ReLU activation
+        )
 
         # Project back to attention space
         output = self.intermediate_to_attention_proj(intermediate)
         output = self.dropout(output, inference=not enable_dropout, key=key)
 
         # Add residual and normalize the layers
-        output = output * mask
         output += inputs
         output = self.layernorm(output)
 
@@ -350,7 +313,7 @@ class AttentionBlock(eqx.Module):
     def __call__(
         self,
         inputs: Float[Array, "seq_len attention_size"],
-        kv_context: Optional[Float[Array, "seq_len attention_size"]],
+        kv_context: Optional[Float[Array, "seq_len attention_size"]] = None,
         input_mask: Optional[Integer[Array, "seq_len"]] = None,
         kv_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
@@ -360,7 +323,6 @@ class AttentionBlock(eqx.Module):
             kv_mask = input_mask
         kv_seq_len = kv_context.shape[0] if kv_context is not None else inputs.shape[0]
         mask = self.make_attention_mask(inputs.shape[0], kv_seq_len, input_mask, kv_mask)
-
         attention_key, dropout_key = jax.random.split(key)
 
         result = self.attention(
@@ -446,16 +408,12 @@ class TransformerLayer(eqx.Module):
         )
 
         output = self.attention_block(
-            inputs, inputs, input_mask=input_mask, kv_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
+            inputs, input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
 
-        seq_len = inputs.shape[0]
-        feed_forward_keys = jax.random.split(feed_forward_key, num=seq_len)
-
-        if input_mask is None:
-            input_mask = jnp.ones((seq_len,), dtype=jnp.bool_)
-        output = jax.vmap(self.feed_forward_block, in_axes=(0, 0, None, 0))(
-            output, input_mask, enable_dropout, feed_forward_keys
+        feed_forward_keys = jax.random.split(feed_forward_key, num=inputs.shape[0])
+        output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
+            output, enable_dropout, feed_forward_keys
         )
         return output
 
