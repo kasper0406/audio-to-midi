@@ -14,6 +14,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 use tokio::process::Command;
+use tokio::io::{BufReader, AsyncBufReadExt};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -104,6 +105,7 @@ fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> R
 enum AudioLoadingError {
     IoError(std::io::Error),
     FfmpegError(i32),
+    ParseSampleRateError(),
 }
 impl std::error::Error for AudioLoadingError {}
 impl fmt::Display for AudioLoadingError {
@@ -111,8 +113,39 @@ impl fmt::Display for AudioLoadingError {
         match self {
             AudioLoadingError::IoError(err) => write!(f, "IO error: {}", err),
             AudioLoadingError::FfmpegError(status) => write!(f, "ffmpeg terminated with status: {}", status),
+            AudioLoadingError::ParseSampleRateError() => write!(f, "failed to parse ffprobe sample rate"),
         }
     }
+}
+
+fn is_aac_file(input_file: &str) -> bool {
+    input_file.ends_with(".aac")
+}
+
+async fn get_aac_sample_rate(input_file: &str) -> Result<f64, AudioLoadingError> {
+    let mut process = Command::new("ffprobe")
+        .arg(input_file)
+        .arg("-show_streams")
+        .arg("-show_entries")
+        .arg("stream=sample_rate")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg("-v")
+        .arg("quiet")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(AudioLoadingError::IoError)?;
+
+    let stdout = process.stdout.take().expect("child did not have a handle to stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.map_err(AudioLoadingError::IoError)?;
+
+    let sample_rate: u32 =  line.trim().parse().map_err(|_err| AudioLoadingError::ParseSampleRateError())?;
+
+    process.wait().await.map_err(AudioLoadingError::IoError)?;
+    debug!["Obtained sample rate {} for {}", sample_rate, input_file];
+    Ok(sample_rate as f64)
 }
 
 async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
@@ -121,10 +154,25 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sa
     if let Some(max_duration) = maybe_max_duration {
         command.arg("-t").arg(format!["{}", max_duration]);
     }
+
+    let mut ffmpeg_audio_filter = String::from("pan=mono|c0=c0");
+    if is_aac_file(input_file) {
+        debug!["Processing aac file {}", input_file];
+        // Unfortunately aac conversion using ffmpeg adds a delay to the beginning of the audio
+        // I have found no easy way of removing this, so this is a hack to do it...
+        command.arg("-c:a").arg("aac");
+
+        let sample_rate = get_aac_sample_rate(input_file).await?;
+        let delay = (2 * 1024) as f64 / sample_rate; // 2 AAC frames of 1024 samples over the sample rate
+        debug!["Detecting AAC file, correcting with delay {}", delay];
+        ffmpeg_audio_filter.push_str(&format!(",atrim=start={}", delay));
+        debug!["Filter after: {}", ffmpeg_audio_filter];
+    }
+
     command.arg("-i")
         .arg(input_file)
         .arg("-af")
-        .arg("pan=mono|c0=c0")
+        .arg(ffmpeg_audio_filter)
         .arg("-ar")
         .arg(format!["{}", sample_rate])
         .arg("-f")
