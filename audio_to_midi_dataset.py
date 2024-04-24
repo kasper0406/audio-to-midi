@@ -55,6 +55,11 @@ def perturb_audio_frames(
 def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
+class CalculatedFrameDurationInvalid(Exception):
+    def __init__(self, calculated, actual):
+        super().__init__("Duration per frame mismatch")
+        self.calculated_dpf = calculated
+        self.actual_dpf = actual
 
 # Overlap is in the percentage of the `window_size`` and should be in ]0;1[
 @partial(jax.jit, static_argnames=["window_size", "overlap"])
@@ -497,7 +502,8 @@ class AudioToMidiDatasetLoader:
 
         midi_events = AudioToMidiDatasetLoader._pad_and_stack_midi_events(midi_events, minimum_midi_event_size)
 
-        assert abs(calculated_duration_per_frame - duration_per_frame) < 0.001, "Duration per frame values must line up!"
+        if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
+            raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
         return midi_events, frames, calculated_duration_per_frame, frame_width
 
     def _load_random_samples(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
@@ -509,7 +515,7 @@ class AudioToMidiDatasetLoader:
         self,
         num_samples_to_load: int,
         num_samples_to_maintain: int,
-        sleep_time: int = 10 # seconds
+        sleep_time: int = 0.1 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -517,42 +523,48 @@ class AudioToMidiDatasetLoader:
             if self._stop_event.is_set():
                 return
 
-            with self.sample_load_lock:
-                # Try to avoid unncessary JIT's due to different midi event lengths
-                current_events = self.loaded_midi_events
-                current_frames = self.loaded_audio_frames
-                current_sample_names = self.loaded_sample_names
-            
-            # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-            sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events.shape[1])
+            try:
+                with self.sample_load_lock:
+                    # Try to avoid unncessary JIT's due to different midi event lengths
+                    current_events = self.loaded_midi_events
+                    current_frames = self.loaded_audio_frames
+                    current_sample_names = self.loaded_sample_names
 
-            current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
-            current_events = current_events[current_amount_to_evict:, ...]
-            current_frames = current_frames[current_amount_to_evict:, ...]
+                # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
+                sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events.shape[1])
 
-            # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
-            blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)
-            current_events = np.concatenate([ # Make sure there is sufficient edge padding on the current events
-                current_events,
-                np.repeat(
-                    np.repeat(blank_event[None, :], repeats=loaded_midi_events.shape[1] - current_events.shape[1], axis=0)[None, ...],
-                    repeats=current_events.shape[0], axis=0)
-            ], axis=1)
+                current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
+                current_events = current_events[current_amount_to_evict:, ...]
+                current_frames = current_frames[current_amount_to_evict:, ...]
 
-            new_events = np.concatenate([
-                current_events,
-                loaded_midi_events,
-            ], axis=0)
-            new_frames = np.concatenate([
-                current_frames,
-                loaded_audio_frames,
-            ], axis=0)
-            new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
+                # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
+                blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)
+                current_events = np.concatenate([ # Make sure there is sufficient edge padding on the current events
+                    current_events,
+                    np.repeat(
+                        np.repeat(blank_event[None, :], repeats=loaded_midi_events.shape[1] - current_events.shape[1], axis=0)[None, ...],
+                        repeats=current_events.shape[0], axis=0)
+                ], axis=1)
 
-            with self.sample_load_lock:
-                self.loaded_midi_events = new_events
-                self.loaded_audio_frames = new_frames
-                self.loaded_sample_names = new_sample_names
+                new_events = np.concatenate([
+                    current_events,
+                    loaded_midi_events,
+                ], axis=0)
+                new_frames = np.concatenate([
+                    current_frames,
+                    loaded_audio_frames,
+                ], axis=0)
+                new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
+
+                with self.sample_load_lock:
+                    self.loaded_midi_events = new_events
+                    self.loaded_audio_frames = new_frames
+                    self.loaded_sample_names = new_sample_names
+            except CalculatedFrameDurationInvalid as e:
+                calc_dpf = e.calculated_dpf
+                actual_dpf = e.actual_dpf
+                print(f"Calculated duration per frame {calc_dpf} does not line up with actual duration per frame {actual_dpf}." +
+                    f"Difference was {abs(calc_dpf - actual_dpf)}. Trying again...")
 
     @classmethod
     def load_audio_frames(cls, filenames: [Path], sharding = None):
@@ -841,7 +853,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/narrowed_keys_6"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/test"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,
