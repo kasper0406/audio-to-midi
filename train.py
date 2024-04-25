@@ -19,16 +19,6 @@ from more_itertools import chunked
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
 
-# List of ideas:
-#  - Double check logic for event context windows
-#  - Try to disable noise in audio frames
-#  - Try to changge audio frame offset to 0, to maybe give attention mechanism an easier time?
-#  - Give the model the list of currently playing notes
-#  - No extra midi keys for releases - play note at velocity 0
-#  - Try different optimizer (LAMB) allowing larger batch sizes on GPU
-
-
-
 @eqx.filter_jit
 def continous_probability_loss(probs, expected, variance):
     """
@@ -56,7 +46,9 @@ def duration_probability_loss(logits, probs, expected, variance):
     loss_if_zero_duration = optax.softmax_cross_entropy_with_integer_labels(
         logits=logits, labels=jnp.array(expected, dtype=jnp.int16)
     )
+
     loss_otherwise = continous_probability_loss(probs[1:], expected - 1, variance)
+    loss_otherwise += probs[0]
 
     return jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
 

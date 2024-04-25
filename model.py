@@ -525,8 +525,9 @@ class Decoder(eqx.Module):
         (
             midi_pooling_key,
             position_pooling_key,
+            duration_pooling_key,
             velocity_pooling_key,
-        ) = jax.random.split(key, num=3)
+        ) = jax.random.split(key, num=4)
 
         self.midi_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
@@ -543,7 +544,7 @@ class Decoder(eqx.Module):
         self.duration_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
             out_features=frame_seq_length,
-            key=position_pooling_key,
+            key=duration_pooling_key,
         )
 
         self.velocity_decoder_pooling = eqx.nn.Linear(
