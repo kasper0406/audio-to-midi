@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, AudioToMidiDatasetLoader, get_active_events
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
 
 # List of ideas:
@@ -48,68 +48,65 @@ def continous_probability_loss(probs, expected, variance):
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
-def velocity_loss_fn(probs, expected, variance):
-    epsilon = 0.0000001
+def duration_probability_loss(logits, probs, expected, variance):
+    # Compared to a `continous_probability_loss` we have a special case in that if the duration of
+    # the note is outside of what is indicated by the audio frame, we want a special duration
+    # of 0 predicted, meaning that the duration can not be fully trusted, and extends to the end
+    # of the current audio.
+    loss_if_zero_duration = optax.softmax_cross_entropy_with_integer_labels(
+        logits=logits, labels=jnp.array(expected, dtype=jnp.int16)
+    )
+    loss_otherwise = continous_probability_loss(probs[1:], expected - 1, variance)
 
-    expectation_if_zero = jnp.zeros(probs.shape[0])
-    expectation_if_zero = expectation_if_zero.at[0].set(1.0)
-
-    x = jnp.arange(probs.shape[0])
-    expectation_if_nonzero = -0.5 * jnp.square((x - expected) / variance)
-    expectation_if_nonzero = jnp.maximum(
-        expectation_if_nonzero, -10.0
-    )  # Below values of -10 we will assume the exponential will give 0
-    expectation_if_nonzero = jnp.exp(expectation_if_nonzero)
-    # 0 probability of velocity 0 as that would be no event in the first place
-    expectation_if_nonzero = expectation_if_nonzero.at[0].set(0.0)
-
-    expectation = jnp.select([expected == 0], [expectation_if_zero], expectation_if_nonzero)
-    expectation = expectation / jnp.sum(expectation)
-    # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
+    return jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
 
 @eqx.filter_jit
 def compute_loss_from_output(
-    midi_logits, position_probs, velocity_probs, expected_next_output
+    midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
 ):
     expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
         logits=midi_logits, labels=expected_next_midi
     )
-    # TODO: Consider if this can be represented in some other way
-    expected_next_position = expected_next_output[:, 0]
-    position_loss = jax.vmap(partial(continous_probability_loss, variance=3.0), (0, 0))(
-        position_probs, expected_next_position
+
+    expected_attack_time = expected_next_output[:, 0]
+    attack_time_loss = jax.vmap(partial(continous_probability_loss, variance=3.0), (0, 0))(
+        attack_time_probs, expected_attack_time
     )
 
-    expected_next_velocity = expected_next_output[:, 2]
-    velocity_loss = jax.vmap(partial(velocity_loss_fn, variance=1.0), (0, 0))(
+    expected_duration = expected_next_output[:, 2]
+    duration_loss = jax.vmap(partial(duration_probability_loss, variance=2.0), (0, 0, 0))(
+        duration_logits, duration_probs, expected_duration
+    )
+
+    expected_next_velocity = expected_next_output[:, 3]
+    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=1.0), (0, 0))(
         velocity_probs, expected_next_velocity
     )
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    individual_losses = jnp.array([ midi_event_loss, position_loss, velocity_loss ])
-    return midi_event_loss + 0.3 * position_loss + 0.8 * velocity_loss, individual_losses
+    individual_losses = jnp.array([ midi_event_loss, attack_time_loss, duration_loss, velocity_loss ])
+    return midi_event_loss + 0.5 * (attack_time_loss + duration_loss) + 0.3 * velocity_loss, individual_losses
 
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, audio_frames, outputs_so_far, active_events, expected_next_output, key):
+def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-                model, in_axes=(0, 0, 0, 0, None)
-    )(audio_frames, outputs_so_far, active_events, batched_keys, True)
+    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
+                model, in_axes=(0, 0, 0, None)
+    )(audio_frames, outputs_so_far, batched_keys, True)
 
     loss, individual_losses = compute_loss_from_output(
-        midi_logits, position_probs, velocity_probs, expected_next_output
+        midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
     )
     return jnp.mean(loss), jnp.mean(individual_losses, axis=1)
 
 
 @eqx.filter_jit
 def compute_training_step(
-    flat_model, audio_frames, outputs_so_far, active_events, next_output, flat_opt_state, key, tx,
+    flat_model, audio_frames, outputs_so_far, next_output, flat_opt_state, key, tx,
     treedef_model, treedef_opt_state
 ):
     model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
@@ -120,7 +117,6 @@ def compute_training_step(
         model,
         audio_frames=audio_frames,
         outputs_so_far=outputs_so_far,
-        active_events=active_events,
         expected_next_output=next_output,
         key=key,
     )
@@ -150,25 +146,26 @@ def compute_test_loss(
     model,
     key: jax.random.PRNGKey,
     audio_frames: Float[Array, "num_frames num_frame_data"],
-    midi_events: Float[Array, "max_events 3"]
+    midi_events: Float[Array, "max_events 4"]
 ):
     size = midi_events.shape[0] - 1 # Minus one because we do not pick the last event
     mask = jnp.arange(size).reshape(1, size) <= jnp.arange(size).reshape(size, 1)
-    mask = jnp.repeat(mask[..., None], repeats=3, axis=2)
+    mask = jnp.repeat(mask[..., None], repeats=4, axis=2)
 
-    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16)
     # Do not pick the last element with the full sequence, as there is nothing to predict
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
-    active_events = jax.vmap(get_active_events)(event_prefixes)
 
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
-    midi_logits, _, _, position_probs, _, velocity_probs = jax.vmap(
-        model, (None, 0, 0, 0)
-    )(audio_frames, event_prefixes, active_events, inference_keys)
+    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
+        model, (None, 0, 0)
+    )(audio_frames, event_prefixes, inference_keys)
 
     losses, individual_losses = compute_loss_from_output(
         midi_logits,
-        position_probs,
+        attack_time_probs,
+        duration_logits,
+        duration_probs,
         velocity_probs,
         midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
     )
@@ -231,11 +228,11 @@ def train(
     flat_state, treedef_state = jax.tree_util.tree_flatten(state)
 
     loss_sum = jnp.array([0.0], dtype=jnp.float32)
-    idv_loss_sum = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
+    idv_loss_sum = jnp.array([0.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
-        (audio_frames, seen_events, active_events, next_event) = jax.device_put(
-            (batch["audio_frames"], batch["seen_events"], batch["active_events"], batch["next_event"]),
+        (audio_frames, seen_events, next_event) = jax.device_put(
+            (batch["audio_frames"], batch["seen_events"], batch["next_event"]),
             batch_sharding,
         )
 
@@ -247,7 +244,6 @@ def train(
             flat_model,
             audio_frames,
             seen_events,
-            active_events,
             next_event,
             flat_state,
             key,
@@ -282,7 +278,7 @@ def train(
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}, Idv.loss = {averaged_individual_losses}")
 
             loss_sum = jnp.array([0.0], dtype=jnp.float32)
-            idv_loss_sum = jnp.array([0.0, 0.0, 0.0], dtype=jnp.float32)
+            idv_loss_sum = jnp.array([0.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")

@@ -7,17 +7,17 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Integer, PRNGKeyArray
 
 import position_encoding
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE, BLANK_DURATION
 
 model_config = {
-    "frame_size": 2048,
-    "max_frame_sequence_length": 48 + 1,
-    "attention_size": 128,
-    "intermediate_size": 128,
+    "frame_size": 1024,
+    "max_frame_sequence_length": 200,
+    "attention_size": 64,
+    "intermediate_size": 64,
     "num_heads": 1,
-    "num_layers": 8,
+    "num_layers": 4,
     "dropout_rate": 0.10,
-    "midi_event_context_size": 15,
+    "midi_event_context_size": 30,
 }
 
 
@@ -480,7 +480,8 @@ class Decoder(eqx.Module):
     """
 
     midi_decoder_pooling: eqx.nn.Linear
-    position_decoder_pooling: eqx.nn.Linear
+    attack_time_decoder_pooling: eqx.nn.Linear
+    duration_decoder_pooling: eqx.nn.Linear
     velocity_decoder_pooling: eqx.nn.Linear
 
     def __init__(
@@ -501,7 +502,13 @@ class Decoder(eqx.Module):
             key=midi_pooling_key,
         )
 
-        self.position_decoder_pooling = eqx.nn.Linear(
+        self.attack_time_decoder_pooling = eqx.nn.Linear(
+            in_features=attention_size,
+            out_features=frame_seq_length,
+            key=position_pooling_key,
+        )
+
+        self.duration_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
             out_features=frame_seq_length,
             key=position_pooling_key,
@@ -516,40 +523,43 @@ class Decoder(eqx.Module):
     # TODO: Consider a different attention_size for midi and frame embeddings
     def __call__(
         self,
-        pingpong_output: Float[Array, "attention_size"],
+        output: Float[Array, "attention_size"],
         key: Optional[jax.random.PRNGKey] = None,
-    ) -> (
-        Float[Array, "midi_voccab_size"],
-        Float[Array, "midi_voccab_size"],
-        Float[Array, "frame_seq_len"],
-        Float[Array, "frame_seq_len"],
     ):  # Probability distribution over the midi events
         (
             midi_decoder_key,
-            position_decoder_key,
+            attack_time_decoder_key,
+            duration_decoder_key,
             velocity_decoder_key,
-        ) = jax.random.split(key, num=3)
+        ) = jax.random.split(key, num=4)
 
         midi_logits = self.midi_decoder_pooling(
-            pingpong_output, key=midi_decoder_key
+            output, key=midi_decoder_key
         )
         midi_probabilities = jax.nn.softmax(midi_logits)
 
-        position_logits = self.position_decoder_pooling(
-            pingpong_output, key=position_decoder_key
+        attack_time_logits = self.attack_time_decoder_pooling(
+            output, key=attack_time_decoder_key
         )
-        position_probabilities = jax.nn.softmax(position_logits)
+        attack_time_probabilities = jax.nn.softmax(attack_time_logits)
+
+        duration_logits = self.duration_decoder_pooling(
+            output, key=duration_decoder_key
+        )
+        duration_probabilities = jax.nn.softmax(duration_logits)
 
         velocity_logits = self.velocity_decoder_pooling(
-            pingpong_output, key=velocity_decoder_key
+            output, key=velocity_decoder_key
         )
         velocity_probabilities = jax.nn.softmax(velocity_logits)
 
         return (
             midi_logits,
             midi_probabilities,
-            position_logits,
-            position_probabilities,
+            attack_time_logits,
+            attack_time_probabilities,
+            duration_logits,
+            duration_probabilities,
             velocity_logits,
             velocity_probabilities,
         )
@@ -616,9 +626,8 @@ class OutputSequenceGenerator(eqx.Module):
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
         seen_events: Integer[
-            Array, "midi_seq_len 3"  # Pair of (input_frame_position, midi_key, velocity)
+            Array, "midi_seq_len 4"  # Pair of (input_frame_position, midi_key, velocity)
         ],  # Index of midi event in the vocabulary
-        active_events: Integer[Array, "midi_seq_len 3"],
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ) -> Float[
@@ -626,18 +635,15 @@ class OutputSequenceGenerator(eqx.Module):
     ]:  # Probability distribution over the midi events:
         seen_events = OutputSequenceGenerator._truncate_midi_event_to_context_size(
             seen_events, context_size=self.midi_event_context_size)
-        active_events = OutputSequenceGenerator._truncate_midi_event_to_context_size(
-            active_events, context_size=self.midi_event_context_size)
-        return self.call_model(input_frames, seen_events, active_events, key, enable_dropout)
+        return self.call_model(input_frames, seen_events, key, enable_dropout)
 
     @eqx.filter_jit
     def call_model(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
         seen_events: Integer[
-            Array, "midi_context_size 3"  # Pair of (input_frame_position, midi_key, velocity)
+            Array, "midi_context_size 4"  # Pair of (attack_time, midi_key, duration, velocity)
         ],  # Index of midi event in the vocabulary
-        active_events: Integer[Array, "midi_context_size 3"],
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
@@ -647,7 +653,7 @@ class OutputSequenceGenerator(eqx.Module):
             input_frames, enable_dropout=enable_dropout, key=frame_embedding_key
         )
 
-        midi_embeddings_seen = jax.vmap(
+        midi_embeddings = jax.vmap(
             partial(
                 self.midi_embedding,
                 event_type=0,
@@ -656,21 +662,9 @@ class OutputSequenceGenerator(eqx.Module):
             )
         )(seen_events)
 
-        midi_embeddings_active = jax.vmap(
-            partial(
-                self.midi_embedding,
-                event_type=1,
-                enable_dropout=enable_dropout,
-                key=midi_embedding_key_active,
-            )
-        )(active_events)
+        event_mask = jnp.asarray(seen_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int8)
 
-        all_midi_embeddings = jnp.concatenate([midi_embeddings_seen, midi_embeddings_active], axis=0)
-        # Mask out all events with id of BLANK_MIDI_EVENT as those are just padding entries
-        all_midi_events = jnp.concatenate([seen_events, active_events], axis=0, dtype=jnp.int16)
-        event_mask = jnp.asarray(all_midi_events[:, 1] != BLANK_MIDI_EVENT, dtype=jnp.int8)
-
-        all_inputs = jnp.concatenate([all_midi_embeddings, frame_embeddings], axis=0)
+        all_inputs = jnp.concatenate([midi_embeddings, frame_embeddings], axis=0)
         total_mask = jnp.concatenate([event_mask, jnp.ones(frame_embeddings.shape[0], dtype=jnp.int8)], axis=0)
 
         output = self.event_processor(
@@ -686,16 +680,16 @@ class OutputSequenceGenerator(eqx.Module):
 
     @partial(jax.jit, static_argnames=["context_size"])
     def _truncate_midi_event_to_context_size(
-        generated_output: Integer[Array, "midi_seq_len 3"],
+        generated_output: Integer[Array, "midi_seq_len 4"],
         context_size: int,
-    ) -> Integer[Array, "midi_event_context_size 3"]:
-        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)
+    ) -> Integer[Array, "midi_event_context_size 4"]:
+        blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16)
 
         num_events = jnp.count_nonzero(generated_output[:, 1] != BLANK_MIDI_EVENT, axis=0)
         offset = jnp.maximum(0, num_events - context_size)
         generated_output = jnp.roll(generated_output, shift=-offset, axis=0)
         events_to_keep = num_events - offset
-        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=3, axis=1) < events_to_keep
+        mask = jnp.repeat(jnp.arange(generated_output.shape[0])[:, None], repeats=4, axis=1) < events_to_keep
         generated_output = jnp.where(mask, generated_output, blank_event)
         generated_output = generated_output[0:context_size, ...]
 

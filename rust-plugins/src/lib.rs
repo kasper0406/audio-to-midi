@@ -43,7 +43,7 @@ fn frame_position(time: f32, duration_per_frame: f32) -> u32 {
     (time / duration_per_frame).round() as u32
 }
 
-type MidiEvents = Vec<(u32, u32, u32)>;
+type MidiEvents = Vec<(u32, u32, u32, u32)>;
 const VELOCITY_CATEGORIES: f32 = 10.0;
 
 async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
@@ -62,16 +62,18 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
+                let attack_time = frame_position(record.time, duration_per_frame);
                 let key = key_to_event(record.key);
-                if record.time < max_event_time {
-                    let frame_pos = frame_position(record.time, duration_per_frame);
-                    let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
-                    events.push( (frame_pos, key, velocity) );
-                }
-                if record.time + record.duration < max_event_time {
-                    let frame_pos = frame_position(record.time + record.duration, duration_per_frame);
-                    events.push( (frame_pos, key, 0) );
-                }
+                let duration = {
+                    if record.time + record.duration < max_event_time {
+                        frame_position(record.duration, duration_per_frame).max(1)
+                    } else {
+                        0 // If the note persists outside of the area we can see, we assign it a special duration of 0
+                    }
+                };
+                let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
+
+                events.push( (attack_time, key, duration, velocity) );
             },
             Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
         }
@@ -79,9 +81,9 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
 
     let mut events_with_padding: MidiEvents = vec![];
-    events_with_padding.push((0, 1, 0));
+    events_with_padding.push((0, 1, 0, 0));
     events_with_padding.append(&mut events);
-    events_with_padding.push((0, 0, 0));
+    events_with_padding.push((0, 0, 0, 0));
     Ok(events_with_padding)
 }
 
@@ -316,13 +318,14 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         let audio_array = audio_samples.into_pyarray(py).to_owned();
         audio_results.push(audio_array);
 
-        let event_array = PyArray2::<u16>::zeros(py, [events.len(), 3], false);
+        let event_array = PyArray2::<u16>::zeros(py, [events.len(), 4], false);
         {
             let mut event_array_read_write = event_array.readwrite();
-            for (row, (time, key, velocity)) in events.into_iter().enumerate() {
-                *event_array_read_write.get_mut([row, 0]).unwrap() = time as u16;
+            for (row, (attack_time, key, duration, velocity)) in events.into_iter().enumerate() {
+                *event_array_read_write.get_mut([row, 0]).unwrap() = attack_time as u16;
                 *event_array_read_write.get_mut([row, 1]).unwrap() = key as u16;
-                *event_array_read_write.get_mut([row, 2]).unwrap() = velocity as u16;
+                *event_array_read_write.get_mut([row, 2]).unwrap() = duration as u16;
+                *event_array_read_write.get_mut([row, 3]).unwrap() = velocity as u16;
             }
         }
         event_results.push(event_array);
