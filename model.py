@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 48 + 1,
-    "attention_size": 64,
-    "intermediate_size": 64,
+    "attention_size": 128,
+    "intermediate_size": 128,
     "num_heads": 1,
-    "num_layers": 4,
+    "num_layers": 8,
     "dropout_rate": 0.10,
     "midi_event_context_size": 15,
 }
@@ -567,6 +567,7 @@ class OutputSequenceGenerator(eqx.Module):
 
     event_processor: TransformerStack
     decoder: Decoder
+    dropout: eqx.nn.Dropout
 
     midi_event_context_size: int = eqx.field(static=True)
 
@@ -607,6 +608,8 @@ class OutputSequenceGenerator(eqx.Module):
             key=decoder_key,
         )
 
+        self.dropout = eqx.nn.Dropout(conf["dropout_rate"])
+
         self.midi_event_context_size = conf["midi_event_context_size"]
 
     def __call__(
@@ -638,7 +641,7 @@ class OutputSequenceGenerator(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
-        frame_processor_key, event_processor_key, frame_embedding_key, midi_embedding_key_seen, midi_embedding_key_active, decoder_key = jax.random.split(key, num=6)
+        event_processor_key, frame_embedding_key, midi_embedding_key_seen, midi_embedding_key_active, decoder_key, dropout_key = jax.random.split(key, num=6)
 
         frame_embeddings = self.frame_embedding(
             input_frames, enable_dropout=enable_dropout, key=frame_embedding_key
@@ -676,8 +679,10 @@ class OutputSequenceGenerator(eqx.Module):
             enable_dropout=enable_dropout,
             key=event_processor_key,
         )
+        output = jnp.tanh(output[0, :])
+        output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
-        return self.decoder(output[0, :], decoder_key)
+        return self.decoder(output, decoder_key)
 
     @partial(jax.jit, static_argnames=["context_size"])
     def _truncate_midi_event_to_context_size(

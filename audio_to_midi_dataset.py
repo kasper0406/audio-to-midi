@@ -33,8 +33,8 @@ BLANK_VELOCITY = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.80
+SAMPLES_PER_FFT = 2 ** 11
+WINDOW_OVERLAP = 0.60
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 10
@@ -47,7 +47,7 @@ def perturb_audio_frames(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 20  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 40  # Randomize the level of noise
     gaussian_noise = jnp.abs(sigma * jax.random.normal(key2, frames.shape))
     return frames + gaussian_noise
 
@@ -452,7 +452,7 @@ class AudioToMidiDatasetLoader:
             while len(self.queue) >= self.prefetch_count:
                 # print("Backing off, as the queue is full")
                 # Backoff mechanism
-                time.sleep(1)
+                time.sleep(0.05)
             self.queue.append(batch)
 
     def _pad_and_stack_midi_events(unpadded_midi_events: Integer[Array, "length 3"], minimum_midi_event_size: Optional[int] = None):
@@ -853,7 +853,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/test"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/narrowed_keys_7"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,
