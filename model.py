@@ -89,7 +89,6 @@ class NoteEmbedding(eqx.Module):
         return self.embedding(note)
 
 class VelocityEmbedding(eqx.Module):
-    special_velocity_embedding: eqx.nn.Embedding
     linear_velocity_embedding: eqx.nn.Linear
 
     def __init__(
@@ -98,13 +97,6 @@ class VelocityEmbedding(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         special_vel_key, linear_vel_key = jax.random.split(key, num=2)
-
-        self.special_velocity_embedding = eqx.nn.Embedding(
-            num_embeddings=1,
-            embedding_size=output_size,
-            key=special_vel_key
-        )
-
         self.linear_velocity_embedding = eqx.nn.Linear(
             in_features=1,
             out_features=output_size,
@@ -115,28 +107,61 @@ class VelocityEmbedding(eqx.Module):
         self, 
         velocity: int,
     ):
-        """
-        One special velocity:
-        0: BLANK_VELOCITY
+        scaled_vel = jnp.array([(velocity) / (MidiVocabulary.num_velocities())], dtype=jnp.float16)
+        return self.linear_velocity_embedding(scaled_vel)
 
-        These are handled with all custom embeddings.
-        The rest of the notes in the interval [1..num_velocities()] are generated using a single linear layer
-        potentially with a continous non-linear function after, to make sure they are continous
-        and follow a nice pattern. This is to hope for better generalization.
-        """
-        num_special = self.special_velocity_embedding.num_embeddings
+class DurationEmbedding(eqx.Module):
+    special_duration_embedding: eqx.nn.Embedding
+    position_transform: eqx.nn.Embedding
+    position_embedding: Float[Array, "seq_len output_shape"]
 
-        def special_velocity(special_vel):
-            return self.special_velocity_embedding(special_vel)
-        def normal_velocity(normal_vel):
-            scaled_vel = jnp.array([(normal_vel - num_special) / (MidiVocabulary.num_velocities() - num_special)], dtype=jnp.float16)
-            return self.linear_velocity_embedding(scaled_vel)
+    max_seq_len: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        output_size: int,
+        max_frame_sequence_length: int,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        special_duration_key, linear_duration_key = jax.random.split(key, num=2)
+
+        self.special_duration_embedding = eqx.nn.Embedding(
+            num_embeddings=1,
+            embedding_size=output_size,
+            key=special_duration_key
+        )
+
+        self.position_embedding = position_encoding.for_input_frame(
+            max_frame_sequence_length, output_size
+        )
+        self.position_transform = eqx.nn.Linear(
+            in_features=output_size,
+            out_features=output_size,
+            key=linear_duration_key
+        )
+
+        self.max_seq_len = max_frame_sequence_length
+
+    def __call__(
+        self, 
+        duration: int,
+    ):
+        """
+        One special duration:
+        0: BLANK_DURATION
+        """
+        num_special = self.special_duration_embedding.num_embeddings
+
+        def special_duration(special_duration):
+            return self.special_duration_embedding(special_duration)
+        def normal_duration(normal_duration):
+            return self.position_transform(self.position_embedding[normal_duration, :])
 
         return jax.lax.cond(
-            velocity < num_special,
-            special_velocity,
-            normal_velocity,
-            velocity
+            duration < num_special,
+            special_duration,
+            normal_duration,
+            duration
         )
 
 class MidiVocabulary(eqx.Module):
@@ -168,7 +193,8 @@ class MidiVocabulary(eqx.Module):
         return 10
 
     note_embedding: NoteEmbedding
-    position_embeddings: Float[Array, "seq_len output_shape"]
+    attack_time_embedding: Float[Array, "seq_len output_shape"]
+    duration_embedding: DurationEmbedding
     velocity_embedding: VelocityEmbedding
     event_type_embedding: eqx.nn.Embedding
     layernorm: eqx.nn.LayerNorm
@@ -181,12 +207,17 @@ class MidiVocabulary(eqx.Module):
         dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        node_key, velocity_key, event_type_key = jax.random.split(key, num=3)
+        node_key, velocity_key, duration_key, event_type_key = jax.random.split(key, num=4)
         self.note_embedding = NoteEmbedding(
             output_size=output_size, key=node_key
         )
-        self.position_embeddings = position_encoding.for_input_frame(
+        self.attack_time_embedding = position_encoding.for_input_frame(
             max_frame_sequence_length, output_size
+        )
+        self.duration_embedding = DurationEmbedding(
+            output_size=output_size,
+            max_frame_sequence_length=max_frame_sequence_length,
+            key=duration_key,
         )
         self.velocity_embedding = VelocityEmbedding(
             output_size=output_size,
@@ -203,18 +234,19 @@ class MidiVocabulary(eqx.Module):
     def __call__(
         self,
         midi_event: Integer[
-            Array, " 3"
+            Array, " 4"
         ],  # A numpy array of length 3. (position, note, velocity)
         event_type: Integer, # 0 for a seen event, 1 for a currently active event
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         note_embedding = self.note_embedding(midi_event[1])
-        position_embedding = self.position_embeddings[midi_event[0], :]
-        velocity_embedding = self.velocity_embedding(midi_event[2])
+        attack_time_embedding = self.attack_time_embedding[midi_event[0], :]
+        duration_embedding = self.duration_embedding(midi_event[2])
+        velocity_embedding = self.velocity_embedding(midi_event[3])
         event_type_embedding = self.event_type_embedding(event_type)
         combined = self.layernorm(
-            note_embedding + position_embedding + velocity_embedding + event_type_embedding
+            note_embedding + attack_time_embedding + duration_embedding + velocity_embedding + event_type_embedding
         )
         return self.dropout(combined, inference=not enable_dropout, key=key)
 
