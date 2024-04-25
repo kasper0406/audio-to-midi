@@ -47,7 +47,11 @@ def duration_probability_loss(logits, probs, expected, variance):
         logits=logits, labels=jnp.array(expected, dtype=jnp.int16)
     )
 
-    loss_otherwise = continous_probability_loss(probs[1:], expected - 1, variance)
+    # Increase the variance proportional to the duration length squared, because pianos
+    # will usually decay their sound as time goes on, making it hard to predict exact
+    # durations for long note durations
+    duration_variance = variance + (expected / 20) ** 2
+    loss_otherwise = continous_probability_loss(probs[1:], expected - 1, duration_variance)
     loss_otherwise += probs[0]
 
     return jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
@@ -72,7 +76,7 @@ def compute_loss_from_output(
     )
 
     expected_next_velocity = expected_next_output[:, 3]
-    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=1.0), (0, 0))(
+    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=2.0), (0, 0))(
         velocity_probs, expected_next_velocity
     )
 
