@@ -30,11 +30,12 @@ SEQUENCE_END = 0
 ACTIVE_EVENT_SEPARATOR = 2
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
+BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.80
+SAMPLES_PER_FFT = 2 ** 11
+WINDOW_OVERLAP = 0.90
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 10
@@ -47,7 +48,7 @@ def perturb_audio_frames(
     1. Add gausian noise
     """
     key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 20  # Randomize the level of noise
+    sigma = jax.random.uniform(key1) / 40  # Randomize the level of noise
     gaussian_noise = jnp.abs(sigma * jax.random.normal(key2, frames.shape))
     return frames + gaussian_noise
 
@@ -55,6 +56,11 @@ def perturb_audio_frames(
 def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
+class CalculatedFrameDurationInvalid(Exception):
+    def __init__(self, calculated, actual):
+        super().__init__("Duration per frame mismatch")
+        self.calculated_dpf = calculated
+        self.actual_dpf = actual
 
 # Overlap is in the percentage of the `window_size`` and should be in ]0;1[
 @partial(jax.jit, static_argnames=["window_size", "overlap"])
@@ -99,6 +105,8 @@ def fft_audio(
     return standardized_amplitudes
 
 
+# TODO: Before using this again, we need to check if the time-shifting causes the attack_time + duration
+#       to be outside the bound of the audio.
 @partial(jax.jit, static_argnames=["duration_per_frame"], donate_argnames=["frames"])
 def time_shift_audio_and_events(
     duration_per_frame: float,
@@ -117,7 +125,7 @@ def time_shift_audio_and_events(
     epsilon = 0  # frames
 
     # Due to active events, for now we only shift audio to the right
-    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=0, maxval=35)).astype(jnp.int16)
+    offset_amounts_in_frames = jnp.round(jax.random.uniform(key, shape=(1,), minval=0, maxval=10)).astype(jnp.int16)
 
     # Handle audio samples
     audio_frame_positions = jnp.arange(frames.shape[0])
@@ -276,7 +284,7 @@ def generate_batch(
     batch_size: int,
     duration_per_frame_in_secs: float,
     frame_width_in_secs: float,
-    selected_midi_events: Integer[Array, "batch_size max_len 3"],
+    selected_midi_events: Integer[Array, "batch_size max_len 4"],
     selected_audio_frames: Float[Array, "batch_size frames"],
 ):
     (
@@ -286,10 +294,10 @@ def generate_batch(
         time_shift_key,
     ) = jax.random.split(key, num=4)
     # TODO: Re-structure these transformations in a nicer way
-    timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
-    selected_audio_frames, selected_midi_events = jax.vmap(
-        time_shift_audio_and_events, (None, 0, 0, 0)
-    )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
+    # timeshift_keys = jax.random.split(time_shift_key, num=selected_audio_frames.shape[0])
+    # selected_audio_frames, selected_midi_events = jax.vmap(
+    #     time_shift_audio_and_events, (None, 0, 0, 0)
+    # )(duration_per_frame_in_secs, selected_audio_frames, selected_midi_events, timeshift_keys)
 
     sample_keys = jax.random.split(sample_key, num=batch_size)
     selected_audio_frames = jax.vmap(perturb_audio_frames, (0, 0))(
@@ -316,8 +324,8 @@ def generate_batch(
 
     event_indices = jnp.arange(selected_midi_events.shape[1])
     seen_event_mask = event_indices < picked_midi_splits[:, jnp.newaxis]
-    seen_event_mask = jnp.repeat(seen_event_mask[:, :, None], repeats=3, axis=2) # Repeat for every (position, event, velocity) pair
-    blank_events = jnp.repeat(jnp.repeat(jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16)[None, :], selected_midi_events.shape[1], axis=0)[None, ...], batch_size, axis=0)
+    seen_event_mask = jnp.repeat(seen_event_mask[:, :, None], repeats=4, axis=2) # Repeat for every (position, event, velocity) pair
+    blank_events = jnp.repeat(jnp.repeat(jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16)[None, :], selected_midi_events.shape[1], axis=0)[None, ...], batch_size, axis=0)
     seen_events = jnp.select(
         [~seen_event_mask],
         [blank_events],
@@ -325,7 +333,7 @@ def generate_batch(
     )
 
     # Compute the set of active events so it can be used by the model
-    active_events = jax.vmap(get_active_events)(seen_events)
+    # active_events = jax.vmap(get_active_events)(seen_events)
 
     # We can get rid of events that are BLANK_MIDI_EVENT for all samples in the batch
     # TODO: For now do not do this, as it leads to JAX recompilation pauses during the initial training steps
@@ -337,7 +345,7 @@ def generate_batch(
         "next_event": next_events,
         "duration_per_frame_in_secs": duration_per_frame_in_secs,
         "frame_width_in_secs": frame_width_in_secs,
-        "active_events": active_events,
+        # "active_events": active_events,
     }
 
 
@@ -447,15 +455,15 @@ class AudioToMidiDatasetLoader:
             while len(self.queue) >= self.prefetch_count:
                 # print("Backing off, as the queue is full")
                 # Backoff mechanism
-                time.sleep(1)
+                time.sleep(0.05)
             self.queue.append(batch)
 
-    def _pad_and_stack_midi_events(unpadded_midi_events: Integer[Array, "length 3"], minimum_midi_event_size: Optional[int] = None):
+    def _pad_and_stack_midi_events(unpadded_midi_events: Integer[Array, "length 4"], minimum_midi_event_size: Optional[int] = None):
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
         if minimum_midi_event_size is not None:
             # We support extra padding to avoid JAX jit recompilations
             max_events_length = max(max_events_length, minimum_midi_event_size)
-        padding = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)[
+        padding = np.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=np.int16)[
             None, :
         ]
         padded_midi_events = [
@@ -497,7 +505,8 @@ class AudioToMidiDatasetLoader:
 
         midi_events = AudioToMidiDatasetLoader._pad_and_stack_midi_events(midi_events, minimum_midi_event_size)
 
-        assert abs(calculated_duration_per_frame - duration_per_frame) < 0.001, "Duration per frame values must line up!"
+        if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
+            raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
         return midi_events, frames, calculated_duration_per_frame, frame_width
 
     def _load_random_samples(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
@@ -509,7 +518,7 @@ class AudioToMidiDatasetLoader:
         self,
         num_samples_to_load: int,
         num_samples_to_maintain: int,
-        sleep_time: int = 10 # seconds
+        sleep_time: int = 0.1 # seconds
     ):
         # TODO: Consider doing this in a way that preserves determinism
         while True:
@@ -517,58 +526,48 @@ class AudioToMidiDatasetLoader:
             if self._stop_event.is_set():
                 return
 
-            with self.sample_load_lock:
-                # Try to avoid unncessary JIT's due to different midi event lengths
-                current_events = self.loaded_midi_events
-                current_frames = self.loaded_audio_frames
-                current_sample_names = self.loaded_sample_names
-            
-            # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-            sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events.shape[1])
+            try:
+                with self.sample_load_lock:
+                    # Try to avoid unncessary JIT's due to different midi event lengths
+                    current_events = self.loaded_midi_events
+                    current_frames = self.loaded_audio_frames
+                    current_sample_names = self.loaded_sample_names
 
-            current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
-            current_events = current_events[current_amount_to_evict:, ...]
-            current_frames = current_frames[current_amount_to_evict:, ...]
+                # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
+                sample_names, loaded_midi_events, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events.shape[1])
 
-            # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
-            blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=np.int16)
-            current_events = np.concatenate([ # Make sure there is sufficient edge padding on the current events
-                current_events,
-                np.repeat(
-                    np.repeat(blank_event[None, :], repeats=loaded_midi_events.shape[1] - current_events.shape[1], axis=0)[None, ...],
-                    repeats=current_events.shape[0], axis=0)
-            ], axis=1)
+                current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
+                current_events = current_events[current_amount_to_evict:, ...]
+                current_frames = current_frames[current_amount_to_evict:, ...]
 
-            new_events = np.concatenate([
-                current_events,
-                loaded_midi_events,
-            ], axis=0)
-            new_frames = np.concatenate([
-                current_frames,
-                loaded_audio_frames,
-            ], axis=0)
-            new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
+                # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
+                blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=np.int16)
+                current_events = np.concatenate([ # Make sure there is sufficient edge padding on the current events
+                    current_events,
+                    np.repeat(
+                        np.repeat(blank_event[None, :], repeats=loaded_midi_events.shape[1] - current_events.shape[1], axis=0)[None, ...],
+                        repeats=current_events.shape[0], axis=0)
+                ], axis=1)
 
-            with self.sample_load_lock:
-                self.loaded_midi_events = new_events
-                self.loaded_audio_frames = new_frames
-                self.loaded_sample_names = new_sample_names
+                new_events = np.concatenate([
+                    current_events,
+                    loaded_midi_events,
+                ], axis=0)
+                new_frames = np.concatenate([
+                    current_frames,
+                    loaded_audio_frames,
+                ], axis=0)
+                new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
 
-    @classmethod
-    def load_audio_frames(cls, filenames: [Path], sharding = None):
-        raise NotImplementedError()
-        
-        # audio_samples = parallel_audio_reader.load_audio_files(
-        #     AudioToMidiDatasetLoader.SAMPLE_RATE,
-        #     filenames,
-        #     MAX_EVENT_TIMESTAMP * 1000
-        # )
-        # if sharding is not None:
-        #     audio_samples = jax.device_put(audio_samples, sharding)
-
-        # frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
-
-        # return frames, AudioToMidiDatasetLoader.SAMPLE_RATE, duration_per_frame, frame_width
+                with self.sample_load_lock:
+                    self.loaded_midi_events = new_events
+                    self.loaded_audio_frames = new_frames
+                    self.loaded_sample_names = new_sample_names
+            except CalculatedFrameDurationInvalid as e:
+                calc_dpf = e.calculated_dpf
+                actual_dpf = e.actual_dpf
+                print(f"Calculated duration per frame {calc_dpf} does not line up with actual duration per frame {actual_dpf}." +
+                    f"Difference was {abs(calc_dpf - actual_dpf)}. Trying again...")
 
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
@@ -743,8 +742,8 @@ def plot_with_frequency_normalization_domain_audio(
     ax2.set_xlim(0, frames.shape[0])
     ax2.set_xlabel("Frame count")
 
-def _remove_zeros(arr: Integer[Array, "len 3"]):
-    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], jnp.int16)
+def _remove_zeros(arr: Integer[Array, "len 4"]):
+    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], jnp.int16)
     mask = ~(jnp.all(arr == blank_event, axis=1))
     return arr[mask]
 
@@ -752,8 +751,7 @@ def visualize_sample(
     sample_name: str,
     frames: Float[Array, "num_samples"],
     seen_events: Integer[Array, "seen_array_length 2"],
-    next_event: Integer[Array, "3"],
-    active_events: Integer[Array, "3"],
+    next_event: Integer[Array, "4"],
     duration_per_frame_in_secs: float,
     frame_width: float,
 ):
@@ -762,7 +760,6 @@ def visualize_sample(
     print("Duration per frame:", duration_per_frame_in_secs)
     print("Frame width in seconds:", frame_width)
     print(f"Seen events: {_remove_zeros(seen_events)}")
-    print(f"Active events: {_remove_zeros(active_events)}")
     print(f"Next event: {next_event}")
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
     # plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
@@ -839,8 +836,9 @@ if __name__ == "__main__":
     dataset_loader = AudioToMidiDatasetLoader(
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/narrowed_keys_7"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,
@@ -855,7 +853,6 @@ if __name__ == "__main__":
         print(f"Audio frames shape {num}:", loaded_batch["audio_frames"].shape)
         print(f"Seen events shape {num}:", loaded_batch["seen_events"].shape)
         print(f"Next event shape: {num}", loaded_batch["next_event"].shape)
-        print(f"Active events shape: {num}", loaded_batch["active_events"].shape)
 
         # seen_events = loaded_batch["seen_events"][:, :, 1] + 1 # +1 to make the blank event -1 appear as a 0
         # flattened_events = jnp.reshape(seen_events, (seen_events.shape[0] * seen_events.shape[1]))
@@ -872,7 +869,6 @@ if __name__ == "__main__":
             loaded_batch["audio_frames"][batch_idx],
             loaded_batch["seen_events"][batch_idx],
             loaded_batch["next_event"][batch_idx],
-            loaded_batch["active_events"][batch_idx],
             loaded_batch["duration_per_frame_in_secs"],
             loaded_batch["frame_width_in_secs"],
         )

@@ -14,6 +14,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 use tokio::process::Command;
+use tokio::io::{BufReader, AsyncBufReadExt};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -42,7 +43,7 @@ fn frame_position(time: f32, duration_per_frame: f32) -> u32 {
     (time / duration_per_frame).round() as u32
 }
 
-type MidiEvents = Vec<(u32, u32, u32)>;
+type MidiEvents = Vec<(u32, u32, u32, u32)>;
 const VELOCITY_CATEGORIES: f32 = 10.0;
 
 async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
@@ -61,16 +62,18 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
+                let attack_time = frame_position(record.time, duration_per_frame);
                 let key = key_to_event(record.key);
-                if record.time < max_event_time {
-                    let frame_pos = frame_position(record.time, duration_per_frame);
-                    let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
-                    events.push( (frame_pos, key, velocity) );
-                }
-                if record.time + record.duration < max_event_time {
-                    let frame_pos = frame_position(record.time + record.duration, duration_per_frame);
-                    events.push( (frame_pos, key, 0) );
-                }
+                let duration = {
+                    if record.time + record.duration < max_event_time {
+                        frame_position(record.duration, duration_per_frame).max(1)
+                    } else {
+                        0 // If the note persists outside of the area we can see, we assign it a special duration of 0
+                    }
+                };
+                let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
+
+                events.push( (attack_time, key, duration, velocity) );
             },
             Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
         }
@@ -78,9 +81,9 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
 
     let mut events_with_padding: MidiEvents = vec![];
-    events_with_padding.push((0, 1, 0));
+    events_with_padding.push((0, 1, 0, 0));
     events_with_padding.append(&mut events);
-    events_with_padding.push((0, 0, 0));
+    events_with_padding.push((0, 0, 0, 0));
     Ok(events_with_padding)
 }
 
@@ -104,6 +107,7 @@ fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> R
 enum AudioLoadingError {
     IoError(std::io::Error),
     FfmpegError(i32),
+    ParseSampleRateError(),
 }
 impl std::error::Error for AudioLoadingError {}
 impl fmt::Display for AudioLoadingError {
@@ -111,8 +115,39 @@ impl fmt::Display for AudioLoadingError {
         match self {
             AudioLoadingError::IoError(err) => write!(f, "IO error: {}", err),
             AudioLoadingError::FfmpegError(status) => write!(f, "ffmpeg terminated with status: {}", status),
+            AudioLoadingError::ParseSampleRateError() => write!(f, "failed to parse ffprobe sample rate"),
         }
     }
+}
+
+fn is_aac_file(input_file: &str) -> bool {
+    input_file.ends_with(".aac")
+}
+
+async fn get_aac_sample_rate(input_file: &str) -> Result<f64, AudioLoadingError> {
+    let mut process = Command::new("ffprobe")
+        .arg(input_file)
+        .arg("-show_streams")
+        .arg("-show_entries")
+        .arg("stream=sample_rate")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg("-v")
+        .arg("quiet")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(AudioLoadingError::IoError)?;
+
+    let stdout = process.stdout.take().expect("child did not have a handle to stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.map_err(AudioLoadingError::IoError)?;
+
+    let sample_rate: u32 =  line.trim().parse().map_err(|_err| AudioLoadingError::ParseSampleRateError())?;
+
+    process.wait().await.map_err(AudioLoadingError::IoError)?;
+    debug!["Obtained sample rate {} for {}", sample_rate, input_file];
+    Ok(sample_rate as f64)
 }
 
 async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
@@ -121,10 +156,25 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sa
     if let Some(max_duration) = maybe_max_duration {
         command.arg("-t").arg(format!["{}", max_duration]);
     }
+
+    let mut ffmpeg_audio_filter = String::from("pan=mono|c0=c0");
+    if is_aac_file(input_file) {
+        debug!["Processing aac file {}", input_file];
+        // Unfortunately aac conversion using ffmpeg adds a delay to the beginning of the audio
+        // I have found no easy way of removing this, so this is a hack to do it...
+        command.arg("-c:a").arg("aac");
+
+        let sample_rate = get_aac_sample_rate(input_file).await?;
+        let delay = (2 * 1024) as f64 / sample_rate; // 2 AAC frames of 1024 samples over the sample rate
+        debug!["Detecting AAC file, correcting with delay {}", delay];
+        ffmpeg_audio_filter.push_str(&format!(",atrim=start={}", delay));
+        debug!["Filter after: {}", ffmpeg_audio_filter];
+    }
+
     command.arg("-i")
         .arg(input_file)
         .arg("-af")
-        .arg("pan=mono|c0=c0")
+        .arg(ffmpeg_audio_filter)
         .arg("-ar")
         .arg(format!["{}", sample_rate])
         .arg("-f")
@@ -268,13 +318,14 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         let audio_array = audio_samples.into_pyarray(py).to_owned();
         audio_results.push(audio_array);
 
-        let event_array = PyArray2::<u16>::zeros(py, [events.len(), 3], false);
+        let event_array = PyArray2::<u16>::zeros(py, [events.len(), 4], false);
         {
             let mut event_array_read_write = event_array.readwrite();
-            for (row, (time, key, velocity)) in events.into_iter().enumerate() {
-                *event_array_read_write.get_mut([row, 0]).unwrap() = time as u16;
+            for (row, (attack_time, key, duration, velocity)) in events.into_iter().enumerate() {
+                *event_array_read_write.get_mut([row, 0]).unwrap() = attack_time as u16;
                 *event_array_read_write.get_mut([row, 1]).unwrap() = key as u16;
-                *event_array_read_write.get_mut([row, 2]).unwrap() = velocity as u16;
+                *event_array_read_write.get_mut([row, 2]).unwrap() = duration as u16;
+                *event_array_read_write.get_mut([row, 3]).unwrap() = velocity as u16;
             }
         }
         event_results.push(event_array);

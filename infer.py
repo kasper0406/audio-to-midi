@@ -13,6 +13,7 @@ from jaxtyping import Array, Float
 from audio_to_midi_dataset import (
     BLANK_MIDI_EVENT,
     BLANK_VELOCITY,
+    BLANK_DURATION,
     SEQUENCE_END,
     SEQUENCE_START,
     AudioToMidiDatasetLoader,
@@ -23,27 +24,30 @@ from model import OutputSequenceGenerator, model_config
 
 
 @eqx.filter_jit
-def forward(model, audio_frames, outputs_so_far, active_notes, key):
+def forward(model, audio_frames, outputs_so_far, key):
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
-    midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs = jax.vmap(
-        model, (0, 0, 0, 0)
-    )(audio_frames, outputs_so_far, active_notes, inference_keys)
-    return midi_logits, midi_probs, position_logits, position_probs, velocity_logits, velocity_probs
+    return jax.vmap(
+        model, (0, 0, 0)
+    )(audio_frames, outputs_so_far, inference_keys)
 
 
 def _update_raw_outputs(
     current,
     midi_logits,
     midi_probs,
-    position_logits,
-    position_probs,
+    attack_time_logits,
+    attack_time_probs,
+    duration_logits,
+    duration_probs,
     velocity_logits,
     velocity_probs,
 ):
     midi_logits = midi_logits[:, None, :]
     midi_probs = midi_probs[:, None, :]
-    position_logits = position_logits[:, None, :]
-    position_probs = position_probs[:, None, :]
+    attack_time_logits = attack_time_logits[:, None, :]
+    attack_time_probs = attack_time_probs[:, None, :]
+    duration_logits = duration_logits[:, None, :]
+    duration_probs = duration_probs[:, None, :]
     velocity_logits = velocity_logits[:, None, :]
     velocity_probs = velocity_probs[:, None, :]
 
@@ -51,8 +55,10 @@ def _update_raw_outputs(
         return {
             "midi_logits": midi_logits,
             "midi_probs": midi_probs,
-            "position_logits": position_logits,
-            "position_probs": position_probs,
+            "attack_time_logits": attack_time_logits,
+            "attack_time_probs": attack_time_probs,
+            "duration_logits": duration_logits,
+            "duration_probs": duration_probs,
             "velocity_logits": velocity_logits,
             "velocity_probs": velocity_probs,
         }
@@ -60,11 +66,17 @@ def _update_raw_outputs(
     return {
         "midi_logits": jnp.concatenate([current["midi_logits"], midi_logits], axis=1),
         "midi_probs": jnp.concatenate([current["midi_probs"], midi_probs], axis=1),
-        "position_logits": jnp.concatenate(
-            [current["position_logits"], position_logits], axis=1
+        "attack_time_logits": jnp.concatenate(
+            [current["attack_time_logits"], attack_time_logits], axis=1
         ),
-        "position_probs": jnp.concatenate(
-            [current["position_probs"], position_probs], axis=1
+        "attack_time_probs": jnp.concatenate(
+            [current["attack_time_probs"], attack_time_probs], axis=1
+        ),
+        "duration_logits": jnp.concatenate(
+            [current["duration_logits"], duration_logits], axis=1
+        ),
+        "duration_probs": jnp.concatenate(
+            [current["duration_probs"], duration_probs], axis=1
         ),
         "velocity_logits": jnp.concatenate(
             [current["velocity_logits"], velocity_logits], axis=1
@@ -83,7 +95,7 @@ def batch_infer(
 ):
     batch_size = frames.shape[0]
     seen_events = jnp.tile(
-        jnp.array([0, SEQUENCE_START, BLANK_VELOCITY], dtype=jnp.int16),
+        jnp.array([0, SEQUENCE_START, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16),
         (batch_size, 1, 1),
     )
 
@@ -104,35 +116,31 @@ def batch_infer(
         # Use a padded version to avoid jax recompilations
         padding_amount = (padding_increment - seen_events.shape[1]) % padding_increment
         padding = jnp.tile(
-            jnp.array([0, BLANK_MIDI_EVENT, BLANK_VELOCITY], dtype=jnp.int16), (batch_size, padding_amount, 1)
+            jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16), (batch_size, padding_amount, 1)
         )
         padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
         # jax.debug.print(
         #     "Padded seen events {padded_seen_events}",
         #     padded_seen_events=padded_seen_events,
         # )
-        active_notes = jax.vmap(get_active_events)(padded_seen_events)
-        # jax.debug.print(
-        #     "Active notes {active_notes}",
-        #     active_notes=active_notes,
-        # )
 
         (
             midi_logits,
             midi_probs,
-            position_logits,
-            position_probs,
+            attack_time_logits,
+            attack_time_probs,
+            duration_logits,
+            duration_probs,
             velocity_logits,
             velocity_probs,
         ) = forward(
             model,
             frames,
             padded_seen_events,
-            active_notes,
             inference_key,
         )
 
-        midi_events = jnp.select(
+        notes = jnp.select(
             [end_of_sequence_mask],
             [jnp.tile(jnp.array(BLANK_MIDI_EVENT, dtype=jnp.int16), (batch_size,))],
             jnp.argmax(midi_probs, axis=1),
@@ -140,13 +148,19 @@ def batch_infer(
 
         # Make sure the position is always monotonically increasing
         # TODO: Consider to throw a weighted dice with position_probs probabilities here?
-        positions = jnp.maximum(
-            seen_events[:, -1, 0], jnp.argmax(position_probs, axis=1)
+        attack_times = jnp.maximum(
+            seen_events[:, -1, 0], jnp.argmax(attack_time_probs, axis=1)
         )
-        positions = jnp.select(
+        attack_times = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            positions,
+            attack_times,
+        )
+
+        durations = jnp.select(
+            [end_of_sequence_mask],
+            [jnp.zeros((batch_size,), jnp.int16)],
+            jnp.argmax(duration_probs, axis=1),
         )
 
         velocities = jnp.select(
@@ -157,12 +171,12 @@ def batch_infer(
 
         # Combine the predicted positions with their corresponding midi events
         predicted_events = jnp.transpose(
-            jnp.vstack([positions, midi_events, velocities])
+            jnp.vstack([attack_times, notes, durations, velocities])
         )
 
         # Update seen events with the new predictions
         seen_events = jnp.concatenate(
-            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 3))], axis=1
+            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 4))], axis=1
         )
         # print(f"Seen events at step {i}", seen_events)
 
@@ -171,8 +185,10 @@ def batch_infer(
             raw_outputs,
             midi_logits,
             midi_probs,
-            position_logits,
-            position_probs,
+            attack_time_logits,
+            attack_time_probs,
+            duration_logits,
+            duration_probs,
             velocity_logits,
             velocity_probs,
         )
