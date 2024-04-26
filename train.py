@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, AudioToMidiDatasetLoader, get_active_events
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, NUM_VELOCITY_CATEGORIES, AudioToMidiDatasetLoader, get_active_events
 from model import OutputSequenceGenerator, model_config
 
 @eqx.filter_jit
@@ -38,27 +38,30 @@ def continous_probability_loss(probs, expected, variance):
     return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
 
 @eqx.filter_jit
-def duration_probability_loss(logits, probs, expected, variance):
+def duration_loss_fn(predicted, expected):
     # Compared to a `continous_probability_loss` we have a special case in that if the duration of
     # the note is outside of what is indicated by the audio frame, we want a special duration
     # of 0 predicted, meaning that the duration can not be fully trusted, and extends to the end
     # of the current audio.
-    loss_if_zero_duration = optax.softmax_cross_entropy_with_integer_labels(
-        logits=logits, labels=jnp.array(expected, dtype=jnp.int16)
-    )
+    loss_if_zero_duration = predicted * 100
 
     # Increase the variance proportional to the duration length squared, because pianos
     # will usually decay their sound as time goes on, making it hard to predict exact
     # durations for long note durations
-    duration_variance = variance + (expected / 20) ** 2
-    loss_otherwise = continous_probability_loss(probs[1:], expected - 1, duration_variance)
-    loss_otherwise += probs[0]
+    duration_damping = 1 + (expected / 0.3) ** 2
+    loss_otherwise = jnp.square(expected - predicted) / duration_damping
 
-    return jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
+    loss =  jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
+    return jnp.sum(loss, axis=-1)
+
+@eqx.filter_jit
+def velocity_loss_fn(predicted, expected):
+    loss = jnp.square(predicted - expected)
+    return jnp.sum(loss, axis=-1)
 
 @eqx.filter_jit
 def compute_loss_from_output(
-    midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
+    midi_logits, attack_time_probs, durations, velocities, expected_next_output
 ):
     expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -70,19 +73,15 @@ def compute_loss_from_output(
         attack_time_probs, expected_attack_time
     )
 
-    expected_duration = expected_next_output[:, 2]
-    duration_loss = jax.vmap(partial(duration_probability_loss, variance=2.0), (0, 0, 0))(
-        duration_logits, duration_probs, expected_duration
-    )
+    expected_durations = expected_next_output[:, 2] / midi_logits.shape[0]
+    duration_loss = jax.vmap(duration_loss_fn, (0, 0))(durations, expected_durations)
 
-    expected_next_velocity = expected_next_output[:, 3]
-    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=2.0), (0, 0))(
-        velocity_probs, expected_next_velocity
-    )
+    expected_next_velocities = expected_next_output[:, 3] / NUM_VELOCITY_CATEGORIES
+    velocity_loss = jax.vmap(velocity_loss_fn, (0, 0))(velocities, expected_next_velocities)
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     individual_losses = jnp.array([ midi_event_loss, attack_time_loss, duration_loss, velocity_loss ])
-    return midi_event_loss + 0.5 * (attack_time_loss + duration_loss) + 0.3 * velocity_loss, individual_losses
+    return midi_event_loss + attack_time_loss + 0.5 * duration_loss + 0.5 * velocity_loss, individual_losses
 
 
 @eqx.filter_jit
@@ -90,12 +89,12 @@ def compute_loss_from_output(
 def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
+    midi_logits, _, _, attack_time_probs, duration, velocity = jax.vmap(
                 model, in_axes=(0, 0, 0, None)
     )(audio_frames, outputs_so_far, batched_keys, True)
 
     loss, individual_losses = compute_loss_from_output(
-        midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
+        midi_logits, attack_time_probs, duration, velocity, expected_next_output
     )
     return jnp.mean(loss), jnp.mean(individual_losses, axis=1)
 
@@ -153,16 +152,15 @@ def compute_test_loss(
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
-    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
+    midi_logits, _, _, attack_time_probs, duration, velocity = jax.vmap(
         model, (None, 0, 0)
     )(audio_frames, event_prefixes, inference_keys)
 
     losses, individual_losses = compute_loss_from_output(
         midi_logits,
         attack_time_probs,
-        duration_logits,
-        duration_probs,
-        velocity_probs,
+        duration,
+        velocity,
         midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
     )
 

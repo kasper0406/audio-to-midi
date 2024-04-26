@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 1024,
     "max_frame_sequence_length": 200,
-    "attention_size": 128,
-    "intermediate_size": 256,
-    "num_heads": 2,
-    "num_layers": 12,
+    "attention_size": 64,
+    "intermediate_size": 64,
+    "num_heads": 1,
+    "num_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 30,
 }
@@ -543,13 +543,13 @@ class Decoder(eqx.Module):
 
         self.duration_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
-            out_features=frame_seq_length,
+            out_features=1,
             key=duration_pooling_key,
         )
 
         self.velocity_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
-            out_features=MidiVocabulary.num_velocities(),
+            out_features=1,
             key=velocity_pooling_key,
         )
 
@@ -576,25 +576,16 @@ class Decoder(eqx.Module):
         )
         attack_time_probabilities = jax.nn.softmax(attack_time_logits)
 
-        duration_logits = self.duration_decoder_pooling(
-            output, key=duration_decoder_key
-        )
-        duration_probabilities = jax.nn.softmax(duration_logits)
-
-        velocity_logits = self.velocity_decoder_pooling(
-            output, key=velocity_decoder_key
-        )
-        velocity_probabilities = jax.nn.softmax(velocity_logits)
+        duration = jax.nn.relu(self.duration_decoder_pooling(output, key=duration_decoder_key))
+        velocity = jax.nn.relu(self.velocity_decoder_pooling(output, key=velocity_decoder_key))
 
         return (
             midi_logits,
             midi_probabilities,
             attack_time_logits,
             attack_time_probabilities,
-            duration_logits,
-            duration_probabilities,
-            velocity_logits,
-            velocity_probabilities,
+            duration,
+            velocity,
         )
 
 
