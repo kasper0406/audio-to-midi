@@ -48,8 +48,8 @@ def duration_loss_fn(predicted, expected):
     # Increase the variance proportional to the duration length squared, because pianos
     # will usually decay their sound as time goes on, making it hard to predict exact
     # durations for long note durations
-    duration_damping = 1 + (expected / 0.3) ** 2
-    loss_otherwise = jnp.square(expected - predicted) / duration_damping
+    duration_damping = 1 + (expected / 0.4) ** 2
+    loss_otherwise = jnp.square(5 * (expected - predicted)) / duration_damping
 
     loss =  jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
     return jnp.sum(loss, axis=-1)
@@ -81,7 +81,7 @@ def compute_loss_from_output(
 
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     individual_losses = jnp.array([ midi_event_loss, attack_time_loss, duration_loss, velocity_loss ])
-    return midi_event_loss + attack_time_loss + 0.5 * duration_loss + 0.5 * velocity_loss, individual_losses
+    return midi_event_loss + attack_time_loss + duration_loss + velocity_loss, individual_losses
 
 
 @eqx.filter_jit
