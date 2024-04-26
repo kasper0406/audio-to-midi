@@ -53,7 +53,7 @@ if not args.validation:
 
 if args.validation:
     validation_dir = Path(args.path)
-    loss = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
-    print(f"Validation loss: {loss}")
+    loss, idv_losses = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
+    print(f"Validation loss: {loss}, idv = {idv_losses}")
 
 plt.show() # Wait for matplotlib

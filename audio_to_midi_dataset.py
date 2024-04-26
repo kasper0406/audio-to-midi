@@ -22,7 +22,7 @@ import math
 import rust_plugins
 
 # TODO: Clean this up
-MIDI_EVENT_VOCCAB_SIZE = 90
+MIDI_EVENT_VOCCAB_SIZE = 92
 
 MAX_EVENT_TIMESTAMP = 5.0
 SEQUENCE_START = 1

@@ -146,18 +146,14 @@ def batch_infer(
         durations = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.round(raw_durations[0]),
+            jnp.round(raw_durations[0] * frames.shape[0]),
         )
 
         velocities = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(raw_velocities[0] * 10)),
+            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(raw_velocities[0] * NUM_VELOCITY_CATEGORIES)),
         )
-
-        print(f"Attack times shape: {attack_times}")
-        print(f"Durations shape: {durations}")
-        print(f"Velocities shape: {velocities}")
 
         # Combine the predicted positions with their corresponding midi events
         predicted_events = jnp.transpose(
@@ -293,6 +289,7 @@ def main():
             raw_outputs["position_probs"][:, i, :],
             raw_outputs["velocity_probs"][:, i, :],
             expected_midi_events[:, i + 1],
+            all_frames[0].shape[0],
         )
         loss = ~end_of_sequence_mask[:, i] * loss
         print(f"Loss at step {i}: {loss}")

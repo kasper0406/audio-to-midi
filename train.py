@@ -61,7 +61,7 @@ def velocity_loss_fn(predicted, expected):
 
 @eqx.filter_jit
 def compute_loss_from_output(
-    midi_logits, attack_time_probs, durations, velocities, expected_next_output
+    midi_logits, attack_time_probs, durations, velocities, expected_next_output, num_frames,
 ):
     expected_next_midi = expected_next_output[:, 1]
     midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -73,7 +73,7 @@ def compute_loss_from_output(
         attack_time_probs, expected_attack_time
     )
 
-    expected_durations = expected_next_output[:, 2] / midi_logits.shape[0]
+    expected_durations = expected_next_output[:, 2] / num_frames
     duration_loss = jax.vmap(duration_loss_fn, (0, 0))(durations, expected_durations)
 
     expected_next_velocities = expected_next_output[:, 3] / NUM_VELOCITY_CATEGORIES
@@ -94,7 +94,7 @@ def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key)
     )(audio_frames, outputs_so_far, batched_keys, True)
 
     loss, individual_losses = compute_loss_from_output(
-        midi_logits, attack_time_probs, duration, velocity, expected_next_output
+        midi_logits, attack_time_probs, duration, velocity, expected_next_output, audio_frames.shape[1]
     )
     return jnp.mean(loss), jnp.mean(individual_losses, axis=1)
 
@@ -162,28 +162,33 @@ def compute_test_loss(
         duration,
         velocity,
         midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
+        audio_frames.shape[0],
     )
 
     # Blank out the losses obtained when the prediction should result in a blank event
     actual_event_mask = midi_events[1:, 1] != BLANK_MIDI_EVENT
     losses = jnp.select([actual_event_mask], [losses], 0.0)
-    return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
+    individual_losses = jnp.select([actual_event_mask], [individual_losses], 0.0)
+
+    return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask), jnp.mean(individual_losses, axis=1)
 
 
 def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
     batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
 
-    test_loss = jnp.array([0.0], dtype=jnp.float32)
+    test_loss = jnp.zeros((1,))
+    individual_loss = jnp.zeros((4,))
     count = jnp.array(0, dtype=jnp.int32)
     for frames, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=frames.shape[0])
-        test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+        test_losses, individual_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
         test_loss += jnp.sum(test_losses)
+        individual_loss += jnp.sum(individual_losses, axis=0)
         count += test_losses.shape[0]
 
     print("Finished evaluating test loss")
-    return (test_loss / count)[0]
+    return (test_loss / count)[0], individual_loss / count
 
 
 def train(
@@ -278,10 +283,10 @@ def train(
             print("Evaluating test loss...")
             model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             eval_key, key = jax.random.split(key, num=2)
-            testset_loss = compute_testset_loss(model, testset_dir, eval_key, batch_sharding)
+            testset_loss, idv_losses = compute_testset_loss(model, testset_dir, eval_key, batch_sharding)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
-            print(f"Test loss: {testset_loss}")
+            print(f"Test loss: {testset_loss}, idv. losses = {idv_losses}")
 
     model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
     state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
