@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Integer, PRNGKeyArray
 
 import position_encoding
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE, BLANK_DURATION
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE, BLANK_DURATION, get_data_prep_config
 
 model_config = {
     "frame_size": 1024,
@@ -19,6 +19,12 @@ model_config = {
     "dropout_rate": 0.10,
     "midi_event_context_size": 30,
 }
+
+def get_model_metadata():
+    return {
+        'model': model_config,
+        'data_prep': get_data_prep_config(),
+    }
 
 
 class FrameEmbedding(eqx.Module):

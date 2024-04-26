@@ -16,11 +16,11 @@ from audio_to_midi_dataset import (
     BLANK_DURATION,
     SEQUENCE_END,
     SEQUENCE_START,
+    NUM_VELOCITY_CATEGORIES,
     AudioToMidiDatasetLoader,
     plot_frequency_domain_audio,
-    get_active_events
 )
-from model import OutputSequenceGenerator, model_config
+from model import OutputSequenceGenerator, model_config, get_model_metadata
 
 
 @eqx.filter_jit
@@ -37,19 +37,15 @@ def _update_raw_outputs(
     midi_probs,
     attack_time_logits,
     attack_time_probs,
-    duration_logits,
-    duration_probs,
-    velocity_logits,
-    velocity_probs,
+    durations,
+    velocities,
 ):
     midi_logits = midi_logits[:, None, :]
     midi_probs = midi_probs[:, None, :]
     attack_time_logits = attack_time_logits[:, None, :]
     attack_time_probs = attack_time_probs[:, None, :]
-    duration_logits = duration_logits[:, None, :]
-    duration_probs = duration_probs[:, None, :]
-    velocity_logits = velocity_logits[:, None, :]
-    velocity_probs = velocity_probs[:, None, :]
+    durations = durations[:, None, :]
+    velocities = velocities[:, None, :]
 
     if current is None:
         return {
@@ -57,10 +53,8 @@ def _update_raw_outputs(
             "midi_probs": midi_probs,
             "attack_time_logits": attack_time_logits,
             "attack_time_probs": attack_time_probs,
-            "duration_logits": duration_logits,
-            "duration_probs": duration_probs,
-            "velocity_logits": velocity_logits,
-            "velocity_probs": velocity_probs,
+            "durations": durations,
+            "velocities": velocities,
         }
 
     return {
@@ -72,17 +66,11 @@ def _update_raw_outputs(
         "attack_time_probs": jnp.concatenate(
             [current["attack_time_probs"], attack_time_probs], axis=1
         ),
-        "duration_logits": jnp.concatenate(
-            [current["duration_logits"], duration_logits], axis=1
+        "durations": jnp.concatenate(
+            [current["durations"], durations], axis=1
         ),
-        "duration_probs": jnp.concatenate(
-            [current["duration_probs"], duration_probs], axis=1
-        ),
-        "velocity_logits": jnp.concatenate(
-            [current["velocity_logits"], velocity_logits], axis=1
-        ),
-        "velocity_probs": jnp.concatenate(
-            [current["velocity_probs"], velocity_probs], axis=1
+        "velocities": jnp.concatenate(
+            [current["velocities"], velocities], axis=1
         ),
     }
 
@@ -129,10 +117,8 @@ def batch_infer(
             midi_probs,
             attack_time_logits,
             attack_time_probs,
-            duration_logits,
-            duration_probs,
-            velocity_logits,
-            velocity_probs,
+            raw_durations,
+            raw_velocities,
         ) = forward(
             model,
             frames,
@@ -160,14 +146,18 @@ def batch_infer(
         durations = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.argmax(duration_probs, axis=1),
+            jnp.round(raw_durations[0]),
         )
 
         velocities = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.argmax(velocity_probs, axis=1),
+            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(raw_velocities[0] * 10)),
         )
+
+        print(f"Attack times shape: {attack_times}")
+        print(f"Durations shape: {durations}")
+        print(f"Velocities shape: {velocities}")
 
         # Combine the predicted positions with their corresponding midi events
         predicted_events = jnp.transpose(
@@ -187,10 +177,8 @@ def batch_infer(
             midi_probs,
             attack_time_logits,
             attack_time_probs,
-            duration_logits,
-            duration_probs,
-            velocity_logits,
-            velocity_probs,
+            raw_durations,
+            raw_velocities,
         )
 
         end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
@@ -224,6 +212,10 @@ def load_newest_checkpoint(checkpoint_path: Path):
     step_to_restore = checkpoint_manager.latest_step()
     if step_to_restore is None:
         raise "There is no checkpoint to load! Inference will be useless"
+    else:
+        current_metadata = get_model_metadata()
+        if current_metadata != checkpoint_manager.metadata():
+            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}, but current configuration is {current_metadata}")
 
     print(f"Restoring saved model at step {step_to_restore}")
     model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)

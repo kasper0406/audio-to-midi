@@ -40,6 +40,18 @@ COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 5
 
+def get_data_prep_config():
+    return {
+        "midi_voccab_size": MIDI_EVENT_VOCCAB_SIZE,
+        "max_event_timestamp": MAX_EVENT_TIMESTAMP,
+        "num_velocity_categories": NUM_VELOCITY_CATEGORIES,
+        "samples_per_fft": SAMPLES_PER_FFT,
+        "window_overlap": WINDOW_OVERLAP,
+        "compression_factor": COMPRESSION_FACTOR,
+        "frequency_cutoff": FREQUENCY_CUTOFF,
+        "linear_scaling": LINEAR_SCALING
+    }
+
 @partial(jax.jit, donate_argnames=["frames"])
 def perturb_audio_frames(
     frames, key: jax.random.PRNGKey

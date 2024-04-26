@@ -17,7 +17,7 @@ from functools import reduce
 from more_itertools import chunked
 
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, NUM_VELOCITY_CATEGORIES, AudioToMidiDatasetLoader, get_active_events
-from model import OutputSequenceGenerator, model_config
+from model import OutputSequenceGenerator, model_config, get_model_metadata
 
 @eqx.filter_jit
 def continous_probability_loss(probs, expected, variance):
@@ -56,7 +56,7 @@ def duration_loss_fn(predicted, expected):
 
 @eqx.filter_jit
 def velocity_loss_fn(predicted, expected):
-    loss = jnp.square(predicted - expected)
+    loss = 10 * jnp.square(predicted - expected)
     return jnp.sum(loss, axis=-1)
 
 @eqx.filter_jit
@@ -343,7 +343,9 @@ def main():
         max_to_keep=checkpoints_to_keep, save_interval_steps=checkpoint_every
     )
     checkpoint_manager = ocp.CheckpointManager(
-        checkpoint_path, options=checkpoint_options
+        checkpoint_path,
+        options=checkpoint_options,
+        metadata=get_model_metadata()
     )
 
     step_to_restore = checkpoint_manager.latest_step()
