@@ -146,13 +146,13 @@ def batch_infer(
         durations = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.round(raw_durations[0] * frames.shape[0]),
+            jnp.round(jnp.sum(raw_durations, axis=-1) * frames.shape[0]),
         )
 
         velocities = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(raw_velocities[0] * NUM_VELOCITY_CATEGORIES)),
+            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(jnp.sum(raw_velocities, axis=-1) * NUM_VELOCITY_CATEGORIES)),
         )
 
         # Combine the predicted positions with their corresponding midi events

@@ -170,7 +170,8 @@ def compute_test_loss(
     losses = jnp.select([actual_event_mask], [losses], 0.0)
     individual_losses = jnp.select([actual_event_mask], [individual_losses], 0.0)
 
-    return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask), jnp.mean(individual_losses, axis=1)
+    num_events = jnp.count_nonzero(actual_event_mask)
+    return jnp.sum(losses) / num_events, jnp.sum(individual_losses, axis=1) / num_events
 
 
 def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
