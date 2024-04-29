@@ -850,7 +850,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/narrowed_keys_7"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands_small"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,

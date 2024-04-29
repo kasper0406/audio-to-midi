@@ -48,10 +48,10 @@ def duration_loss_fn(predicted, expected):
     # Increase the variance proportional to the duration length squared, because pianos
     # will usually decay their sound as time goes on, making it hard to predict exact
     # durations for long note durations
-    duration_damping = 1 + (expected / 0.4) ** 2
+    duration_damping = 1 + (expected / 0.4) ** 1.5
     loss_otherwise = jnp.square(5 * (expected - predicted)) / duration_damping
 
-    loss =  jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
+    loss = jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
     return jnp.sum(loss, axis=-1)
 
 @eqx.filter_jit
@@ -133,7 +133,7 @@ def load_test_set(testset_dir: Path, sharding, batch_size: int):
     batches = []
     for chunk in chunks:
         midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
-        batches.append((frames, midi_events))
+        batches.append((chunk, frames, midi_events))
     return batches
 
 @eqx.filter_jit
@@ -173,22 +173,31 @@ def compute_test_loss(
     num_events = jnp.count_nonzero(actual_event_mask)
     return jnp.sum(losses) / num_events, jnp.sum(individual_losses, axis=1) / num_events
 
-
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
     batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
+
+    loss_map = {}
+    for sample_names, frames, midi_events in batches:
+        test_loss_keys = jax.random.split(key, num=frames.shape[0])
+        test_losses, individual_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+        for sample_name, loss, individual_loss in zip(sample_names, test_losses, individual_losses):
+            loss_map[sample_name] = { "loss": loss, "individual_loss": individual_loss }
+
+    print("Finished evaluating test loss")
+    return loss_map
+
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model, testset_dir, key, sharding, batch_size)
 
     test_loss = jnp.zeros((1,))
     individual_loss = jnp.zeros((4,))
     count = jnp.array(0, dtype=jnp.int32)
-    for frames, midi_events in batches:
-        test_loss_keys = jax.random.split(key, num=frames.shape[0])
-        test_losses, individual_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
-        test_loss += jnp.sum(test_losses)
-        individual_loss += jnp.sum(individual_losses, axis=0)
-        count += test_losses.shape[0]
+    for losses in per_sample_map.values():
+        test_loss += losses["loss"]
+        individual_loss += losses["individual_loss"]
+        count += 1
 
-    print("Finished evaluating test loss")
     return (test_loss / count)[0], individual_loss / count
 
 

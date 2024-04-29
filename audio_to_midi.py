@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import jax
 from infer import load_newest_checkpoint, batch_infer
-from train import compute_testset_loss
+from train import compute_testset_loss, compute_testset_loss_individual
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding
 import matplotlib.pyplot as plt
 
@@ -17,6 +17,9 @@ parser.add_argument('--visualize-audio-embeddings',
     action='store_true')
 parser.add_argument('--validation',
     help='Test the provided validation set on the model',
+    action='store_true')
+parser.add_argument('--individual',
+    help='Report losses on individual samples in the validation set',
     action='store_true')
 
 args = parser.parse_args()
@@ -53,7 +56,15 @@ if not args.validation:
 
 if args.validation:
     validation_dir = Path(args.path)
-    loss, idv_losses = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
-    print(f"Validation loss: {loss}, idv = {idv_losses}")
+
+    if args.individual:
+        losses = compute_testset_loss_individual(audio_to_midi, validation_dir, key, sharding=None)
+        for sample_name, losses in losses.items():
+            loss = losses["loss"]
+            idv_loss = losses["individual_loss"]
+            print(f"{sample_name}\t{loss} {idv_loss}")
+    else:
+        loss, idv_losses = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
+        print(f"Validation loss: {loss}, idv = {idv_losses}")
 
 plt.show() # Wait for matplotlib
