@@ -62,6 +62,11 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
+                if record.time > max_event_time {
+                    debug!["Skipping midi event because it happens after {} seconds", max_event_time];
+                    continue
+                }
+
                 let attack_time = frame_position(record.time, duration_per_frame);
                 let key = key_to_event(record.key);
                 let duration = {
