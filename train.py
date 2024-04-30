@@ -42,8 +42,8 @@ def duration_loss_fn(predicted, expected):
     # Increase the variance proportional to the duration length squared, because pianos
     # will usually decay their sound as time goes on, making it hard to predict exact
     # durations for long note durations
-    duration_damping = 1 + (expected / 0.4) ** 1.5
-    loss = jnp.square(5 * (expected - predicted)) / duration_damping
+    duration_damping = 1 + (expected / 60) ** 1.5
+    loss = 0.02 * jnp.square(expected - predicted) / duration_damping
     return jnp.sum(loss, axis=-1)
 
 @eqx.filter_jit
@@ -65,7 +65,7 @@ def compute_loss_from_output(
         attack_time_probs, expected_attack_time
     )
 
-    expected_durations = expected_next_output[:, 2] / num_frames
+    expected_durations = expected_next_output[:, 2]
     duration_loss = jax.vmap(duration_loss_fn, (0, 0))(durations, expected_durations)
 
     expected_next_velocities = expected_next_output[:, 3] / NUM_VELOCITY_CATEGORIES

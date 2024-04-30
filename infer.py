@@ -146,7 +146,7 @@ def batch_infer(
         durations = jnp.select(
             [end_of_sequence_mask],
             [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.round(jnp.sum(raw_durations, axis=-1) * frames.shape[0]),
+            jnp.round(jnp.sum(raw_durations, axis=-1)),
         )
 
         velocities = jnp.select(
