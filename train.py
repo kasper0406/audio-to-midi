@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, NUM_VELOCITY_CATEGORIES, AudioToMidiDatasetLoader, get_active_events
+from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, NUM_VELOCITY_CATEGORIES, AudioToMidiDatasetLoader, get_active_events, visualize_sample
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 
 @eqx.filter_jit
@@ -39,19 +39,11 @@ def continous_probability_loss(probs, expected, variance):
 
 @eqx.filter_jit
 def duration_loss_fn(predicted, expected):
-    # Compared to a `continous_probability_loss` we have a special case in that if the duration of
-    # the note is outside of what is indicated by the audio frame, we want a special duration
-    # of 0 predicted, meaning that the duration can not be fully trusted, and extends to the end
-    # of the current audio.
-    loss_if_zero_duration = predicted * 100
-
     # Increase the variance proportional to the duration length squared, because pianos
     # will usually decay their sound as time goes on, making it hard to predict exact
     # durations for long note durations
     duration_damping = 1 + (expected / 0.4) ** 1.5
-    loss_otherwise = jnp.square(5 * (expected - predicted)) / duration_damping
-
-    loss = jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
+    loss = jnp.square(5 * (expected - predicted)) / duration_damping
     return jnp.sum(loss, axis=-1)
 
 @eqx.filter_jit
@@ -69,7 +61,7 @@ def compute_loss_from_output(
     )
 
     expected_attack_time = expected_next_output[:, 0]
-    attack_time_loss = jax.vmap(partial(continous_probability_loss, variance=3.0), (0, 0))(
+    attack_time_loss = jax.vmap(partial(continous_probability_loss, variance=1.0), (0, 0))(
         attack_time_probs, expected_attack_time
     )
 
@@ -151,6 +143,9 @@ def compute_test_loss(
     # Do not pick the last element with the full sequence, as there is nothing to predict
     event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
 
+    # jax.debug.print("Calling model with events {e}", e=event_prefixes)
+    # jax.debug.print("Expected {e}", e=midi_events[1:, ...])
+
     inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
     midi_logits, _, _, attack_time_probs, duration, velocity = jax.vmap(
         model, (None, 0, 0)
@@ -164,6 +159,8 @@ def compute_test_loss(
         midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
         audio_frames.shape[0],
     )
+
+    # jax.debug.print("Idv. losses {l}", l=individual_losses)
 
     # Blank out the losses obtained when the prediction should result in a blank event
     actual_event_mask = midi_events[1:, 1] != BLANK_MIDI_EVENT

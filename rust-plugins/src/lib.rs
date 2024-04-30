@@ -69,13 +69,7 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
 
                 let attack_time = frame_position(record.time, duration_per_frame);
                 let key = key_to_event(record.key);
-                let duration = {
-                    if record.time + record.duration < max_event_time {
-                        frame_position(record.duration, duration_per_frame).max(1)
-                    } else {
-                        0 // If the note persists outside of the area we can see, we assign it a special duration of 0
-                    }
-                };
+                let duration = frame_position(record.duration, duration_per_frame).max(1);
                 let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
 
                 events.push( (attack_time, key, duration, velocity) );
