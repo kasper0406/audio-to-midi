@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 1024,
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 512,
+    "intermediate_size": 512,
+    "num_heads": 2,
+    "num_layers": 12,
     "dropout_rate": 0.10,
     "midi_event_context_size": 30,
 }
@@ -36,6 +36,7 @@ class FrameEmbedding(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
+    position_embedder: eqx.nn.Linear
 
     def __init__(
         self,
@@ -46,19 +47,22 @@ class FrameEmbedding(eqx.Module):
         dropout_rate: float,
         key: PRNGKeyArray,
     ):
+        frame_key, pos_key = jax.random.split(key, num=2)
+
         self.frame_size = frame_size
         self.frame_embedder = eqx.nn.MLP(
             in_size=self.frame_size,
             out_size=output_shape,
             width_size=self.frame_size,
             depth=0,
-            key=key)
+            key=frame_key)
         self.frame_normalizer = eqx.nn.LayerNorm(shape=output_shape)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
             max_frame_sequence_length, output_shape
         )
+        self.position_embedder = eqx.nn.Linear(in_features=output_shape, out_features=output_shape, key=pos_key)
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
@@ -68,11 +72,11 @@ class FrameEmbedding(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        position_embeddings = self.position_embeddings[0 : input_frames.shape[0]]
+        position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : input_frames.shape[0]])
         frame_embeddings = jax.vmap(self.frame_embedder)(input_frames)
-        frame_embeddings = jax.vmap(self.frame_normalizer)(frame_embeddings)
+        # frame_embeddings = jax.vmap(self.frame_normalizer)(frame_embeddings)
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
-        return self.dropout(combined, inference=not enable_dropout, key=key)
+        return combined
 
 class NoteEmbedding(eqx.Module):
     embedding: eqx.nn.Embedding
