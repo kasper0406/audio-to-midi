@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 64,
-    "intermediate_size": 64,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 128,
+    "intermediate_size": 128,
+    "num_heads": 2,
+    "num_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 }
@@ -30,7 +30,6 @@ def get_model_metadata():
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
-    frame_embedder: eqx.nn.MLP
     frame_normalizer: eqx.nn.LayerNorm
     frame_size: int
     layernorm: eqx.nn.LayerNorm
@@ -62,27 +61,26 @@ class FrameEmbedding(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
+        internal_channels = 5
+        time_kernel = 10
+        time_stride = 3
+        freq_kernel = 5
+        freq_stride = 3
+
         self.conv1 = eqx.nn.Conv2d(
             in_channels=1,
-            out_channels=3,
-            kernel_size=(10, 5),
-            stride=(3, 2),
+            out_channels=internal_channels,
+            kernel_size=(time_kernel, freq_kernel),
+            stride=(time_stride, freq_stride),
             key=conv1_key)
         
-        new_height = int(self.frame_size / 2) - 2
+        new_height = int(self.frame_size / freq_stride)
         self.conv2 = eqx.nn.Conv2d(
-            in_channels=3,
-            out_channels=200,
-            kernel_size=(10, new_height),
+            in_channels=internal_channels,
+            out_channels=output_shape,
+            kernel_size=(1, new_height),
             stride=(1, 1),
             key=conv2_key)
-        
-        self.frame_embedder = eqx.nn.MLP(
-            in_size=200,
-            out_size=output_shape,
-            width_size=self.frame_size,
-            depth=2,
-            key=frame_key)
 
     def __call__(
         self,
@@ -93,9 +91,7 @@ class FrameEmbedding(eqx.Module):
         # print(f"input_frames shape = {input_frames.shape}")
         c1 = self.conv1(input_frames[jnp.newaxis, ...])
         # print(f"c1 shape = {c1.shape}")
-        c2 = jnp.transpose(jnp.squeeze((self.conv2(c1))))
-        # print(f"c2 shape = {c2.shape}")
-        frame_embeddings = jax.vmap(self.frame_embedder)(c2)
+        frame_embeddings = jnp.transpose(jnp.squeeze((self.conv2(c1))))
 
         position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
 
