@@ -10,14 +10,14 @@ import position_encoding
 from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_VOCCAB_SIZE, BLANK_DURATION, get_data_prep_config
 
 model_config = {
-    "frame_size": 1024,
+    "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 512,
-    "num_heads": 2,
-    "num_layers": 12,
+    "attention_size": 64,
+    "intermediate_size": 64,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
-    "midi_event_context_size": 30,
+    "midi_event_context_size": 1,
 }
 
 def get_model_metadata():
@@ -37,6 +37,8 @@ class FrameEmbedding(eqx.Module):
     position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
     position_embedder: eqx.nn.Linear
+    conv1: eqx.nn.Conv2d
+    conv2: eqx.nn.Conv2d
 
     def __init__(
         self,
@@ -47,15 +49,9 @@ class FrameEmbedding(eqx.Module):
         dropout_rate: float,
         key: PRNGKeyArray,
     ):
-        frame_key, pos_key = jax.random.split(key, num=2)
+        frame_key, pos_key, conv1_key, conv2_key = jax.random.split(key, num=4)
 
         self.frame_size = frame_size
-        self.frame_embedder = eqx.nn.MLP(
-            in_size=self.frame_size,
-            out_size=output_shape,
-            width_size=self.frame_size,
-            depth=0,
-            key=frame_key)
         self.frame_normalizer = eqx.nn.LayerNorm(shape=output_shape)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
@@ -66,15 +62,43 @@ class FrameEmbedding(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
+        self.conv1 = eqx.nn.Conv2d(
+            in_channels=1,
+            out_channels=3,
+            kernel_size=(10, 5),
+            stride=(3, 2),
+            key=conv1_key)
+        
+        new_height = int(self.frame_size / 2) - 2
+        self.conv2 = eqx.nn.Conv2d(
+            in_channels=3,
+            out_channels=200,
+            kernel_size=(10, new_height),
+            stride=(1, 1),
+            key=conv2_key)
+        
+        self.frame_embedder = eqx.nn.MLP(
+            in_size=200,
+            out_size=output_shape,
+            width_size=self.frame_size,
+            depth=2,
+            key=frame_key)
+
     def __call__(
         self,
         input_frames: Float[Array, "seq_len frame_size"],
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : input_frames.shape[0]])
-        frame_embeddings = jax.vmap(self.frame_embedder)(input_frames)
-        # frame_embeddings = jax.vmap(self.frame_normalizer)(frame_embeddings)
+        # print(f"input_frames shape = {input_frames.shape}")
+        c1 = self.conv1(input_frames[jnp.newaxis, ...])
+        # print(f"c1 shape = {c1.shape}")
+        c2 = jnp.transpose(jnp.squeeze((self.conv2(c1))))
+        # print(f"c2 shape = {c2.shape}")
+        frame_embeddings = jax.vmap(self.frame_embedder)(c2)
+
+        position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
+
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
         return combined
 
@@ -91,7 +115,7 @@ class NoteEmbedding(eqx.Module):
             embedding_size=output_size,
             key=key,
         )
-    
+
     def __call__(
         self, 
         note: int,
