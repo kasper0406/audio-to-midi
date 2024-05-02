@@ -90,8 +90,12 @@ class FrameEmbedding(eqx.Module):
     ):
         # print(f"input_frames shape = {input_frames.shape}")
         c1 = self.conv1(input_frames[jnp.newaxis, ...])
+        c1 = jax.nn.gelu(c1)
+        c1 = jax.nn.normalize(c1)
         # print(f"c1 shape = {c1.shape}")
         frame_embeddings = jnp.transpose(jnp.squeeze((self.conv2(c1))))
+        frame_embeddings = jax.nn.gelu(frame_embeddings)
+        frame_embeddings = jax.nn.normalize(frame_embeddings)
 
         position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
 
@@ -736,7 +740,8 @@ class OutputSequenceGenerator(eqx.Module):
             enable_dropout=enable_dropout,
             key=event_processor_key,
         )
-        output = jnp.tanh(output[0, :])
+        # output = jnp.tanh(output[0, :])
+        output = output[0, :]
         output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
         return self.decoder(output, decoder_key)
