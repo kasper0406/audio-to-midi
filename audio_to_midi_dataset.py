@@ -105,14 +105,14 @@ def fft_audio(
     absolute_values = jnp.transpose(jnp.absolute(fft))
 
     # Do a logaritmic compression to emulate human hearing
-    compressed_amplitudes = (
-        jnp.sign(absolute_values)
-        * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
-        / jnp.log1p(COMPRESSION_FACTOR)
-    )
+    #compressed_amplitudes = (
+    #    jnp.sign(absolute_values)
+    #    * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
+    #    / jnp.log1p(COMPRESSION_FACTOR)
+    #)
 
     # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
-    standardized_amplitudes = (compressed_amplitudes + FRAME_BLANK_VALUE) / LINEAR_SCALING
+    standardized_amplitudes = (absolute_values + FRAME_BLANK_VALUE) / LINEAR_SCALING
 
     return standardized_amplitudes
 

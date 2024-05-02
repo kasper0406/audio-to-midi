@@ -37,15 +37,19 @@ def _update_raw_outputs(
     midi_probs,
     attack_time_logits,
     attack_time_probs,
-    durations,
-    velocities,
+    duration_logits,
+    duration_probs,
+    velocity_logits,
+    velocity_probs,
 ):
     midi_logits = midi_logits[:, None, :]
     midi_probs = midi_probs[:, None, :]
     attack_time_logits = attack_time_logits[:, None, :]
     attack_time_probs = attack_time_probs[:, None, :]
-    durations = durations[:, None, :]
-    velocities = velocities[:, None, :]
+    duration_logits = duration_logits[:, None, :]
+    duration_probs = duration_probs[:, None, :]
+    velocity_logits = velocity_logits[:, None, :]
+    velocity_probs = velocity_probs[:, None, :]
 
     if current is None:
         return {
@@ -53,8 +57,10 @@ def _update_raw_outputs(
             "midi_probs": midi_probs,
             "attack_time_logits": attack_time_logits,
             "attack_time_probs": attack_time_probs,
-            "durations": durations,
-            "velocities": velocities,
+            "duration_logits": duration_logits,
+            "duration_probs": duration_probs,
+            "velocity_logits": velocity_logits,
+            "velocity_probs": velocity_probs,
         }
 
     return {
@@ -66,11 +72,17 @@ def _update_raw_outputs(
         "attack_time_probs": jnp.concatenate(
             [current["attack_time_probs"], attack_time_probs], axis=1
         ),
-        "durations": jnp.concatenate(
-            [current["durations"], durations], axis=1
+        "duration_logits": jnp.concatenate(
+            [current["duration_logits"], duration_logits], axis=1
         ),
-        "velocities": jnp.concatenate(
-            [current["velocities"], velocities], axis=1
+        "duration_probs": jnp.concatenate(
+            [current["duration_probs"], duration_probs], axis=1
+        ),
+        "velocity_logits": jnp.concatenate(
+            [current["velocity_logits"], velocity_logits], axis=1
+        ),
+        "velocity_probs": jnp.concatenate(
+            [current["velocity_probs"], velocity_probs], axis=1
         ),
     }
 
@@ -107,18 +119,20 @@ def batch_infer(
             jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16), (batch_size, padding_amount, 1)
         )
         padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
-        # jax.debug.print(
-        #     "Padded seen events {padded_seen_events}",
-        #     padded_seen_events=padded_seen_events,
-        # )
+        jax.debug.print(
+            "Padded seen events {padded_seen_events}",
+            padded_seen_events=padded_seen_events,
+        )
 
         (
             midi_logits,
             midi_probs,
             attack_time_logits,
             attack_time_probs,
-            raw_durations,
-            raw_velocities,
+            duration_logits,
+            duration_probs,
+            velocity_logits,
+            velocity_probs,
         ) = forward(
             model,
             frames,
@@ -144,16 +158,16 @@ def batch_infer(
         )
 
         durations = jnp.select(
-            [end_of_sequence_mask],
-            [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.round(jnp.sum(raw_durations, axis=-1)),
-        )
+             [end_of_sequence_mask],
+             [jnp.zeros((batch_size,), jnp.int16)],
+             jnp.argmax(duration_probs, axis=1),
+         )
 
         velocities = jnp.select(
-            [end_of_sequence_mask],
-            [jnp.zeros((batch_size,), jnp.int16)],
-            jnp.minimum(NUM_VELOCITY_CATEGORIES, jnp.round(jnp.sum(raw_velocities, axis=-1) * NUM_VELOCITY_CATEGORIES)),
-        )
+             [end_of_sequence_mask],
+             [jnp.zeros((batch_size,), jnp.int16)],
+             jnp.argmax(velocity_probs, axis=1),
+         )
 
         # Combine the predicted positions with their corresponding midi events
         predicted_events = jnp.transpose(

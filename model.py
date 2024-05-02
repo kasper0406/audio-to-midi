@@ -12,12 +12,18 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 128,
-    "intermediate_size": 128,
-    "num_heads": 2,
-    "num_layers": 4,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
+
+    "internal_channels": 3,
+    "time_kernel": 10,
+    "time_stride": 2,
+    "freq_kernel": 5,
+    "freq_stride": 3,
 }
 
 def get_model_metadata():
@@ -61,22 +67,16 @@ class FrameEmbedding(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
-        internal_channels = 5
-        time_kernel = 10
-        time_stride = 3
-        freq_kernel = 5
-        freq_stride = 3
-
         self.conv1 = eqx.nn.Conv2d(
             in_channels=1,
-            out_channels=internal_channels,
-            kernel_size=(time_kernel, freq_kernel),
-            stride=(time_stride, freq_stride),
+            out_channels=model_config["internal_channels"],
+            kernel_size=(model_config["time_kernel"], model_config["freq_kernel"]),
+            stride=(model_config["time_stride"], model_config["freq_stride"]),
             key=conv1_key)
         
-        new_height = int(self.frame_size / freq_stride)
+        new_height = int(self.frame_size / model_config["freq_stride"])
         self.conv2 = eqx.nn.Conv2d(
-            in_channels=internal_channels,
+            in_channels=model_config["internal_channels"],
             out_channels=output_shape,
             kernel_size=(1, new_height),
             stride=(1, 1),
@@ -573,13 +573,13 @@ class Decoder(eqx.Module):
 
         self.duration_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
-            out_features=1,
+            out_features=frame_seq_length,
             key=duration_pooling_key,
         )
 
         self.velocity_decoder_pooling = eqx.nn.Linear(
             in_features=attention_size,
-            out_features=1,
+            out_features=MidiVocabulary.num_velocities(),
             key=velocity_pooling_key,
         )
 
@@ -606,16 +606,25 @@ class Decoder(eqx.Module):
         )
         attack_time_probabilities = jax.nn.softmax(attack_time_logits)
 
-        duration = jax.nn.relu(self.duration_decoder_pooling(output, key=duration_decoder_key))
-        velocity = jax.nn.relu(self.velocity_decoder_pooling(output, key=velocity_decoder_key))
+        duration_logits = self.duration_decoder_pooling(
+            output, key=duration_decoder_key
+        )
+        duration_probabilities = jax.nn.softmax(duration_logits)
+
+        velocity_logits = self.velocity_decoder_pooling(
+            output, key=velocity_decoder_key
+        )
+        velocity_probabilities = jax.nn.softmax(velocity_logits)
 
         return (
             midi_logits,
             midi_probabilities,
             attack_time_logits,
             attack_time_probabilities,
-            duration,
-            velocity,
+            duration_logits,
+            duration_probabilities,
+            velocity_logits,
+            velocity_probabilities,
         )
 
 
