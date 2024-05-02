@@ -12,10 +12,10 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 256,
+    "intermediate_size": 256,
+    "num_heads": 2,
+    "num_layers": 8,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
@@ -92,6 +92,7 @@ class FrameEmbedding(eqx.Module):
         c1 = self.conv1(input_frames[jnp.newaxis, ...])
         c1 = jax.nn.gelu(c1)
         c1 = jax.nn.normalize(c1)
+
         # print(f"c1 shape = {c1.shape}")
         frame_embeddings = jnp.transpose(jnp.squeeze((self.conv2(c1))))
         frame_embeddings = jax.nn.gelu(frame_embeddings)

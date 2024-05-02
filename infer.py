@@ -148,6 +148,7 @@ def batch_infer(
 
         # Make sure the position is always monotonically increasing
         # TODO: Consider to throw a weighted dice with position_probs probabilities here?
+        # plot_prob_dist("Attack time", attack_time_probs[0])
         attack_times = jnp.maximum(
             seen_events[:, -1, 0], jnp.argmax(attack_time_probs, axis=1)
         )
@@ -157,12 +158,14 @@ def batch_infer(
             attack_times,
         )
 
+        # plot_prob_dist("Duration", duration_probs[0])
         durations = jnp.select(
              [end_of_sequence_mask],
              [jnp.zeros((batch_size,), jnp.int16)],
              jnp.argmax(duration_probs, axis=1),
          )
 
+        # plot_prob_dist("Velocity", velocity_probs[0])
         velocities = jnp.select(
              [end_of_sequence_mask],
              [jnp.zeros((batch_size,), jnp.int16)],
@@ -187,8 +190,10 @@ def batch_infer(
             midi_probs,
             attack_time_logits,
             attack_time_probs,
-            raw_durations,
-            raw_velocities,
+            duration_logits,
+            duration_probs,
+            velocity_logits,
+            velocity_probs,
         )
 
         end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
