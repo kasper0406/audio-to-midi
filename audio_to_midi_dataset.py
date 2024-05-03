@@ -34,11 +34,11 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.90
-COMPRESSION_FACTOR = 0.05
+SAMPLES_PER_FFT = 2 ** 13
+WINDOW_OVERLAP = 0.80
+COMPRESSION_FACTOR = 0.01
 FREQUENCY_CUTOFF = 4000
-LINEAR_SCALING = 30
+LINEAR_SCALING = 150
 
 def get_data_prep_config():
     return {
@@ -362,7 +362,7 @@ def generate_batch(
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 2 * FREQUENCY_CUTOFF # Sample rate to allow frequencies up to cutoff
+    SAMPLE_RATE = 44100
 
     def __init__(
         self,
@@ -698,7 +698,7 @@ def plot_frequency_domain_audio(
     ax1.xaxis.set_visible(False)
     fig.colorbar(c_left)
     ax1_twin = ax1.twiny()
-    ax1_twin.set_xlim(0, frames.shape[0])
+    ax1_twin.set_xlim(0, frames.shape[1])
     ax1_twin.set_xlabel("Frame count")
 
     ax2.set(
