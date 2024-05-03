@@ -36,9 +36,9 @@ FRAME_BLANK_VALUE = 0
 
 SAMPLES_PER_FFT = 2 ** 12
 WINDOW_OVERLAP = 0.90
-COMPRESSION_FACTOR = 1
+COMPRESSION_FACTOR = 0.05
 FREQUENCY_CUTOFF = 4000
-LINEAR_SCALING = 5
+LINEAR_SCALING = 30
 
 def get_data_prep_config():
     return {
@@ -850,7 +850,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands_small"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
         batch_size=1,
         prefetch_count=1,
         num_workers=1,

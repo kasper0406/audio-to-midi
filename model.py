@@ -12,18 +12,24 @@ from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, MIDI_EVENT_V
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 256,
-    "intermediate_size": 256,
-    "num_heads": 2,
-    "num_layers": 8,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
-    "internal_channels": 3,
-    "time_kernel": 10,
-    "time_stride": 2,
-    "freq_kernel": 5,
-    "freq_stride": 3,
+    "internal_channels_1": 3,
+    "time_kernel_1": 3,
+    "time_stride_1": 2,
+    "freq_kernel_1": 3,
+    "freq_stride_1": 2,
+
+    "internal_channels_2": 10,
+    "time_kernel_2": 2,
+    "time_stride_2": 1,
+    "freq_kernel_2": 3,
+    "freq_stride_2": 2,
 }
 
 def get_model_metadata():
@@ -44,6 +50,7 @@ class FrameEmbedding(eqx.Module):
     position_embedder: eqx.nn.Linear
     conv1: eqx.nn.Conv2d
     conv2: eqx.nn.Conv2d
+    conv3: eqx.nn.Conv2d
 
     def __init__(
         self,
@@ -54,7 +61,7 @@ class FrameEmbedding(eqx.Module):
         dropout_rate: float,
         key: PRNGKeyArray,
     ):
-        frame_key, pos_key, conv1_key, conv2_key = jax.random.split(key, num=4)
+        frame_key, pos_key, conv1_key, conv2_key, conv3_key = jax.random.split(key, num=5)
 
         self.frame_size = frame_size
         self.frame_normalizer = eqx.nn.LayerNorm(shape=output_shape)
@@ -69,18 +76,26 @@ class FrameEmbedding(eqx.Module):
 
         self.conv1 = eqx.nn.Conv2d(
             in_channels=1,
-            out_channels=model_config["internal_channels"],
-            kernel_size=(model_config["time_kernel"], model_config["freq_kernel"]),
-            stride=(model_config["time_stride"], model_config["freq_stride"]),
+            out_channels=model_config["internal_channels_1"],
+            kernel_size=(model_config["time_kernel_1"], model_config["freq_kernel_1"]),
+            stride=(model_config["time_stride_1"], model_config["freq_stride_1"]),
             key=conv1_key)
-        
-        new_height = int(self.frame_size / model_config["freq_stride"])
+
         self.conv2 = eqx.nn.Conv2d(
-            in_channels=model_config["internal_channels"],
+            in_channels=model_config["internal_channels_1"],
+            out_channels=model_config["internal_channels_2"],
+            kernel_size=(model_config["time_kernel_2"], model_config["freq_kernel_2"]),
+            stride=(model_config["time_stride_2"], model_config["freq_stride_2"]),
+            key=conv2_key)
+
+        new_height = int(int(((self.frame_size - (model_config["freq_kernel_1"] - model_config["freq_stride_1"])) / model_config["freq_stride_1"]) - (model_config["freq_kernel_2"] - model_config["freq_stride_2"])) / model_config["freq_stride_2"])
+        # print(f"New height {new_height}")
+        self.conv3 = eqx.nn.Conv2d(
+            in_channels=model_config["internal_channels_2"],
             out_channels=output_shape,
             kernel_size=(1, new_height),
             stride=(1, 1),
-            key=conv2_key)
+            key=conv3_key)
 
     def __call__(
         self,
@@ -92,11 +107,17 @@ class FrameEmbedding(eqx.Module):
         c1 = self.conv1(input_frames[jnp.newaxis, ...])
         c1 = jax.nn.gelu(c1)
         c1 = jax.nn.normalize(c1)
-
         # print(f"c1 shape = {c1.shape}")
-        frame_embeddings = jnp.transpose(jnp.squeeze((self.conv2(c1))))
+
+        c2 = self.conv2(c1)
+        c2 = jax.nn.gelu(c2)
+        c2 = jax.nn.normalize(c2)
+        # print(f"c2 shape = {c2.shape}")
+
+        frame_embeddings = jnp.transpose(jnp.squeeze((self.conv3(c2))))
         frame_embeddings = jax.nn.gelu(frame_embeddings)
         frame_embeddings = jax.nn.normalize(frame_embeddings)
+        # print(f"frame embeddings shape = {frame_embeddings.shape}")
 
         position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
 
