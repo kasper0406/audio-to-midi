@@ -620,21 +620,25 @@ class AudioToMidiDatasetLoader:
         return AudioToMidiDatasetLoader.load_audio_frames(filenames, sharding=sharding)
 
     @jax.jit
-    def _convert_samples(samples: Float[Array, "count samples"]):
+    def _convert_samples(samples: Float[Array, "count channel samples"]):
         # Pad the signals with half the window size on each side to make sure the center of the Hann
         # window hits the full signal.
         padding_width = int(SAMPLES_PER_FFT / 2)
-        padded_samples = jnp.pad(samples, ((0, 0), (padding_width, padding_width)), mode='constant', constant_values=0)
-        frames = jax.vmap(fft_audio, (0, None, None))(padded_samples, SAMPLES_PER_FFT, WINDOW_OVERLAP)
+        padded_samples = jnp.pad(samples, ((0, 0), (0,0), (padding_width, padding_width)), mode='constant', constant_values=0)
+        left_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 0, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
+        right_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 1, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
 
-        duration_per_frame = MAX_EVENT_TIMESTAMP / frames.shape[2]
+        duration_per_frame = MAX_EVENT_TIMESTAMP / left_frames.shape[2]
 
         # Select only the lowest FREQUENCY_CUTOFF frequencies
         frame_width_in_secs = SAMPLES_PER_FFT / AudioToMidiDatasetLoader.SAMPLE_RATE
         cutoff_frame = int(FREQUENCY_CUTOFF * frame_width_in_secs)
-        frames = frames[:, 0:cutoff_frame, :]
+        left_frames = left_frames[:, 0:cutoff_frame, :]
+        right_frames = right_frames[:, 0:cutoff_frame, :]
 
-        return jnp.transpose(frames, axes=(0, 2, 1)), duration_per_frame, frame_width_in_secs
+        # Make the frames on the form (batch, channel, temporal position, frequency)
+        frames = jnp.transpose(jnp.stack([left_frames, right_frames]), axes=(1, 0, 3, 2))
+        return frames, duration_per_frame, frame_width_in_secs
 
     @classmethod
     def load_sample_names(cls, dataset_dir: Path):
@@ -675,21 +679,36 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 def plot_frequency_domain_audio(
     sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32]
 ):
-    fig, ax1 = plt.subplots()
-    X = jnp.linspace(0.0, duration_per_frame * frames.shape[0], frames.shape[0])
-    Y = jnp.linspace(0.0, frames.shape[1] / frame_width, frames.shape[1])
-    c = ax1.pcolor(X, Y, jnp.transpose(frames))
+    fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1)
+
+    left_frames = frames[0]
+    X_left = jnp.linspace(0.0, duration_per_frame * left_frames.shape[0], left_frames.shape[0])
+    Y_left = jnp.linspace(0.0, left_frames.shape[1] / frame_width, left_frames.shape[1])
+    c_left = ax1.pcolor(X_left, Y_left, jnp.transpose(left_frames))
+
+    right_frames = frames[0]
+    X_right = jnp.linspace(0.0, duration_per_frame * right_frames.shape[0], right_frames.shape[0])
+    Y_right = jnp.linspace(0.0, right_frames.shape[1] / frame_width, right_frames.shape[1])
+    c_right = ax2.pcolor(X_right, Y_right, jnp.transpose(right_frames))
 
     ax1.set(
-        xlabel="Time [s]",
         ylabel="Frequency [Hz]",
         title=f"Audio signal in frequency-domain\n{sample_name}",
     )
-    fig.colorbar(c)
+    ax1.xaxis.set_visible(False)
+    fig.colorbar(c_left)
+    ax1_twin = ax1.twiny()
+    ax1_twin.set_xlim(0, frames.shape[0])
+    ax1_twin.set_xlabel("Frame count")
 
-    ax2 = ax1.twiny()
-    ax2.set_xlim(0, frames.shape[0])
-    ax2.set_xlabel("Frame count")
+    ax2.set(
+        xlabel="Time [s]",
+        ylabel="Frequency [Hz]",
+    )
+    fig.colorbar(c_right)
+
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.05, top=0.90, bottom=0.08)
 
 def plot_embedding(
     sample_name: str, embeddings: Float[Array, "frame_count embedding_size"]

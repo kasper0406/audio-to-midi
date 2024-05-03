@@ -110,7 +110,7 @@ fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> R
 
 #[derive(Debug)]
 enum AudioLoadingError {
-    IoError(std::io::Error),
+    IoError(std::io::Error, String),
     FfmpegError(i32),
     ParseSampleRateError(),
 }
@@ -118,7 +118,7 @@ impl std::error::Error for AudioLoadingError {}
 impl fmt::Display for AudioLoadingError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            AudioLoadingError::IoError(err) => write!(f, "IO error: {}", err),
+            AudioLoadingError::IoError(err, file) => write!(f, "IO error: {}, file: {}", err, file),
             AudioLoadingError::FfmpegError(status) => write!(f, "ffmpeg terminated with status: {}", status),
             AudioLoadingError::ParseSampleRateError() => write!(f, "failed to parse ffprobe sample rate"),
         }
@@ -141,65 +141,24 @@ async fn get_aac_sample_rate(input_file: &str) -> Result<f64, AudioLoadingError>
         .arg("quiet")
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(AudioLoadingError::IoError)?;
+        .map_err(|err| AudioLoadingError::IoError(err, String::from(input_file)))?;
 
     let stdout = process.stdout.take().expect("child did not have a handle to stdout");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    reader.read_line(&mut line).await.map_err(AudioLoadingError::IoError)?;
+    reader.read_line(&mut line).await.map_err(|err| AudioLoadingError::IoError(err, String::from(input_file)))?;
 
     let sample_rate: u32 =  line.trim().parse().map_err(|_err| AudioLoadingError::ParseSampleRateError())?;
 
-    process.wait().await.map_err(AudioLoadingError::IoError)?;
+    process.wait().await.map_err(|err| AudioLoadingError::IoError(err, String::from(input_file)))?;
     debug!["Obtained sample rate {} for {}", sample_rate, input_file];
     Ok(sample_rate as f64)
 }
 
-async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
-    // TODO: Consider sending back all audio channels
-    let mut command = Command::new("ffmpeg");
-    if let Some(max_duration) = maybe_max_duration {
-        command.arg("-t").arg(format!["{}", max_duration]);
-    }
-
-    let mut ffmpeg_audio_filter = String::from("pan=mono|c0=c0");
-    if is_aac_file(input_file) {
-        debug!["Processing aac file {}", input_file];
-        // Unfortunately aac conversion using ffmpeg adds a delay to the beginning of the audio
-        // I have found no easy way of removing this, so this is a hack to do it...
-        command.arg("-c:a").arg("aac");
-
-        let sample_rate = get_aac_sample_rate(input_file).await?;
-        let delay = (2 * 1024) as f64 / sample_rate; // 2 AAC frames of 1024 samples over the sample rate
-        debug!["Detecting AAC file, correcting with delay {}", delay];
-        ffmpeg_audio_filter.push_str(&format!(",atrim=start={}", delay));
-        debug!["Filter after: {}", ffmpeg_audio_filter];
-    }
-
-    command.arg("-i")
-        .arg(input_file)
-        .arg("-af")
-        .arg(ffmpeg_audio_filter)
-        .arg("-ar")
-        .arg(format!["{}", sample_rate])
-        .arg("-f")
-        .arg("f32le")
-        .arg(output_file)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    match command.status().await {
-        Ok(status) => {
-            if !status.success() {
-                return Err(AudioLoadingError::FfmpegError(status.code().unwrap_or(-1)));
-            }
-        }
-        Err(err) => return Err(AudioLoadingError::IoError(err)),
-    }
-
-    let mut file = File::open(output_file).await.map_err(AudioLoadingError::IoError)?;
+async fn read_samples_from_file(raw_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
+    let mut file = File::open(raw_file).await.map_err(|err| AudioLoadingError::IoError(err, String::from(raw_file)))?;
     let mut bytes = vec![];
-    file.read_to_end(&mut bytes).await.map_err(AudioLoadingError::IoError)?;
+    file.read_to_end(&mut bytes).await.map_err(|err| AudioLoadingError::IoError(err, String::from(raw_file)))?;
 
     let mut samples: Vec<_> = bytes.chunks_exact(4)
         .map(|chunk| {
@@ -217,21 +176,85 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, output_file: &str, sa
     Ok(samples)
 }
 
-async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: Option<f32>) -> Result<Vec<f32>, AudioLoadingError> {
-    let path = Path::new(file_path);
-    
-    let uuid = Uuid::new_v4();
-    let output_file = format!["/tmp/audio-to-midi-{}.raw", uuid];
-    
-    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &output_file, sample_rate, max_duration).await;
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+    // TODO: Consider sending back all audio channels
+    let mut command = Command::new("ffmpeg");
+    if let Some(max_duration) = maybe_max_duration {
+        command.arg("-t").arg(format!["{}", max_duration]);
+    }
 
-    tokio::fs::remove_file(output_file).await.map_err(AudioLoadingError::IoError)?;
+    let mut ffmpeg_audio_filter = String::from("[0:a]channelsplit=channel_layout=stereo[left][right]");
+    if is_aac_file(input_file) {
+        debug!["Processing aac file {}", input_file];
+        // Unfortunately aac conversion using ffmpeg adds a delay to the beginning of the audio
+        // I have found no easy way of removing this, so this is a hack to do it...
+        command.arg("-c:a").arg("aac");
+
+        let sample_rate = get_aac_sample_rate(input_file).await?;
+        let delay = (2 * 1024) as f64 / sample_rate; // 2 AAC frames of 1024 samples over the sample rate
+        debug!["Detecting AAC file, correcting with delay {}", delay];
+        ffmpeg_audio_filter.push_str(&format!("; [left]atrim=start={}[left]; [right]atrim=start={}[right]", delay, delay));
+        debug!["Filter after: {}", ffmpeg_audio_filter];
+    }
+
+    command.arg("-i")
+        .arg(input_file)
+        .arg("-filter_complex")
+        .arg(ffmpeg_audio_filter)
+
+         // Left channel mapping
+        .arg("-map")
+        .arg("[left]")
+        .arg("-ar")
+        .arg(format!["{}", sample_rate])
+        .arg("-f")
+        .arg("f32le")
+        .arg(left_output_file)
+
+        // Right channel mapping
+        .arg("-map")
+        .arg("[right]")
+        .arg("-ar")
+        .arg(format!["{}", sample_rate])
+        .arg("-f")
+        .arg("f32le")
+        .arg(right_output_file)
+
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    match command.status().await {
+        Ok(status) => {
+            if !status.success() {
+                return Err(AudioLoadingError::FfmpegError(status.code().unwrap_or(-1)));
+            }
+        }
+        Err(err) => return Err(AudioLoadingError::IoError(err, String::from(input_file))),
+    }
+
+    let left_samples = read_samples_from_file(left_output_file, sample_rate, maybe_max_duration);
+    let right_samples = read_samples_from_file(right_output_file, sample_rate, maybe_max_duration);
+
+    Ok((left_samples.await?, right_samples.await?))
+}
+
+async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: Option<f32>) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+    let uuid = Uuid::new_v4();
+    let left_output_file = format!["/tmp/audio-to-midi-{}_left.raw", uuid];
+    let right_output_file = format!["/tmp/audio-to-midi-{}_right.raw", uuid];
+    
+    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &left_output_file, &right_output_file, sample_rate, max_duration).await;
+
+    tokio::fs::remove_file(left_output_file.clone()).await
+        .map_err(|err| AudioLoadingError::IoError(err, String::from(left_output_file)))?;
+    tokio::fs::remove_file(right_output_file.clone()).await
+        .map_err(|err| AudioLoadingError::IoError(err, String::from(right_output_file)))?;
     audio_sampels
 }
 
 #[pyfunction]
-fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<PyArray1<f32>>> {
-    let samples = py.allow_threads(move || {
+fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<PyArray2<f32>>> {
+    let (left_samples, right_samples) = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
             let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate, None).await });
             match future.await {
@@ -248,7 +271,8 @@ fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<Py
         })
     }).unwrap();
 
-    Ok(samples.into_pyarray(py).to_owned())
+    let samples_vec = vec![left_samples, right_samples];
+    Ok(PyArray2::from_vec2(py, &samples_vec)?.to_owned())
 }
 
 async fn file_exists(file: &str) -> bool {
@@ -301,7 +325,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                 event_futures.push(event_future);
             }
 
-            let audio_samples: Vec<Vec<f32>> = join_all(audio_futures).await
+            let audio_samples: Vec<(Vec<f32>, Vec<f32>)> = join_all(audio_futures).await
                 .into_iter()
                 .map(|result| result.unwrap())
                 .map(|result| result.unwrap())
@@ -319,8 +343,9 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
     let mut audio_results = vec![];
     let mut event_results = vec![];
     let (all_audio_samples, all_events) = all_samples;
-    for (audio_samples, events) in all_audio_samples.into_iter().zip(all_events.into_iter()) {
-        let audio_array = audio_samples.into_pyarray(py).to_owned();
+    for ((left_samples, right_samples), events) in all_audio_samples.into_iter().zip(all_events.into_iter()) {
+        let samples_vec = vec![left_samples, right_samples];
+        let audio_array = PyArray2::from_vec2(py, &samples_vec)?.to_owned();
         audio_results.push(audio_array);
 
         let event_array = PyArray2::<u16>::zeros(py, [events.len(), 4], false);

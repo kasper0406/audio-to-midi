@@ -54,12 +54,12 @@ class FrameEmbedding(eqx.Module):
 
     def __init__(
         self,
-        # input_channels: int, # Always 1 for now, TODO consider 2 for stereo, 1 for mono
         output_shape: int,
         frame_size: int,  # Size of the processed audio frame
         max_frame_sequence_length: int,  # The maximum number of input frames
         dropout_rate: float,
         key: PRNGKeyArray,
+        input_channels=2,
     ):
         frame_key, pos_key, conv1_key, conv2_key, conv3_key = jax.random.split(key, num=5)
 
@@ -75,7 +75,7 @@ class FrameEmbedding(eqx.Module):
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
         self.conv1 = eqx.nn.Conv2d(
-            in_channels=1,
+            in_channels=input_channels,
             out_channels=model_config["internal_channels_1"],
             kernel_size=(model_config["time_kernel_1"], model_config["freq_kernel_1"]),
             stride=(model_config["time_stride_1"], model_config["freq_stride_1"]),
@@ -99,12 +99,12 @@ class FrameEmbedding(eqx.Module):
 
     def __call__(
         self,
-        input_frames: Float[Array, "seq_len frame_size"],
+        input_frames: Float[Array, "channels seq_len frame_size"],
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         # print(f"input_frames shape = {input_frames.shape}")
-        c1 = self.conv1(input_frames[jnp.newaxis, ...])
+        c1 = self.conv1(input_frames)
         c1 = jax.nn.gelu(c1)
         c1 = jax.nn.normalize(c1)
         # print(f"c1 shape = {c1.shape}")
