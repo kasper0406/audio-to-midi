@@ -12,10 +12,10 @@ from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 256,
-    "intermediate_size": 256,
-    "num_heads": 2,
-    "num_layers": 8,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
@@ -42,7 +42,6 @@ def get_model_metadata():
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
-    frame_normalizer: eqx.nn.LayerNorm
     frame_size: int
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
@@ -64,7 +63,6 @@ class FrameEmbedding(eqx.Module):
         frame_key, pos_key, conv1_key, conv2_key, conv3_key = jax.random.split(key, num=5)
 
         self.frame_size = frame_size
-        self.frame_normalizer = eqx.nn.LayerNorm(shape=output_shape)
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
@@ -122,7 +120,7 @@ class FrameEmbedding(eqx.Module):
         position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
 
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
-        return combined
+        return self.dropout(combined, inference=not enable_dropout, key=key)
 
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.

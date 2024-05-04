@@ -294,16 +294,25 @@ async fn resolve_audio_samples(sample_file: &str) -> String {
     panic!["Audio not found for sample: {}", sample_file];
 }
 
-fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<bool>> {
+fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f32>> {
     let num_event_types = 88;
-    let mut frames = vec![vec![false; num_event_types]; frame_count];
+    let base = 0.6;
+
+    let mut frames = vec![vec![0.0; num_event_types]; frame_count];
 
     // Currently this is not a perfect representation, if a key is released and then attacked very quickly thereafter
     // but that will be an issue for another day...
-    for (frame_start, key, frame_duration, _velocity) in events {
+    for (frame_start, key, frame_duration, velocity) in events {
+        let velocity_boost = ((*velocity as f32) / VELOCITY_CATEGORIES) / 2.25;
+        let start_strength = (base + velocity_boost).max(1.0);
+        let decay_function = |t: f32| -> f32 {
+            start_strength * (-0.05 * t).exp()
+        };
+
         let frame_end = ((*frame_start + *frame_duration) as usize).min(frame_count);
         for frame in (*frame_start as usize)..frame_end {
-            frames[frame][*key as usize] = true;
+            let t: f32 = frame as f32 - *frame_start as f32;
+            frames[frame][*key as usize] = decay_function(t);
         }
     }
 
@@ -345,7 +354,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                 .collect();
 
             let frame_count = (max_duration / duration_per_frame).round() as usize;
-            let events_by_frame: Vec<Vec<Vec<bool>>> = events.iter()
+            let events_by_frame: Vec<Vec<Vec<f32>>> = events.iter()
                 .map(|events| convert_to_frame_events(&events, frame_count))
                 .collect();
 
@@ -372,7 +381,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         let event_array: Py<PyArray2<u16>> = PyArray2::from_vec2(py, &converted_events)?.to_owned();
         event_results.push(event_array);
 
-        let converted_events_by_frame: Py<PyArray2<bool>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
+        let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
         events_by_frame_results.push(converted_events_by_frame);
     }
     Ok((
