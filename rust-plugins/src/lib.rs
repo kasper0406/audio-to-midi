@@ -301,7 +301,7 @@ fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<b
     // Currently this is not a perfect representation, if a key is released and then attacked very quickly thereafter
     // but that will be an issue for another day...
     for (frame_start, key, frame_duration, _velocity) in events {
-        let frame_end = ((*frame_start + *frame_duration - 1) as usize).min((frame_count - 1) as usize);
+        let frame_end = ((*frame_start + *frame_duration) as usize).min(frame_count);
         for frame in (*frame_start as usize)..frame_end {
             frames[frame][*key as usize] = true;
         }
