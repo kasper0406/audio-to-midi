@@ -77,6 +77,8 @@ def compute_loss_from_output(
         velocity_probs, expected_next_velocities
     )
 
+    optax.sigmoid_binary_cross_entropy()
+
     # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
     individual_losses = jnp.array([ midi_event_loss, attack_time_loss, duration_loss, velocity_loss ])
     return midi_event_loss + attack_time_loss + duration_loss + velocity_loss, individual_losses
