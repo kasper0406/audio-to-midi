@@ -235,9 +235,7 @@ class AudioToMidiDatasetLoader:
             selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
             selected_midi_events_human = jax.device_put(current_loaded_midi_events_human[indexes], self.sharding)
 
-            # Computing these selected samples in Python is super slow, and results in bottle necks
-            # during training. If this is really important, do it in Rust...
-            selected_sample_names = [ current_loaded_sample_names[i] for i in indexes ]
+            selected_sample_names = current_loaded_sample_names[indexes]
 
             batch = generate_batch(
                 batch_key,
@@ -313,6 +311,8 @@ class AudioToMidiDatasetLoader:
     def _load_random_samples(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
         picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
         midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width = self.load_samples(self.dataset_dir, picked_samples, minimum_midi_event_size, self.sharding)
+
+        picked_samples = np.asarray(picked_samples, dtype=object)
         return picked_samples, midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
 
     def _periodic_refresh_samples(
@@ -336,7 +336,7 @@ class AudioToMidiDatasetLoader:
                     current_sample_names = self.loaded_sample_names
 
                 # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-                sample_names, loaded_midi_events, loaded_midi_events_human, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events_human.shape[1])
+                loaded_sample_names, loaded_midi_events, loaded_midi_events_human, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events_human.shape[1])
 
                 current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
                 current_events = current_events[current_amount_to_evict:, ...]
@@ -363,7 +363,10 @@ class AudioToMidiDatasetLoader:
                     current_frames,
                     loaded_audio_frames,
                 ], axis=0)
-                new_sample_names = sample_names + current_sample_names[current_amount_to_evict:]
+                new_sample_names = np.concatenate([
+                    current_sample_names,
+                    loaded_sample_names,
+                ], axis=0)
 
                 with self.sample_load_lock:
                     self.loaded_midi_events = new_events
