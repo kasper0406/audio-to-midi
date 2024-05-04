@@ -1,9 +1,10 @@
 import argparse
 from pathlib import Path
 import jax
-from infer import load_newest_checkpoint, batch_infer
+import jax.numpy as jnp
+from infer import load_newest_checkpoint
 from train import compute_testset_loss, compute_testset_loss_individual
-from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding
+from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample
 import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='audio_to_midi a utility to convert piano audio files to midi events.')
@@ -50,9 +51,13 @@ if not args.validation:
             print(f"Embeddings shape: {embeddings.shape}")
             plot_embedding(str(audio_file), embeddings)
         plt.show(block=False)
-
-    events, metadata = batch_infer(audio_to_midi, key, frames)
-    print(f"Inferred midi events: {events}")
+    
+    infer_keys = jax.random.split(key, num=frames.shape[0])
+    logits, probs = jax.vmap(audio_to_midi)(frames, infer_keys)
+    for i in range(probs.shape[0]):
+        # TODO: Fix this hack!
+        foo = jnp.pad(probs[i], ((0, frames[i].shape[1] - probs[i].shape[0]), (0, 0)), 'constant', constant_values=0)
+        visualize_sample(args.path, frames[i], foo, None, duration_per_frame, frame_width)
 
 if args.validation:
     validation_dir = Path(args.path)
@@ -61,10 +66,9 @@ if args.validation:
         losses = compute_testset_loss_individual(audio_to_midi, validation_dir, key, sharding=None)
         for sample_name, losses in losses.items():
             loss = losses["loss"]
-            idv_loss = losses["individual_loss"]
-            print(f"{sample_name}\t{loss} {idv_loss}")
+            print(f"{sample_name}\t{loss}")
     else:
-        loss, idv_losses = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
-        print(f"Validation loss: {loss}, idv = {idv_losses}")
+        loss = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
+        print(f"Validation loss: {loss}")
 
 plt.show() # Wait for matplotlib

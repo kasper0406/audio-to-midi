@@ -10,22 +10,22 @@ import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
 model_config = {
-    "frame_size": 3715,
+    "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 256,
+    "intermediate_size": 256,
+    "num_heads": 2,
+    "num_layers": 8,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
-    "internal_channels_1": 3,
+    "internal_channels_1": 4,
     "time_kernel_1": 3,
     "time_stride_1": 1,
     "freq_kernel_1": 3,
     "freq_stride_1": 2,
 
-    "internal_channels_2": 10,
+    "internal_channels_2": 16,
     "time_kernel_2": 2,
     "time_stride_2": 1,
     "freq_kernel_2": 3,

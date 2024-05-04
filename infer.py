@@ -14,9 +14,6 @@ from audio_to_midi_dataset import (
     BLANK_MIDI_EVENT,
     BLANK_VELOCITY,
     BLANK_DURATION,
-    SEQUENCE_END,
-    SEQUENCE_START,
-    NUM_VELOCITY_CATEGORIES,
     AudioToMidiDatasetLoader,
     plot_frequency_domain_audio,
 )
@@ -85,123 +82,6 @@ def _update_raw_outputs(
             [current["velocity_probs"], velocity_probs], axis=1
         ),
     }
-
-
-def batch_infer(
-    model,
-    key: jax.random.PRNGKey,
-    frames: Float[Array, "batch_size frame_count"],
-    infer_limit: int = 50,
-):
-    batch_size = frames.shape[0]
-    seen_events = jnp.tile(
-        jnp.array([0, SEQUENCE_START, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16),
-        (batch_size, 1, 1),
-    )
-
-    i = 0
-    # This will be an all False array in the beginning. The mask is updated every step in the inference loop
-    end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
-        seen_events[:, -1, 1] == BLANK_MIDI_EVENT
-    )
-
-    raw_outputs = None
-
-    # TODO: Consider jitting the inside of this loop
-    padding_increment = 20
-    while (not jnp.all(end_of_sequence_mask)) and i < infer_limit:
-        inference_key, key = jax.random.split(key, num=2)
-
-        # Inference result should not change appending padding events!
-        # Use a padded version to avoid jax recompilations
-        padding_amount = (padding_increment - seen_events.shape[1]) % padding_increment
-        padding = jnp.tile(
-            jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16), (batch_size, padding_amount, 1)
-        )
-        padded_seen_events = jnp.concatenate([seen_events, padding], axis=1)
-        jax.debug.print(
-            "Padded seen events {padded_seen_events}",
-            padded_seen_events=padded_seen_events,
-        )
-
-        (
-            midi_logits,
-            midi_probs,
-            attack_time_logits,
-            attack_time_probs,
-            duration_logits,
-            duration_probs,
-            velocity_logits,
-            velocity_probs,
-        ) = forward(
-            model,
-            frames,
-            padded_seen_events,
-            inference_key,
-        )
-
-        notes = jnp.select(
-            [end_of_sequence_mask],
-            [jnp.tile(jnp.array(BLANK_MIDI_EVENT, dtype=jnp.int16), (batch_size,))],
-            jnp.argmax(midi_probs, axis=1),
-        )
-
-        # Make sure the position is always monotonically increasing
-        # TODO: Consider to throw a weighted dice with position_probs probabilities here?
-        # plot_prob_dist("Attack time", attack_time_probs[0])
-        attack_times = jnp.maximum(
-            seen_events[:, -1, 0], jnp.argmax(attack_time_probs, axis=1)
-        )
-        attack_times = jnp.select(
-            [end_of_sequence_mask],
-            [jnp.zeros((batch_size,), jnp.int16)],
-            attack_times,
-        )
-
-        # plot_prob_dist("Duration", duration_probs[0])
-        durations = jnp.select(
-             [end_of_sequence_mask],
-             [jnp.zeros((batch_size,), jnp.int16)],
-             jnp.argmax(duration_probs, axis=1),
-         )
-
-        # plot_prob_dist("Velocity", velocity_probs[0])
-        velocities = jnp.select(
-             [end_of_sequence_mask],
-             [jnp.zeros((batch_size,), jnp.int16)],
-             jnp.argmax(velocity_probs, axis=1),
-         )
-
-        # Combine the predicted positions with their corresponding midi events
-        predicted_events = jnp.transpose(
-            jnp.vstack([attack_times, notes, durations, velocities])
-        )
-
-        # Update seen events with the new predictions
-        seen_events = jnp.concatenate(
-            [seen_events, jnp.reshape(predicted_events, (batch_size, 1, 4))], axis=1
-        )
-        # print(f"Seen events at step {i}", seen_events)
-
-        # Update logits and probs
-        raw_outputs = _update_raw_outputs(
-            raw_outputs,
-            midi_logits,
-            midi_probs,
-            attack_time_logits,
-            attack_time_probs,
-            duration_logits,
-            duration_probs,
-            velocity_logits,
-            velocity_probs,
-        )
-
-        end_of_sequence_mask = (seen_events[:, -1, 1] == SEQUENCE_END) | (
-            seen_events[:, -1, 1] == BLANK_MIDI_EVENT
-        )
-        i += 1
-
-    return seen_events, raw_outputs
 
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):

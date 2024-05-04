@@ -32,10 +32,10 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 13
-WINDOW_OVERLAP = 0.80
+SAMPLES_PER_FFT = 2 ** 12
+WINDOW_OVERLAP = 0.90
 COMPRESSION_FACTOR = 1
-FREQUENCY_CUTOFF = 20000
+FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 5
 
 def get_data_prep_config():
@@ -147,7 +147,7 @@ def generate_batch(
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 44100
+    SAMPLE_RATE = 8000
 
     def __init__(
         self,
@@ -387,12 +387,12 @@ class AudioToMidiDatasetLoader:
         overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
 
         step = window_size - overlap
-        n_windows = math.ceil((audio_samples.shape[0] - overlap) / step)
+        n_windows = math.ceil((audio_samples.shape[1] - overlap) / step)
         windows = []
         for i in range(n_windows):
-            window_samples = audio_samples[i * step:i * step + window_size]
+            window_samples = audio_samples[:, i * step:i * step + window_size]
             # Make sure the window has the exact length (i.e. pad the last window if necessary)
-            window_samples = jnp.pad(window_samples, ((0,window_size - window_samples.shape[0])), constant_values=(0,))
+            window_samples = jnp.pad(window_samples, ((0,0), (0, window_size - window_samples.shape[1])), constant_values=(0,0))
             windows.append(window_samples)
         windowed = jnp.stack(windows)
         
@@ -503,11 +503,12 @@ def plot_frequency_domain_audio(
     ax1_twin.set_xlabel("Frame count")
 
     ax2.set_ylabel("Frequency [Hz]")
-    if events is None:
-        ax2.set_ylabel("Time [s]")
+    ax2.set_xlabel("Time [s]")        
     fig.colorbar(c_right)
 
     if events is not None:
+        ax2.xaxis.set_visible(False)
+
         X_events = jnp.linspace(0.0, duration_per_frame * left_frames.shape[0], left_frames.shape[0])
         Y_events = jnp.arange(MIDI_EVENT_VOCCAB_SIZE)
         c_events = ax3.pcolor(X_events, Y_events, jnp.transpose(events))
@@ -600,7 +601,8 @@ def visualize_sample(
     print("Frames shape:", frames.shape)
     print("Duration per frame:", duration_per_frame_in_secs)
     print("Frame width in seconds:", frame_width)
-    print(f"Human evnets: {_remove_zeros(events_human)}")
+    if events_human is not None:
+        print(f"Human evnets: {_remove_zeros(events_human)}")
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames, events=events)
     # plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
