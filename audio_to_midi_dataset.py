@@ -114,37 +114,6 @@ def fft_audio(
 
     return standardized_amplitudes
 
-@partial(jax.jit, static_argnames=["batch_size"])
-@partial(jax.profiler.annotate_function, name="audio_to_midi_generate_batch")
-def generate_batch(
-    key: jax.random.PRNGKey,
-    batch_size: int,
-    duration_per_frame_in_secs: float,
-    frame_width_in_secs: float,
-    selected_midi_events: Integer[Array, "batch_size frame_count midi_voccab_size"],
-    selected_midi_events_human: Integer[Array, "batch_size num_events 4"],
-    selected_audio_frames: Float[Array, "batch_size frames"],
-    selected_sample_names = None,
-):
-    (
-        key,
-        sample_key,
-    ) = jax.random.split(key, num=2)
-
-    sample_keys = jax.random.split(sample_key, num=batch_size)
-    selected_audio_frames = jax.vmap(perturb_audio_frames, (0, 0))(
-        selected_audio_frames, sample_keys
-    )
-
-    return {
-        "audio_frames": selected_audio_frames,
-        "events": selected_midi_events,
-        "events_human": selected_midi_events_human,
-        "duration_per_frame_in_secs": duration_per_frame_in_secs,
-        "frame_width_in_secs": frame_width_in_secs,
-        "sample_names": selected_sample_names,
-    }
-
 
 class AudioToMidiDatasetLoader:
     SAMPLE_RATE = 8000
@@ -154,10 +123,7 @@ class AudioToMidiDatasetLoader:
         dataset_dir: Path,
         batch_size: int,
         prefetch_count: int,
-        num_workers: int,
         key: jax.random.PRNGKey,
-        num_samples_to_load: int = 250,
-        num_samples_to_maintain: int = 5000,
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
@@ -177,22 +143,14 @@ class AudioToMidiDatasetLoader:
             ),
         )
 
-        self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
+        all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-        self.loaded_sample_names, self.loaded_midi_events, self.loaded_midi_events_human, self.loaded_audio_frames, self.duration_per_frame, self.frame_width = self._load_random_samples(
-            num_samples_to_load,
-            minimum_midi_event_size=128)
-        refresh_thread = threading.Thread(
-            target=partial(self._periodic_refresh_samples, num_samples_to_load=num_samples_to_load, num_samples_to_maintain=num_samples_to_maintain),
-            daemon=True,
-        )
-        self._threads.append(refresh_thread)
-        refresh_thread.start()
 
+        num_workers = 1
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._generate_batch, key=worker_keys[worker_id]),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id]),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -213,48 +171,7 @@ class AudioToMidiDatasetLoader:
                 yield self.queue.popleft()
             except IndexError:
                 print("WARNING: No elements in queue, should not really happen much...")
-                time.sleep(0.1)
-
-    def _generate_batch(self, key: jax.random.PRNGKey):
-        while not self._stop_event.is_set():
-            with self.sample_load_lock:
-                current_loaded_midi_events = self.loaded_midi_events
-                current_loaded_midi_events_human = self.loaded_midi_events_human
-                current_loaded_audio_samples = self.loaded_audio_frames
-                current_loaded_sample_names = self.loaded_sample_names
-
-            batch_key, indexes_key, key = jax.random.split(key, num=3)
-            indexes = jax.random.randint(
-                indexes_key,
-                shape=(self.batch_size,),
-                minval=0,
-                maxval=current_loaded_midi_events.shape[0],
-                dtype=jnp.int32,
-            )
-            selected_samples = jax.device_put(current_loaded_audio_samples[indexes], self.sharding)
-            selected_midi_events = jax.device_put(current_loaded_midi_events[indexes], self.sharding)
-            selected_midi_events_human = jax.device_put(current_loaded_midi_events_human[indexes], self.sharding)
-
-            selected_sample_names = current_loaded_sample_names[indexes]
-
-            batch = generate_batch(
-                batch_key,
-                self.batch_size,
-                self.duration_per_frame,
-                self.frame_width,
-                selected_midi_events,
-                selected_midi_events_human,
-                selected_samples,
-            )
-
-            # It is a bit hacky to inject this, but we can not send strings to JAX jit'ted functions
-            batch["sample_names"] = selected_sample_names
-
-            while len(self.queue) >= self.prefetch_count:
-                # print("Backing off, as the queue is full")
-                # Backoff mechanism
-                time.sleep(0.05)
-            self.queue.append(batch)
+                time.sleep(1.0)
 
     def _pad_and_stack_midi_events(unpadded_midi_events: Integer[Array, "length 4"], minimum_midi_event_size: Optional[int] = None):
         max_events_length = max([events.shape[0] for events in unpadded_midi_events])
@@ -308,71 +225,57 @@ class AudioToMidiDatasetLoader:
             raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
         return midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
 
-    def _load_random_samples(self, num_samples_to_load: int, minimum_midi_event_size: Optional[int] = None):
-        picked_samples = random.sample(self.all_sample_names, min(num_samples_to_load, len(self.all_sample_names)))
-        midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width = self.load_samples(self.dataset_dir, picked_samples, minimum_midi_event_size, self.sharding)
-
-        picked_samples = np.asarray(picked_samples, dtype=object)
-        return picked_samples, midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
-
-    def _periodic_refresh_samples(
+    def _data_load_thread(
         self,
-        num_samples_to_load: int,
-        num_samples_to_maintain: int,
-        sleep_time: int = 0.1 # seconds
+        all_sample_names: List[str],
+        batch_size: int,
+        key: jax.random.PRNGKey,
+        epochs: int = 1,
     ):
-        # TODO: Consider doing this in a way that preserves determinism
+        idx = 0
+        epoch = 0
+
+        # Shuffle all samples to make training see all kinds of data
+        key, shuffle_key = jax.random.split(key, num=2)
+        sample_name_mapping = jax.random.permutation(shuffle_key, len(all_sample_names))
+
         while True:
-            self._stop_event.wait(sleep_time)
             if self._stop_event.is_set():
                 return
+            
+            key, batch_key = jax.random.split(key, num=2)
+
+            # print(f"Loading index {idx} epoch {epoch}")
+            samples_to_load = list(all_sample_names[sample_name_mapping[idx:idx + batch_size]])
+            idx = idx + batch_size
+            if idx > len(all_sample_names):
+                idx = 0
+                epoch += 1
+
+                if epoch >= epochs:
+                    print(f"Stopping data loading because {epoch} epochs has been loaded")
+                    self._stop_event.set()
+                    return
 
             try:
-                with self.sample_load_lock:
-                    # Try to avoid unncessary JIT's due to different midi event lengths
-                    current_events = self.loaded_midi_events
-                    current_events_human = self.loaded_midi_events_human
-                    current_frames = self.loaded_audio_frames
-                    current_sample_names = self.loaded_sample_names
+                # print(f"Loading {len(samples_to_load)} samples")
+                # print(f"Actual samplpes: {samples_to_load}")
+                midi_events, midi_events_human, frames, dps, frame_width = self.load_samples(self.dataset_dir, samples_to_load, None, self.sharding)
 
-                # print(f"Loading {num_samples_to_load}, current size is {current_events.shape[0]}")
-                loaded_sample_names, loaded_midi_events, loaded_midi_events_human, loaded_audio_frames, _duration_per_frame, _frame_width = self._load_random_samples(num_samples_to_load, current_events_human.shape[1])
+                sample_keys = jax.random.split(batch_key, num=batch_size)
+                selected_audio_frames = jax.vmap(perturb_audio_frames)(frames, sample_keys)
 
-                current_amount_to_evict = max(0, num_samples_to_load - (num_samples_to_maintain - current_events.shape[0]))
-                current_events = current_events[current_amount_to_evict:, ...]
-                current_frames = current_frames[current_amount_to_evict:, ...]
-
-                # I am intentionally using `np` here and not `jnp` so the maintained frames are only on the host
-                blank_event = np.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=np.int16)
-                current_events_human = np.concatenate([ # Make sure there is sufficient edge padding on the current events
-                    current_events_human,
-                    np.repeat(
-                        np.repeat(blank_event[None, :], repeats=loaded_midi_events_human.shape[1] - current_events_human.shape[1], axis=0)[None, ...],
-                        repeats=current_events_human.shape[0], axis=0)
-                ], axis=1)
-
-                new_events = np.concatenate([
-                    current_events,
-                    loaded_midi_events,
-                ], axis=0)
-                new_events_human = np.concatenate([
-                    current_events_human,
-                    loaded_midi_events_human,
-                ], axis=0)
-                new_frames = np.concatenate([
-                    current_frames,
-                    loaded_audio_frames,
-                ], axis=0)
-                new_sample_names = np.concatenate([
-                    current_sample_names,
-                    loaded_sample_names,
-                ], axis=0)
-
-                with self.sample_load_lock:
-                    self.loaded_midi_events = new_events
-                    self.loaded_midi_events_human = new_events_human
-                    self.loaded_audio_frames = new_frames
-                    self.loaded_sample_names = new_sample_names
+                while len(self.queue) >= self.prefetch_count:
+                    # print("Backing off, as the queue is full")
+                    time.sleep(0.05)
+                self.queue.append({
+                    "audio_frames": selected_audio_frames,
+                    "events": midi_events,
+                    "events_human": midi_events_human,
+                    "duration_per_frame_in_secs": dps,
+                    "frame_width_in_secs": frame_width,
+                    "sample_names": samples_to_load,
+                })
             except CalculatedFrameDurationInvalid as e:
                 calc_dpf = e.calculated_dpf
                 actual_dpf = e.actual_dpf
@@ -455,7 +358,7 @@ class AudioToMidiDatasetLoader:
             csv_no_audio = label_names - audio_names
             raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
-        return list(sorted(audio_names))
+        return np.asarray(list(sorted(audio_names)), object)
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
@@ -608,72 +511,10 @@ def visualize_sample(
 
     plt.show()
 
-
-def benchmark():
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/v1")
-    with open('dataset_benchmark.csv', mode='w', buffering=1) as benchmark_file:
-        benchmark_csv = csv.writer(benchmark_file)
-
-        for batch_size in [32,64,128,256,512,1024,2048,4096,8192]:
-            for prefetch_count in [0,1,2,4,8]:
-                for num_workers in [1,2,4,8]:
-                    with AudioToMidiDatasetLoader(
-                        dataset_dir=dataset_dir,
-                        batch_size=batch_size,
-                        prefetch_count=prefetch_count,
-                        num_workers=num_workers,
-                        key=key,
-                    ) as dataset_loader:
-                        dataset_loader_iter = iter(dataset_loader)
-
-                        start_time = time.time()
-                        generated_samples = 0
-                        for num, loaded_batch in zip(range(0, 100), dataset_loader_iter):
-                            generated_samples += loaded_batch["audio_frames"].shape[0]
-                        finished_time = time.time()
-
-                        benchmark_csv.writerow([batch_size, prefetch_count, num_workers, generated_samples, finished_time - start_time])
-
-
 if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
-
-    # benchmark()
-
-    # sample_rate, samples = load_audio_and_normalize(
-    #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
-    # )
-    # sample_rate, samples = load_audio_and_normalize(
-    #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_108.aac"
-    # )
-    # duration_per_frame, frequency_domain = fft_audio(sample_rate, samples)
-    # duration_per_frame, frames = cleanup_fft_and_low_pass(
-    #     duration_per_frame, frequency_domain
-    # )
-
-    # plot_time_domain_audio(sample_rate, samples)
-    # plot_frequency_domain_audio(duration_per_frame, frames)
-
-    # plt.show()
-
-    # sample_rate, samples = load_audio_and_normalize(
-    #     "/Volumes/git/ml/datasets/midi-to-sound/v0/piano_YamahaC7_68.aac"
-    # )
-    # perturbed_sampels = perturb_audio_sample(samples, key)
-
-    # import sounddevice as sd
-
-    # sd.play(perturbed_sampels, sample_rate)
-    # sd.wait()
-
-    # test that it sounds right (requires ffplay, or pyaudio):
-    # from pydub.playback import play
-
-    # play(audio_segment)
-
-    # Test pretending we have multiple devices
 
     dataset_loader = AudioToMidiDatasetLoader(
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
@@ -681,12 +522,9 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
         dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
-        batch_size=1,
+        batch_size=4,
         prefetch_count=1,
-        num_workers=1,
         key=key,
-        num_samples_to_load=16,
-        num_samples_to_maintain=200,
     )
     dataset_loader_iter = iter(dataset_loader)
 

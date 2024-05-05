@@ -241,10 +241,6 @@ def main():
     checkpoint_every = 200
     checkpoints_to_keep = 3
     dataset_prefetch_count = 20
-    dataset_num_workers = 2
-
-    num_samples_to_load=16
-    num_samples_to_maintain=batch_size * 8
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
@@ -292,10 +288,7 @@ def main():
         dataset_dir=dataset_dir,
         batch_size=batch_size,
         prefetch_count=dataset_prefetch_count,
-        num_workers=dataset_num_workers,
         key=dataset_loader_key,
-        num_samples_to_load=num_samples_to_load,
-        num_samples_to_maintain=num_samples_to_maintain,
     )
     dataset_loader_iter = iter(dataset_loader)
 
