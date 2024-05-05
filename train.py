@@ -240,6 +240,7 @@ def main():
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
+    dataset_num_workers = 2
     dataset_prefetch_count = 20
 
     key = jax.random.PRNGKey(1234)
@@ -289,6 +290,7 @@ def main():
         batch_size=batch_size,
         prefetch_count=dataset_prefetch_count,
         key=dataset_loader_key,
+        num_workers=dataset_num_workers,
     )
     dataset_loader_iter = iter(dataset_loader)
 

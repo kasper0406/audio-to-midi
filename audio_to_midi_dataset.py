@@ -124,6 +124,7 @@ class AudioToMidiDatasetLoader:
         batch_size: int,
         prefetch_count: int,
         key: jax.random.PRNGKey,
+        num_workers: int = 1,
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
@@ -145,8 +146,6 @@ class AudioToMidiDatasetLoader:
 
         all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
 
-
-        num_workers = 1
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
@@ -173,29 +172,6 @@ class AudioToMidiDatasetLoader:
                 print("WARNING: No elements in queue, should not really happen much...")
                 time.sleep(1.0)
 
-    def _pad_and_stack_midi_events(unpadded_midi_events: Integer[Array, "length 4"], minimum_midi_event_size: Optional[int] = None):
-        max_events_length = max([events.shape[0] for events in unpadded_midi_events])
-        if minimum_midi_event_size is not None:
-            # We support extra padding to avoid JAX jit recompilations
-            max_events_length = max(max_events_length, minimum_midi_event_size)
-        padding = np.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=np.int16)[
-            None, :
-        ]
-        padded_midi_events = [
-            np.concatenate(
-                [
-                    events,
-                    np.repeat(
-                        padding, repeats=max_events_length - len(events), axis=0
-                    ),
-                ],
-                axis=0,
-            )
-            for events in unpadded_midi_events
-        ]
-        stacked_events = np.stack(padded_midi_events, axis=0)
-        return stacked_events
-
     @classmethod
     def load_samples(cls, dataset_dir: Path, samples: List[str], minimum_midi_event_size: Optional[int] = None, sharding = None):
         # We manually calculate the duration_per_frame vaiable here to be able to parallelize the event and sample loading
@@ -218,7 +194,6 @@ class AudioToMidiDatasetLoader:
         if required_padding > 0:
             frames = frames[:-required_padding, ...]
 
-        midi_events_human = AudioToMidiDatasetLoader._pad_and_stack_midi_events(midi_events_human, minimum_midi_event_size)
         midi_events = jnp.stack(midi_events)
 
         if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
