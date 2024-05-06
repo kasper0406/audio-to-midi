@@ -2,9 +2,9 @@ import argparse
 from pathlib import Path
 import jax
 import jax.numpy as jnp
-from infer import load_newest_checkpoint
+from infer import load_newest_checkpoint, forward
 from train import compute_testset_loss, compute_testset_loss_individual
-from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample
+from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description='audio_to_midi a utility to convert piano audio files to midi events.')
@@ -36,12 +36,9 @@ if not args.validation:
     if not audio_file.exists():
         raise f"The specified audio file {audio_file} does not exist!"
 
-    frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=0.5)
+    overlap = 0.5
+    frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
     print("Loaded samples")
-    if args.visualize_audio:
-        for frame in frames:
-            plot_frequency_domain_audio(str(audio_file), duration_per_frame, frame_width, frame)
-        plt.show(block=False)
 
     if args.visualize_audio_embeddings:
         # import code
@@ -52,12 +49,18 @@ if not args.validation:
             plot_embedding(str(audio_file), embeddings)
         plt.show(block=False)
     
-    infer_keys = jax.random.split(key, num=frames.shape[0])
-    logits, probs = jax.vmap(audio_to_midi)(frames, infer_keys)
-    for i in range(probs.shape[0]):
-        # TODO: Fix this hack!
-        foo = jnp.pad(probs[i], ((0, frames[i].shape[1] - probs[i].shape[0]), (0, 0)), 'constant', constant_values=0)
-        visualize_sample(args.path, frames[i], foo, None, duration_per_frame, frame_width)
+    individual_probs, stitched_probs = forward(audio_to_midi, frames, key, duration_per_frame, overlap=overlap)
+
+    if args.visualize_audio:
+        for i in range(individual_probs.shape[0]):
+            # TODO: Fix this hack!
+            padded_output = jnp.pad(individual_probs[i], ((0, frames[i].shape[1] - individual_probs[i].shape[0]), (0, 0)), 'constant', constant_values=0)
+            visualize_sample(args.path, frames[i], padded_output, None, duration_per_frame, frame_width)
+            plt.show(block=False)
+    
+    print(f"Stitched probs shape: {stitched_probs.shape}")
+    plot_output_probs(args.path, duration_per_frame, stitched_probs)
+    plt.show(block=False)
 
 if args.validation:
     validation_dir = Path(args.path)

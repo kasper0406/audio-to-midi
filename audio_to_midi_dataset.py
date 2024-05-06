@@ -353,7 +353,7 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 
 
 def plot_frequency_domain_audio(
-    sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32], events: Integer[Array, "frame_count midi_voccab_size"] = None
+    sample_name: str, duration_per_frame: float, frame_width: float, frames: NDArray[jnp.float32], events: Float[Array, "frame_count midi_voccab_size"] = None
 ):
     if events is None:
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1)
@@ -398,6 +398,22 @@ def plot_frequency_domain_audio(
 
     plt.tight_layout()
     plt.subplots_adjust(hspace=0.05, top=0.90, bottom=0.08)
+
+def plot_output_probs(sample_name: str, duration_per_frame: float, events: Float[Array, "frame_count midi_voccab_size"]):
+    fig, ax1 = plt.subplots()
+
+    X = jnp.linspace(0.0, duration_per_frame * events.shape[0], events.shape[0])
+    Y = jnp.arange(MIDI_EVENT_VOCCAB_SIZE)
+    c = ax1.pcolor(X, Y, jnp.transpose(events))
+    ax1.set(
+        xlabel="Time [s]",
+        ylabel="MIDI Event",
+    )
+    fig.colorbar(c)
+
+    ax1_twin = ax1.twiny()
+    ax1_twin.set_xlim(0, events.shape[0])
+    ax1_twin.set_xlabel("Frame count")
 
 def plot_embedding(
     sample_name: str, embeddings: Float[Array, "frame_count embedding_size"]
@@ -484,8 +500,6 @@ def visualize_sample(
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames, events=events)
     # plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
-    plt.show()
-
 if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
     jax.config.update("jax_threefry_partitionable", True)
@@ -525,3 +539,4 @@ if __name__ == "__main__":
             loaded_batch["duration_per_frame_in_secs"],
             loaded_batch["frame_width_in_secs"],
         )
+        plt.show(block=True)
