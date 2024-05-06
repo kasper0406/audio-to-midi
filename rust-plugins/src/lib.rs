@@ -2,7 +2,7 @@ use std::path::Path;
 use std::fmt;
 use std::str::EncodeUtf16;
 
-use numpy::{ PyArray2, PyArray3 };
+use numpy::{ PyArray2, PyArray3, PyReadonlyArray2 };
 use numpy::ToPyArray;
 use numpy::IntoPyArray;
 use pyo3::prelude::*;
@@ -34,6 +34,8 @@ struct EventRecord {
     key: u32,
     velocity: f32,
 }
+
+const NUM_EVENT_TYPES: usize = 88;
 
 fn key_to_event(key: u32) -> u32 {
     (key - 21) as u32
@@ -78,10 +80,7 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
         }
     }
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-
-    let mut events_with_padding: MidiEvents = vec![];
-    events_with_padding.append(&mut events);
-    Ok(events_with_padding)
+    Ok(events)
 }
 
 fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
@@ -295,10 +294,9 @@ async fn resolve_audio_samples(sample_file: &str) -> String {
 }
 
 fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f32>> {
-    let num_event_types = 88;
     let base = 0.6;
 
-    let mut frames = vec![vec![0.0; num_event_types]; frame_count];
+    let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; frame_count];
 
     // Currently this is not a perfect representation, if a key is released and then attacked very quickly thereafter
     // but that will be an issue for another day...
@@ -391,11 +389,83 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
     ))
 }
 
+#[pyfunction]
+fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
+    let activation_threshold = 0.5;
+    let deactivation_threshold = 0.2;
+
+    let mut events: MidiEvents = vec![];
+
+    let array = py_probs.as_ref(py).readonly();
+    let probs = array.as_array();
+
+    let duration = |end_frame: usize, start_frame: usize| -> u32 {
+        ((end_frame as i32) - (start_frame as i32) - 1).max(1) as u32
+    };
+
+    let velocity = |activation_prob: f32| -> u32 {
+        ((activation_prob - activation_threshold) * (1.0 / (1.0 - activation_threshold)) * VELOCITY_CATEGORIES).round() as u32
+    };
+    
+    let [num_frames, num_keys] = *probs.shape() else { todo!("Unsupported probs format") };
+    let mut currently_playing: Vec<Option<(usize, f32)>> = vec![None; num_keys];
+    for frame in 0..num_frames {
+        for key in 0..num_keys {
+            let get_activation_prob = || -> f32 {
+                let mut activation_prob = probs[(frame, key)];
+                for i in (frame + 1)..num_frames {
+                    if probs[(i, key)] > activation_prob {
+                        activation_prob = probs[(i, key)];
+                    } else {
+                        break;
+                    }
+                }
+                activation_prob
+            };
+
+            if probs[(frame, key)] > activation_threshold {
+                if let Some((started_at, activation_prob)) = currently_playing[key] {
+                    // Either the key is already playing, and we may have a re-activation
+                    if probs[(frame, key)] > activation_prob {
+                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob))); // Close the old event
+                        currently_playing[key] = Some((frame, get_activation_prob()));
+                    }
+                } else {
+                    // Otherwise it is not playing, and we should start playing
+                    currently_playing[key] = Some((frame, get_activation_prob()));
+                }
+            }
+
+            // Handle case where a currently playing note stopped playing
+            if let Some((started_at, activation_prob)) = currently_playing[key] {
+                if probs[(frame, key)] < deactivation_threshold {
+                    // Emit the event and stop playing
+                    events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob)));
+                    currently_playing[key] = None;
+                }
+            }
+        }
+    }
+
+    // There may be currently playing events we need to meit
+    for key in 0..num_keys {
+        if let Some((started_at, activation_prob)) = currently_playing[key] {
+            events.push((started_at as u32, key as u32, duration(num_frames, started_at), velocity(activation_prob)));
+            currently_playing[key] = None;
+        }
+    }
+
+    events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+
+    Ok(PyList::new(py, &events).into())
+}
+
 #[pymodule]
 fn rust_plugins(_py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::init();
 
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_events, m)?)?;
     Ok(())
 }
