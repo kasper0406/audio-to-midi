@@ -16,104 +16,46 @@ from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
 
-from audio_to_midi_dataset import BLANK_MIDI_EVENT, BLANK_VELOCITY, BLANK_DURATION, AudioToMidiDatasetLoader, get_active_events
-from model import OutputSequenceGenerator, model_config
+from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample
+from model import OutputSequenceGenerator, model_config, get_model_metadata
 
 @eqx.filter_jit
-def continous_probability_loss(probs, expected, variance):
-    """
-    Some kind of loss function that will promote having approximately correct positions / velocities
-
-    Assumption: The value of the integer `expected` should be in the range 0 <= expected <= probs.shape[0]!
-    """
-    epsilon = 0.0000001
-    x = jnp.arange(probs.shape[0])
-    expectation = -0.5 * jnp.square((x - expected) / variance)
-    expectation = jnp.maximum(
-        expectation, -10.0
-    )  # Below values of -10 we will assume the exponential will give 0
-    expectation = jnp.exp(expectation)
-    expectation = expectation / jnp.sum(expectation)
-    # jax.debug.print("Expectation: {expectation}", expectation=expectation)
-    return optax.kl_divergence(jnp.log(probs + epsilon), expectation)
+def compute_loss_from_output(logits, expected_output):
+    # TODO: Get rid of this hack!
+    #       This is due to the convolution shrinking the output logits.
+    #       This should be handled in a better way...
+    expected_output = expected_output[:logits.shape[0], ...]
+    loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+    return jnp.sum(loss)
 
 @eqx.filter_jit
-def duration_probability_loss(logits, probs, expected, variance):
-    # Compared to a `continous_probability_loss` we have a special case in that if the duration of
-    # the note is outside of what is indicated by the audio frame, we want a special duration
-    # of 0 predicted, meaning that the duration can not be fully trusted, and extends to the end
-    # of the current audio.
-    loss_if_zero_duration = optax.softmax_cross_entropy_with_integer_labels(
-        logits=logits, labels=jnp.array(expected, dtype=jnp.int16)
-    )
-
-    # Increase the variance proportional to the duration length squared, because pianos
-    # will usually decay their sound as time goes on, making it hard to predict exact
-    # durations for long note durations
-    duration_variance = variance + (expected / 20) ** 2
-    loss_otherwise = continous_probability_loss(probs[1:], expected - 1, duration_variance)
-    loss_otherwise += probs[0]
-
-    return jnp.select([expected == 0], [loss_if_zero_duration], loss_otherwise)
-
-@eqx.filter_jit
-def compute_loss_from_output(
-    midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
-):
-    expected_next_midi = expected_next_output[:, 1]
-    midi_event_loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits=midi_logits, labels=expected_next_midi
-    )
-
-    expected_attack_time = expected_next_output[:, 0]
-    attack_time_loss = jax.vmap(partial(continous_probability_loss, variance=3.0), (0, 0))(
-        attack_time_probs, expected_attack_time
-    )
-
-    expected_duration = expected_next_output[:, 2]
-    duration_loss = jax.vmap(partial(duration_probability_loss, variance=2.0), (0, 0, 0))(
-        duration_logits, duration_probs, expected_duration
-    )
-
-    expected_next_velocity = expected_next_output[:, 3]
-    velocity_loss = jax.vmap(partial(continous_probability_loss, variance=2.0), (0, 0))(
-        velocity_probs, expected_next_velocity
-    )
-
-    # TODO: Fix the weight on the position loss so it is not hard-coded, but part of the config
-    individual_losses = jnp.array([ midi_event_loss, attack_time_loss, duration_loss, velocity_loss ])
-    return midi_event_loss + 0.5 * (attack_time_loss + duration_loss) + 0.3 * velocity_loss, individual_losses
-
-
-@eqx.filter_jit
-@eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, audio_frames, outputs_so_far, expected_next_output, key):
+@eqx.filter_value_and_grad
+def compute_loss(model, audio_frames, expected_outputs, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
-                model, in_axes=(0, 0, 0, None)
-    )(audio_frames, outputs_so_far, batched_keys, True)
+    logits, probs = jax.vmap(
+        model, in_axes=(0, 0, None)
+    )(audio_frames, batched_keys, True)
 
-    loss, individual_losses = compute_loss_from_output(
-        midi_logits, attack_time_probs, duration_logits, duration_probs, velocity_probs, expected_next_output
-    )
-    return jnp.mean(loss), jnp.mean(individual_losses, axis=1)
-
+    loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
+    return jnp.mean(loss)
 
 @eqx.filter_jit
 def compute_training_step(
-    flat_model, audio_frames, outputs_so_far, next_output, flat_opt_state, key, tx,
+    flat_model, audio_frames, expected_outputs, flat_opt_state, key, tx,
     treedef_model, treedef_opt_state
 ):
     model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
     opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
+    # print(f"Audio frames shape: {audio_frames.shape}")
+    # print(f"Expected outputs shape: {expected_outputs.shape}")
+
     key, new_key = jax.random.split(key)
-    (loss, individual_losses), grads = compute_loss(
+    loss, grads = compute_loss(
         model,
         audio_frames=audio_frames,
-        outputs_so_far=outputs_so_far,
-        expected_next_output=next_output,
+        expected_outputs=expected_outputs,
         key=key,
     )
 
@@ -123,7 +65,7 @@ def compute_training_step(
     flat_update_model = jax.tree_util.tree_leaves(update_model)
     flat_update_opt_state = jax.tree_util.tree_leaves(update_opt_state)
 
-    return (loss, individual_losses), flat_update_model, flat_update_opt_state, new_key
+    return loss, flat_update_model, flat_update_opt_state, new_key
 
 
 @lru_cache(maxsize=1)
@@ -133,8 +75,8 @@ def load_test_set(testset_dir: Path, sharding, batch_size: int):
 
     batches = []
     for chunk in chunks:
-        midi_events, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
-        batches.append((frames, midi_events))
+        midi_events, _, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
+        batches.append((chunk, frames, midi_events))
     return batches
 
 @eqx.filter_jit
@@ -142,49 +84,34 @@ def compute_test_loss(
     model,
     key: jax.random.PRNGKey,
     audio_frames: Float[Array, "num_frames num_frame_data"],
-    midi_events: Float[Array, "max_events 4"]
+    midi_events: Float[Array, "num_frames midi_voccab_size"]
 ):
-    size = midi_events.shape[0] - 1 # Minus one because we do not pick the last event
-    mask = jnp.arange(size).reshape(1, size) <= jnp.arange(size).reshape(size, 1)
-    mask = jnp.repeat(mask[..., None], repeats=4, axis=2)
+    logits, probs = model(audio_frames, key)
+    return compute_loss_from_output(logits, midi_events)
 
-    blank_event = jnp.array([0, BLANK_MIDI_EVENT, BLANK_DURATION, BLANK_VELOCITY], dtype=jnp.int16)
-    # Do not pick the last element with the full sequence, as there is nothing to predict
-    event_prefixes = jnp.where(mask, midi_events[0:-1, ...], blank_event)
-
-    inference_keys = jax.random.split(key, num=event_prefixes.shape[0])
-    midi_logits, _, _, attack_time_probs, duration_logits, duration_probs, _, velocity_probs = jax.vmap(
-        model, (None, 0, 0)
-    )(audio_frames, event_prefixes, inference_keys)
-
-    losses, individual_losses = compute_loss_from_output(
-        midi_logits,
-        attack_time_probs,
-        duration_logits,
-        duration_probs,
-        velocity_probs,
-        midi_events[1:, ...], # Skip the start of sequence event, but include the end of sequence
-    )
-
-    # Blank out the losses obtained when the prediction should result in a blank event
-    actual_event_mask = midi_events[1:, 1] != BLANK_MIDI_EVENT
-    losses = jnp.select([actual_event_mask], [losses], 0.0)
-    return jnp.sum(losses) / jnp.count_nonzero(actual_event_mask)
-
-
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
     batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
 
-    test_loss = jnp.array([0.0], dtype=jnp.float32)
-    count = jnp.array(0, dtype=jnp.int32)
-    for frames, midi_events in batches:
+    loss_map = {}
+    for sample_names, frames, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=frames.shape[0])
         test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
-        test_loss += jnp.sum(test_losses)
-        count += test_losses.shape[0]
+        for sample_name, loss in zip(sample_names, test_losses):
+            loss_map[sample_name] = { "loss": loss }
 
     print("Finished evaluating test loss")
+    return loss_map
+
+def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model, testset_dir, key, sharding, batch_size)
+
+    test_loss = jnp.zeros((1,))
+    count = jnp.array(0, dtype=jnp.int32)
+    for losses in per_sample_map.values():
+        test_loss += losses["loss"]
+        count += 1
+
     return (test_loss / count)[0]
 
 
@@ -224,11 +151,10 @@ def train(
     flat_state, treedef_state = jax.tree_util.tree_flatten(state)
 
     loss_sum = jnp.array([0.0], dtype=jnp.float32)
-    idv_loss_sum = jnp.array([0.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
-        (audio_frames, seen_events, next_event) = jax.device_put(
-            (batch["audio_frames"], batch["seen_events"], batch["next_event"]),
+        (audio_frames, events) = jax.device_put(
+            (batch["audio_frames"], batch["events"]),
             batch_sharding,
         )
 
@@ -236,11 +162,10 @@ def train(
         recovery_flat_model = flat_model
         recovery_flat_state = flat_state
 
-        (loss, individual_losses), flat_model, flat_state, key = compute_training_step(
+        loss, flat_model, flat_state, key = compute_training_step(
             flat_model,
             audio_frames,
-            seen_events,
-            next_event,
+            events,
             flat_state,
             key,
             tx,
@@ -261,20 +186,17 @@ def train(
             checkpoint_manager.save(step, args=ocp.args.StandardSave(filtered_model))
 
         loss_sum = loss_sum + loss
-        idv_loss_sum = idv_loss_sum + individual_losses
 
         if step % print_every == 0 and step != 0:
             learning_rate = learning_rate_schedule(step)
 
             averaged_loss = (loss_sum / print_every)[0]
-            averaged_individual_losses = idv_loss_sum / print_every
 
             if trainloss_csv is not None:
                 trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
-            print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}, Idv.loss = {averaged_individual_losses}")
+            print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
 
             loss_sum = jnp.array([0.0], dtype=jnp.float32)
-            idv_loss_sum = jnp.array([0.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
 
         if step % testset_loss_every == 0 and testset_dir is not None:
             print("Evaluating test loss...")
@@ -312,17 +234,14 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 16 * num_devices
+    batch_size = 4 * num_devices
     num_steps = 1000000
     learning_rate_schedule = create_learning_rate_schedule(2.5 * 1e-4, 1000, num_steps)
 
     checkpoint_every = 200
     checkpoints_to_keep = 3
-    dataset_prefetch_count = 20
     dataset_num_workers = 2
-
-    num_samples_to_load=16
-    num_samples_to_maintain=batch_size * 8
+    dataset_prefetch_count = 20
 
     key = jax.random.PRNGKey(1234)
     model_init_key, training_key, dataset_loader_key = jax.random.split(key, num=3)
@@ -345,7 +264,9 @@ def main():
         max_to_keep=checkpoints_to_keep, save_interval_steps=checkpoint_every
     )
     checkpoint_manager = ocp.CheckpointManager(
-        checkpoint_path, options=checkpoint_options
+        checkpoint_path,
+        options=checkpoint_options,
+        metadata=get_model_metadata()
     )
 
     step_to_restore = checkpoint_manager.latest_step()
@@ -368,10 +289,8 @@ def main():
         dataset_dir=dataset_dir,
         batch_size=batch_size,
         prefetch_count=dataset_prefetch_count,
-        num_workers=dataset_num_workers,
         key=dataset_loader_key,
-        num_samples_to_load=num_samples_to_load,
-        num_samples_to_maintain=num_samples_to_maintain,
+        num_workers=dataset_num_workers,
     )
     dataset_loader_iter = iter(dataset_loader)
 
