@@ -406,7 +406,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
     let velocity = |activation_prob: f32| -> u32 {
         ((activation_prob - activation_threshold) * (1.0 / (1.0 - activation_threshold)) * VELOCITY_CATEGORIES).round() as u32
     };
-    
+
     let [num_frames, num_keys] = *probs.shape() else { todo!("Unsupported probs format") };
     let mut currently_playing: Vec<Option<(usize, f32)>> = vec![None; num_keys];
     for frame in 0..num_frames {

@@ -10,8 +10,12 @@ import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
 import numpy as np
+import mido
+from mido import MidiFile, MidiTrack, Message, MetaMessage
+import heapq
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     # Append a frame at the beginning with the start of the first frame to make the stitching
@@ -41,6 +45,44 @@ def forward(model, audio_frames, key, duration_per_frame: float, overlap=0.0):
     print(f"Hacked overlap: {hacked_overlap}")
     return probs, stitch_output_probs(probs, duration_per_frame, hacked_overlap)
 
+def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, output_file: str):
+    midi = MidiFile()
+    track = MidiTrack()
+    midi.tracks.append(track)
+
+    # TODO: Make a model that givne events predicts the time signature and tempo
+    #       For now we'll just denote everything as 4/4 in tempo 120.
+    tempo = 120
+    time_signature = (4, 4)
+
+    track.append(MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo)))
+    track.append(MetaMessage('time_signature', numerator=time_signature[0], denominator=time_signature[1], clocks_per_click=24, notated_32nd_notes_per_beat=8))
+
+    def frame_to_midi_time(frame: int):
+        seconds = frame * duration_per_frame
+        ticks_per_beat = midi.ticks_per_beat
+        microseconds_per_quarter_note = mido.bpm2tempo(tempo, time_signature)
+        return mido.second2tick(seconds, ticks_per_beat, microseconds_per_quarter_note)
+
+    # The actual midi events need to be specified with delta times, so first build the midi events
+    # out of order, then we will sort and emit delta times
+    out_of_order_midi_events = []
+    for attack_frame, key, duration_frame, velocity in events:
+        midi_time_attack = frame_to_midi_time(attack_frame)
+        midi_time_release = frame_to_midi_time(attack_frame + duration_frame)
+        midi_key = key + 21
+        midi_velocity = int(round((velocity / NUM_VELOCITY_CATEGORIES) * 127))
+
+        out_of_order_midi_events.append((midi_time_attack, 'note_on', midi_key, midi_velocity))
+        out_of_order_midi_events.append((midi_time_release, 'note_off', midi_key, midi_velocity))
+
+    current_time = 0
+    for time, event_type, key, velocity in sorted(out_of_order_midi_events):
+        delta_time = time - current_time
+        track.append(Message(event_type, note=key, velocity=velocity, time=delta_time))
+        current_time = time
+
+    midi.save(output_file)
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()

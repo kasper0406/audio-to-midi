@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import jax
 import jax.numpy as jnp
-from infer import load_newest_checkpoint, forward
+from infer import load_newest_checkpoint, forward, write_midi_file
 from train import compute_testset_loss, compute_testset_loss_individual
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
@@ -10,6 +10,7 @@ import rust_plugins
 
 parser = argparse.ArgumentParser(description='audio_to_midi a utility to convert piano audio files to midi events.')
 parser.add_argument('path', help='The path to the audio file or directory for validation')
+parser.add_argument('output', help='The output MIDI file', nargs='?')
 
 parser.add_argument('--visualize-audio',
     help='Visualize the audio samples and event probabilities using matplotlib',
@@ -63,7 +64,11 @@ if not args.validation:
     plot_output_probs(args.path, duration_per_frame, stitched_probs)
     plt.show(block=False)
 
-    print(rust_plugins.extract_events(stitched_probs))
+    events = rust_plugins.extract_events(stitched_probs)
+    if args.output:
+        print(f"Writing MIDI file to {args.output}")
+        write_midi_file(events, duration_per_frame, args.output)
+
 
 if args.validation:
     validation_dir = Path(args.path)
