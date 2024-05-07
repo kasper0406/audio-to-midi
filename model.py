@@ -79,17 +79,17 @@ class FrameEmbedding(eqx.Module):
         conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
         conv_height = frame_size
         conv_inputs = input_channels
-        for conv_sesttings, conv_key in zip(model_config["convolutions"], conv_keys):
+        for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
             self.convolutions.append(
                 eqx.nn.Conv2d(
                     in_channels=conv_inputs,
-                    out_channels=conv_sesttings["internal_channels"],
-                    kernel_size=(conv_sesttings["time_kernel"], conv_sesttings["freq_kernel"]),
-                    stride=(conv_sesttings["time_stride"], conv_sesttings["freq_stride"]),
+                    out_channels=conv_settings["internal_channels"],
+                    kernel_size=(conv_settings["time_kernel"], conv_settings["freq_kernel"]),
+                    stride=(conv_settings["time_stride"], conv_settings["freq_stride"]),
                     key=conv_key)
             )
-            conv_height = int((conv_height - (conv_sesttings["freq_kernel"] - conv_sesttings["freq_stride"])) / conv_sesttings["freq_stride"])
-            conv_inputs = conv_sesttings["internal_channels"]
+            conv_height = int((conv_height - (conv_settings["freq_kernel"] - conv_settings["freq_stride"])) / conv_settings["freq_stride"])
+            conv_inputs = conv_settings["internal_channels"]
 
         self.convolutions.append(
             eqx.nn.Conv2d(
