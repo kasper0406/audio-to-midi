@@ -291,6 +291,7 @@ def main():
         prefetch_count=dataset_prefetch_count,
         key=dataset_loader_key,
         num_workers=dataset_num_workers,
+        epochs=100000,
     )
     dataset_loader_iter = iter(dataset_loader)
 

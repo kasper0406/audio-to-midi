@@ -125,6 +125,7 @@ class AudioToMidiDatasetLoader:
         prefetch_count: int,
         key: jax.random.PRNGKey,
         num_workers: int = 1,
+        epochs: int = 1,
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
@@ -149,7 +150,7 @@ class AudioToMidiDatasetLoader:
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id]),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -226,6 +227,8 @@ class AudioToMidiDatasetLoader:
             if idx > len(all_sample_names):
                 idx = 0
                 epoch += 1
+
+                print("Starting epoch {epoch}")
 
                 if epoch >= epochs:
                     print(f"Stopping data loading because {epoch} epochs has been loaded")
