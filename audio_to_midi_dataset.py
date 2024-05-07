@@ -30,13 +30,12 @@ BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
 BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
-FRAME_BLANK_VALUE = 0
 
-SAMPLES_PER_FFT = 2 ** 12
+SAMPLES_PER_FFT = 2 ** 13
 WINDOW_OVERLAP = 0.90
-COMPRESSION_FACTOR = 1
-FREQUENCY_CUTOFF = 4000
-LINEAR_SCALING = 5
+COMPRESSION_FACTOR = 25
+FREQUENCY_CUTOFF = 8000
+LINEAR_SCALING = 125
 
 def get_data_prep_config():
     return {
@@ -100,23 +99,20 @@ def fft_audio(
 
     # Apply the FFT
     fft = jax.vmap(jnp.fft.rfft)(windows)
-    absolute_values = jnp.transpose(jnp.absolute(fft))
+    absolute_values = jnp.transpose(jnp.absolute(fft)) / LINEAR_SCALING
 
-    # Do a logaritmic compression to emulate human hearing
-    compressed_amplitudes = (
-       jnp.sign(absolute_values)
-       * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
-       / jnp.log1p(COMPRESSION_FACTOR)
-    )
+    if COMPRESSION_FACTOR is not None:
+        # Do a logaritmic compression to emulate human hearing
+        absolute_values = (jnp.sign(absolute_values)
+            * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
+            / jnp.log1p(COMPRESSION_FACTOR)
+        )
 
-    # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
-    standardized_amplitudes = (compressed_amplitudes + FRAME_BLANK_VALUE) / LINEAR_SCALING
-
-    return standardized_amplitudes
+    return absolute_values
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 8000
+    SAMPLE_RATE = 2 * FREQUENCY_CUTOFF
 
     def __init__(
         self,
