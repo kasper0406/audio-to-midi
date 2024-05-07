@@ -221,9 +221,10 @@ class AudioToMidiDatasetLoader:
             samples_to_load = list(all_sample_names[sample_name_mapping[idx:idx + batch_size]])
             idx = idx + batch_size
             if idx > len(all_sample_names):
-                leftover = batch_size - len(samples_to_load)
-                samples_to_load += all_sample_names[sample_name_mapping[0:leftover]]
-                idx = leftover
+                num_leftover = batch_size - len(samples_to_load)
+                leftovers = all_sample_names[sample_name_mapping[0:num_leftover]]
+                samples_to_load = jnp.concatenate([samples_to_load, leftovers])
+                idx = num_leftover
                 epoch += 1
 
                 print(f"Starting epoch {epoch}")
