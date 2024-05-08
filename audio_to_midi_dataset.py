@@ -33,7 +33,7 @@ NUM_VELOCITY_CATEGORIES = 10
 
 SAMPLES_PER_FFT = 2 ** 13
 WINDOW_OVERLAP = 0.90
-COMPRESSION_FACTOR = 25
+COMPRESSION_FACTOR = None
 FREQUENCY_CUTOFF = 8000
 LINEAR_SCALING = 125
 
@@ -222,8 +222,8 @@ class AudioToMidiDatasetLoader:
             idx = idx + batch_size
             if idx > len(all_sample_names):
                 num_leftover = batch_size - len(samples_to_load)
-                leftovers = all_sample_names[sample_name_mapping[0:num_leftover]]
-                samples_to_load = jnp.concatenate([samples_to_load, leftovers])
+                leftovers = list(all_sample_names[sample_name_mapping[0:num_leftover]])
+                samples_to_load += leftovers
                 idx = num_leftover
                 epoch += 1
 
