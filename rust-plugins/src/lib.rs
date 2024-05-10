@@ -35,7 +35,7 @@ struct EventRecord {
     velocity: f32,
 }
 
-const NUM_EVENT_TYPES: usize = 88;
+const NUM_EVENT_TYPES: usize = 90;
 
 fn key_to_event(key: u32) -> u32 {
     (key - 21) as u32
@@ -404,7 +404,15 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
     };
 
     let velocity = |activation_prob: f32| -> u32 {
-        ((activation_prob - activation_threshold) * (1.0 / (1.0 - activation_threshold)) * VELOCITY_CATEGORIES).round() as u32
+        // ((activation_prob - activation_threshold) * (1.0 / (1.0 - activation_threshold)) * VELOCITY_CATEGORIES).round() as u32
+        7
+    };
+    let decay_function = |activation_prob: f32, t: f32| -> f32 {
+        if t < 10.0 {
+            activation_prob
+        } else {
+            activation_prob * (-0.01 * t).exp()
+        }
     };
 
     let [num_frames, num_keys] = *probs.shape() else { todo!("Unsupported probs format") };
@@ -423,25 +431,31 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
                 activation_prob
             };
 
-            if probs[(frame, key)] > activation_threshold {
-                if let Some((started_at, activation_prob)) = currently_playing[key] {
-                    // Either the key is already playing, and we may have a re-activation
-                    if probs[(frame, key)] > activation_prob {
-                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob))); // Close the old event
-                        currently_playing[key] = Some((frame, get_activation_prob()));
-                    }
-                } else {
-                    // Otherwise it is not playing, and we should start playing
-                    currently_playing[key] = Some((frame, get_activation_prob()));
-                }
-            }
-
             // Handle case where a currently playing note stopped playing
             if let Some((started_at, activation_prob)) = currently_playing[key] {
                 if probs[(frame, key)] < deactivation_threshold {
                     // Emit the event and stop playing
                     events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob)));
                     currently_playing[key] = None;
+                }
+            }
+
+            if frame + 1 < num_frames && probs[(frame, key)] < probs[(frame + 1, key)] {
+                // We will handle this key in the next frame
+                continue
+            }
+
+            if probs[(frame, key)] > activation_threshold {
+                if let Some((started_at, activation_prob)) = currently_playing[key] {
+                    // Either the key is already playing, and we may have a re-activation
+                    let time_since_activation = frame as f32 - started_at as f32;
+                    if probs[(frame, key)] > decay_function(activation_prob, time_since_activation) {
+                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob))); // Close the old event
+                        currently_playing[key] = Some((frame, get_activation_prob()));
+                    }
+                } else {
+                    // Otherwise it is not playing, and we should start playing
+                    currently_playing[key] = Some((frame, get_activation_prob()));
                 }
             }
         }

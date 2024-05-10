@@ -31,7 +31,7 @@ key = jax.random.PRNGKey(1234)
 current_directory = Path(__file__).resolve().parent
 
 checkpoint_path = current_directory / "audio_to_midi_checkpoints"
-audio_to_midi = load_newest_checkpoint(checkpoint_path)
+audio_to_midi, state = load_newest_checkpoint(checkpoint_path)
 
 if not args.validation:
     audio_file = Path(args.path)
@@ -51,7 +51,7 @@ if not args.validation:
             plot_embedding(str(audio_file), embeddings)
         plt.show(block=False)
     
-    individual_probs, stitched_probs = forward(audio_to_midi, frames, key, duration_per_frame, overlap=overlap)
+    individual_probs, stitched_probs = forward(audio_to_midi, state, frames, key, duration_per_frame, overlap=overlap)
 
     if args.visualize_audio:
         for i in range(individual_probs.shape[0]):
@@ -74,12 +74,12 @@ if args.validation:
     validation_dir = Path(args.path)
 
     if args.individual:
-        losses = compute_testset_loss_individual(audio_to_midi, validation_dir, key, sharding=None)
+        losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, key, sharding=None)
         for sample_name, losses in losses.items():
             loss = losses["loss"]
             print(f"{sample_name}\t{loss}")
     else:
-        loss = compute_testset_loss(audio_to_midi, validation_dir, key, sharding=None)
+        loss = compute_testset_loss(audio_to_midi, state, validation_dir, key, sharding=None)
         print(f"Validation loss: {loss}")
 
 plt.show() # Wait for matplotlib

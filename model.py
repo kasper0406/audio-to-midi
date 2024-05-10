@@ -10,26 +10,26 @@ import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
 model_config = {
-    "frame_size": 4096,
+    "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 512,
+    "intermediate_size": 1024,
+    "num_heads": 4,
+    "num_layers": 10,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
     "convolutions": [
         {
             "internal_channels": 2,
-            "time_kernel": 4,
+            "time_kernel": 2,
             "time_stride": 1,
             "freq_kernel": 3,
             "freq_stride": 1,
         },
         {
             "internal_channels": 4,
-            "time_kernel": 4,
+            "time_kernel": 3,
             "time_stride": 1,
             "freq_kernel": 3,
             "freq_stride": 2,
@@ -38,7 +38,7 @@ model_config = {
             "internal_channels": 6,
             "time_kernel": 4,
             "time_stride": 1,
-            "freq_kernel": 3,
+            "freq_kernel": 4,
             "freq_stride": 2,
         }
     ],
@@ -96,7 +96,7 @@ class FrameEmbedding(eqx.Module):
                     padding=(int(conv_settings["time_kernel"] / 2) - 1, int(conv_settings["freq_kernel"] / 2)),
                     key=conv_key)
             )
-            self.layers.append(jax.nn.relu)
+            self.layers.append(jax.nn.gelu)
             self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
 
             conv_height = int(conv_height / conv_settings["freq_stride"])
@@ -113,7 +113,7 @@ class FrameEmbedding(eqx.Module):
                 key=output_conv_key
             )
         )
-        self.layers.append(jax.nn.relu)
+        self.layers.append(jax.nn.gelu)
         self.layers.append(eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch"))
         self.layers.append(jax.nn.tanh)
 

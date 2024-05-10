@@ -35,9 +35,9 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
 
     return output
 
-def forward(model, audio_frames, key, duration_per_frame: float, overlap=0.0):
+def forward(model, state, audio_frames, key, duration_per_frame: float, overlap=0.0):
     inference_keys = jax.random.split(key, num=audio_frames.shape[0])
-    _logits, probs = jax.vmap(model)(audio_frames, inference_keys)
+    (_logits, probs), _state = jax.vmap(model, in_axes=(0, None, 0), out_axes=(0, None))(audio_frames, state, inference_keys)
 
     # HACK: Get rid of this!
     #       Currently we train the model to not output the last three frames, so the overlap will be different
@@ -101,8 +101,8 @@ def load_newest_checkpoint(checkpoint_path: Path):
 
     # The randomness does not matter as we will load a checkpoint model anyways
     key = jax.random.PRNGKey(1234)
-    audio_to_midi = OutputSequenceGenerator(model_config, key)
-    checkpoint_manager = ocp.CheckpointManager(checkpoint_path)
+    audio_to_midi, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
+    checkpoint_manager = ocp.CheckpointManager(checkpoint_path, item_names=('params', 'state'))
 
     step_to_restore = checkpoint_manager.latest_step()
     if step_to_restore is None:
@@ -110,14 +110,21 @@ def load_newest_checkpoint(checkpoint_path: Path):
     else:
         current_metadata = get_model_metadata()
         if current_metadata != checkpoint_manager.metadata():
-            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}, but current configuration is {current_metadata}")
+            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}")
+            print(f"Current configuration is {current_metadata}")
 
     print(f"Restoring saved model at step {step_to_restore}")
     model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-    model_params = checkpoint_manager.restore(
+    restored_map = checkpoint_manager.restore(
         step_to_restore,
-        args=ocp.args.StandardRestore(model_params),
+        args=ocp.args.Composite(
+            params=ocp.args.StandardRestore(model_params),
+            state=ocp.args.StandardRestore(state),
+        ),
     )
+    model_params = restored_map["params"]
+    state = restored_map["state"]
+    
     audio_to_midi = eqx.combine(model_params, static_model)
 
     # Replicate the model on all JAX devices
@@ -129,7 +136,8 @@ def load_newest_checkpoint(checkpoint_path: Path):
     model_params = jax.device_put(model_params, replicate_everywhere)
     audio_to_midi = eqx.combine(model_params, static_model)
 
-    return audio_to_midi
+    audio_to_midi = eqx.nn.inference_mode(audio_to_midi)
+    return audio_to_midi, state
 
 def main():
     return
