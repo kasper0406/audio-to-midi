@@ -13,23 +13,35 @@ model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
     "attention_size": 512,
-    "intermediate_size": 512,
+    "intermediate_size": 1024,
     "num_heads": 4,
-    "num_layers": 8,
+    "num_layers": 10,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
-    "internal_channels_1": 5,
-    "time_kernel_1": 3,
-    "time_stride_1": 1,
-    "freq_kernel_1": 3,
-    "freq_stride_1": 2,
-
-    "internal_channels_2": 16,
-    "time_kernel_2": 2,
-    "time_stride_2": 1,
-    "freq_kernel_2": 3,
-    "freq_stride_2": 2,
+    "convolutions": [
+        {
+            "internal_channels": 2,
+            "time_kernel": 2,
+            "time_stride": 1,
+            "freq_kernel": 3,
+            "freq_stride": 1,
+        },
+        {
+            "internal_channels": 4,
+            "time_kernel": 3,
+            "time_stride": 1,
+            "freq_kernel": 3,
+            "freq_stride": 2,
+        },
+        {
+            "internal_channels": 6,
+            "time_kernel": 4,
+            "time_stride": 1,
+            "freq_kernel": 4,
+            "freq_stride": 2,
+        }
+    ],
 }
 
 def get_model_metadata():
@@ -47,9 +59,7 @@ class FrameEmbedding(eqx.Module):
     position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
     position_embedder: eqx.nn.Linear
-    conv1: eqx.nn.Conv2d
-    conv2: eqx.nn.Conv2d
-    conv3: eqx.nn.Conv2d
+    layers: [eqx.Module]
 
     def __init__(
         self,
@@ -60,7 +70,7 @@ class FrameEmbedding(eqx.Module):
         key: PRNGKeyArray,
         input_channels=2,
     ):
-        frame_key, pos_key, conv1_key, conv2_key, conv3_key = jax.random.split(key, num=5)
+        pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
 
         self.frame_size = frame_size
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
@@ -72,55 +82,64 @@ class FrameEmbedding(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
-        self.conv1 = eqx.nn.Conv2d(
-            in_channels=input_channels,
-            out_channels=model_config["internal_channels_1"],
-            kernel_size=(model_config["time_kernel_1"], model_config["freq_kernel_1"]),
-            stride=(model_config["time_stride_1"], model_config["freq_stride_1"]),
-            key=conv1_key)
+        self.layers = []
+        conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
+        conv_height = frame_size
+        conv_inputs = input_channels
+        for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
+            self.layers.append(
+                eqx.nn.Conv2d(
+                    in_channels=conv_inputs,
+                    out_channels=conv_settings["internal_channels"],
+                    kernel_size=(conv_settings["time_kernel"], conv_settings["freq_kernel"]),
+                    stride=(conv_settings["time_stride"], conv_settings["freq_stride"]),
+                    padding=(int(conv_settings["time_kernel"] / 2) - 1, int(conv_settings["freq_kernel"] / 2)),
+                    key=conv_key)
+            )
+            self.layers.append(jax.nn.gelu)
+            self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
 
-        self.conv2 = eqx.nn.Conv2d(
-            in_channels=model_config["internal_channels_1"],
-            out_channels=model_config["internal_channels_2"],
-            kernel_size=(model_config["time_kernel_2"], model_config["freq_kernel_2"]),
-            stride=(model_config["time_stride_2"], model_config["freq_stride_2"]),
-            key=conv2_key)
+            conv_height = int(conv_height / conv_settings["freq_stride"])
+            conv_inputs = conv_settings["internal_channels"]
+            # print(f"Conv height: {conv_height}")
 
-        new_height = int(int(((self.frame_size - (model_config["freq_kernel_1"] - model_config["freq_stride_1"])) / model_config["freq_stride_1"]) - (model_config["freq_kernel_2"] - model_config["freq_stride_2"])) / model_config["freq_stride_2"])
-        # print(f"New height {new_height}")
-        self.conv3 = eqx.nn.Conv2d(
-            in_channels=model_config["internal_channels_2"],
-            out_channels=output_shape,
-            kernel_size=(1, new_height),
-            stride=(1, 1),
-            key=conv3_key)
+        self.layers.append(
+            eqx.nn.Conv2d(
+                in_channels=conv_inputs,
+                out_channels=output_shape,
+                kernel_size=(1, conv_height),
+                stride=(1, conv_height),
+                padding=0,
+                key=output_conv_key
+            )
+        )
+        self.layers.append(jax.nn.gelu)
+        self.layers.append(eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch"))
+        self.layers.append(jax.nn.tanh)
 
     def __call__(
         self,
         input_frames: Float[Array, "channels seq_len frame_size"],
+        state,
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        # print(f"input_frames shape = {input_frames.shape}")
-        c1 = self.conv1(input_frames)
-        c1 = jax.nn.gelu(c1)
-        c1 = jax.nn.normalize(c1)
-        # print(f"c1 shape = {c1.shape}")
+        frame_embeddings = input_frames
+        for layer in self.layers:
+            # print(f"Frame embedding shape: {frame_embeddings.shape}")
+            if isinstance(layer, eqx.nn.BatchNorm):
+                frame_embeddings, state = layer(frame_embeddings, state, inference=not enable_dropout)
+            else:
+                frame_embeddings = layer(frame_embeddings)
 
-        c2 = self.conv2(c1)
-        c2 = jax.nn.gelu(c2)
-        c2 = jax.nn.normalize(c2)
-        # print(f"c2 shape = {c2.shape}")
-
-        frame_embeddings = jnp.transpose(jnp.squeeze((self.conv3(c2))))
-        frame_embeddings = jax.nn.gelu(frame_embeddings)
-        frame_embeddings = jax.nn.normalize(frame_embeddings)
-        # print(f"frame embeddings shape = {frame_embeddings.shape}")
+        # Make the last layer fit what we need for the transformer
+        frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))
+        # print(f"Frame embeddings shape: {frame_embeddings.shape}")
 
         position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
 
         combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
-        return self.dropout(combined, inference=not enable_dropout, key=key)
+        return self.dropout(combined, inference=not enable_dropout, key=key), state
 
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
@@ -461,13 +480,14 @@ class OutputSequenceGenerator(eqx.Module):
     def __call__(
         self,
         input_frames: Float[Array, "frame_seq_len frame_size"],
+        state,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
         event_processor_key, frame_embedding_key, decoder_key, dropout_key = jax.random.split(key, num=4)
 
-        frame_embeddings = self.frame_embedding(
-            input_frames, enable_dropout=enable_dropout, key=frame_embedding_key
+        frame_embeddings, state = self.frame_embedding(
+            input_frames, state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
         mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int8)
 
@@ -477,7 +497,7 @@ class OutputSequenceGenerator(eqx.Module):
             enable_dropout=enable_dropout,
             key=event_processor_key,
         )
-        # output = jnp.tanh(output)
+        output = jnp.tanh(output)
         output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
-        return self.decoder(output, decoder_key)
+        return self.decoder(output, decoder_key), state

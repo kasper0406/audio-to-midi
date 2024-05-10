@@ -22,7 +22,7 @@ import math
 import rust_plugins
 
 # TODO: Clean this up
-MIDI_EVENT_VOCCAB_SIZE = 88
+MIDI_EVENT_VOCCAB_SIZE = 90
 
 MAX_EVENT_TIMESTAMP = 5.0
 ACTIVE_EVENT_SEPARATOR = 2
@@ -30,13 +30,12 @@ BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
 BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
-FRAME_BLANK_VALUE = 0
 
 SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.90
+WINDOW_OVERLAP = 0.95
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
-LINEAR_SCALING = 5
+LINEAR_SCALING = 180
 
 def get_data_prep_config():
     return {
@@ -100,23 +99,20 @@ def fft_audio(
 
     # Apply the FFT
     fft = jax.vmap(jnp.fft.rfft)(windows)
-    absolute_values = jnp.transpose(jnp.absolute(fft))
+    absolute_values = jnp.transpose(jnp.absolute(fft)) / LINEAR_SCALING
 
-    # Do a logaritmic compression to emulate human hearing
-    compressed_amplitudes = (
-       jnp.sign(absolute_values)
-       * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
-       / jnp.log1p(COMPRESSION_FACTOR)
-    )
+    if COMPRESSION_FACTOR is not None:
+        # Do a logaritmic compression to emulate human hearing
+        absolute_values = (jnp.sign(absolute_values)
+            * jnp.log1p(COMPRESSION_FACTOR * jnp.abs(absolute_values))
+            / jnp.log1p(COMPRESSION_FACTOR)
+        )
 
-    # Normalize the coefficients to give them closer to 0 mean based on some heuristic guided by the compression
-    standardized_amplitudes = (compressed_amplitudes + FRAME_BLANK_VALUE) / LINEAR_SCALING
-
-    return standardized_amplitudes
+    return absolute_values
 
 
 class AudioToMidiDatasetLoader:
-    SAMPLE_RATE = 8000
+    SAMPLE_RATE = 2 * FREQUENCY_CUTOFF
 
     def __init__(
         self,
@@ -125,6 +121,7 @@ class AudioToMidiDatasetLoader:
         prefetch_count: int,
         key: jax.random.PRNGKey,
         num_workers: int = 1,
+        epochs: int = 1,
     ):
         self.dataset_dir = dataset_dir
         self.batch_size = batch_size
@@ -149,7 +146,7 @@ class AudioToMidiDatasetLoader:
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id]),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -224,8 +221,13 @@ class AudioToMidiDatasetLoader:
             samples_to_load = list(all_sample_names[sample_name_mapping[idx:idx + batch_size]])
             idx = idx + batch_size
             if idx > len(all_sample_names):
-                idx = 0
+                num_leftover = batch_size - len(samples_to_load)
+                leftovers = list(all_sample_names[sample_name_mapping[0:num_leftover]])
+                samples_to_load += leftovers
+                idx = num_leftover
                 epoch += 1
+
+                print(f"Starting epoch {epoch}")
 
                 if epoch >= epochs:
                     print(f"Stopping data loading because {epoch} epochs has been loaded")

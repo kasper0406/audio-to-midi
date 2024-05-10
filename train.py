@@ -29,31 +29,28 @@ def compute_loss_from_output(logits, expected_output):
     return jnp.sum(loss)
 
 @eqx.filter_jit
-@eqx.filter_value_and_grad
-def compute_loss(model, audio_frames, expected_outputs, key):
+@eqx.filter_value_and_grad(has_aux=True)
+def compute_loss(model, state, audio_frames, expected_outputs, key):
     batch_size = audio_frames.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    logits, probs = jax.vmap(
-        model, in_axes=(0, 0, None)
-    )(audio_frames, batched_keys, True)
+    (logits, probs), state = jax.vmap(
+        model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
+    )(audio_frames, state, batched_keys, True)
 
     loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
-    return jnp.mean(loss)
+    return jnp.mean(loss), state
 
 @eqx.filter_jit
 def compute_training_step(
-    flat_model, audio_frames, expected_outputs, flat_opt_state, key, tx,
-    treedef_model, treedef_opt_state
+    model, state, audio_frames, expected_outputs, opt_state, key, tx,
 ):
-    model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
-    opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
-
     # print(f"Audio frames shape: {audio_frames.shape}")
     # print(f"Expected outputs shape: {expected_outputs.shape}")
 
     key, new_key = jax.random.split(key)
-    loss, grads = compute_loss(
+    (loss, state), grads = compute_loss(
         model,
+        state,
         audio_frames=audio_frames,
         expected_outputs=expected_outputs,
         key=key,
@@ -62,10 +59,7 @@ def compute_training_step(
     updates, update_opt_state = tx.update(grads, opt_state, model)
     update_model = eqx.apply_updates(model, updates)
 
-    flat_update_model = jax.tree_util.tree_leaves(update_model)
-    flat_update_opt_state = jax.tree_util.tree_leaves(update_opt_state)
-
-    return loss, flat_update_model, flat_update_opt_state, new_key
+    return loss, update_model, state, update_opt_state, new_key
 
 
 @lru_cache(maxsize=1)
@@ -79,32 +73,25 @@ def load_test_set(testset_dir: Path, sharding, batch_size: int):
         batches.append((chunk, frames, midi_events))
     return batches
 
-@eqx.filter_jit
-def compute_test_loss(
-    model,
-    key: jax.random.PRNGKey,
-    audio_frames: Float[Array, "num_frames num_frame_data"],
-    midi_events: Float[Array, "num_frames midi_voccab_size"]
-):
-    logits, probs = model(audio_frames, key)
-    return compute_loss_from_output(logits, midi_events)
-
-def compute_testset_loss_individual(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    inference_model = eqx.nn.inference_mode(model)
     batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
     print("Loaded test set")
 
     loss_map = {}
     for sample_names, frames, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=frames.shape[0])
-        test_losses = jax.vmap(compute_test_loss, (None, 0, 0, 0))(model, test_loss_keys, frames, midi_events)
+        (logits, _probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(frames, state, test_loss_keys)
+        test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
+
         for sample_name, loss in zip(sample_names, test_losses):
             loss_map[sample_name] = { "loss": loss }
 
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model, testset_dir, key, sharding, batch_size)
+def compute_testset_loss(model, state, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model, state, testset_dir, key, sharding, batch_size)
 
     test_loss = jnp.zeros((1,))
     count = jnp.array(0, dtype=jnp.int32)
@@ -117,9 +104,10 @@ def compute_testset_loss(model, testset_dir: Path, key: jax.random.PRNGKey, shar
 
 def train(
     model,
+    state,
     tx,
     data_loader,
-    state: optax.OptState,
+    opt_state: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
     trainloss_csv: Optional[any],
     testloss_csv: Optional[any],
@@ -147,9 +135,6 @@ def train(
         ),
     )
 
-    flat_model, treedef_model = jax.tree_util.tree_flatten(model)
-    flat_state, treedef_state = jax.tree_util.tree_flatten(state)
-
     loss_sum = jnp.array([0.0], dtype=jnp.float32)
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
@@ -159,31 +144,32 @@ def train(
         )
 
         # Keep the old model state in memory until we are sure the loss is not nan
-        recovery_flat_model = flat_model
-        recovery_flat_state = flat_state
+        recovery_model = model
+        recovery_opt_state = opt_state
 
-        loss, flat_model, flat_state, key = compute_training_step(
-            flat_model,
+        loss, model, state, opt_state, key = compute_training_step(
+            model,
+            state,
             audio_frames,
             events,
-            flat_state,
+            opt_state,
             key,
             tx,
-            treedef_model,
-            treedef_state,
         )
         step_end_time = time.time()
 
         if jnp.isnan(loss):
             print(f"Encountered NAN loss at step {step}. Trying to recover!")
-            flat_model = recovery_flat_model
-            flat_state = recovery_flat_state
+            model = recovery_model
+            opt_state = recovery_opt_state
             continue
 
         if checkpoint_manager.should_save(step):
-            model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             filtered_model = eqx.filter(model, eqx.is_array)
-            checkpoint_manager.save(step, args=ocp.args.StandardSave(filtered_model))
+            checkpoint_manager.save(step, args=ocp.args.Composite(
+                params=ocp.args.StandardSave(filtered_model),
+                state=ocp.args.StandardSave(state),
+            ))
 
         loss_sum = loss_sum + loss
 
@@ -199,17 +185,15 @@ def train(
             loss_sum = jnp.array([0.0], dtype=jnp.float32)
 
         if step % testset_loss_every == 0 and testset_dir is not None:
+            pass
             print("Evaluating test loss...")
-            model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
             eval_key, key = jax.random.split(key, num=2)
-            testset_loss = compute_testset_loss(model, testset_dir, eval_key, batch_sharding)
+            testset_loss = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
             print(f"Test loss: {testset_loss}")
 
-    model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
-    state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
-    return model, state
+    return model, state, opt_state
 
 def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, cosine_decay_steps: int):
     warmup_fn = optax.linear_schedule(
@@ -248,7 +232,7 @@ def main():
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
 
-    audio_to_midi = OutputSequenceGenerator(model_config, model_init_key)
+    audio_to_midi, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, model_init_key)
 
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
@@ -266,6 +250,7 @@ def main():
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_path,
         options=checkpoint_options,
+        item_names=('params', 'state'),
         metadata=get_model_metadata()
     )
 
@@ -273,16 +258,23 @@ def main():
     if step_to_restore is not None:
         print(f"Restoring saved model at step {step_to_restore}")
         model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-        model_params = checkpoint_manager.restore(
+        restored_map = checkpoint_manager.restore(
             step_to_restore,
-            args=ocp.args.StandardRestore(model_params),
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(model_params),
+                state=ocp.args.StandardRestore(state),
+            ),
         )
+
+        model_params = restored_map["params"]
+        state = restored_map["state"]
+        
         audio_to_midi = eqx.combine(model_params, static_model)
 
     tx = optax.adamw(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(5.0), tx)
     # The filtering is necessary to have the opt-state flattening working
-    state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
+    opt_state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
 
     print("Setting up dataset loader...")
     dataset_loader = AudioToMidiDatasetLoader(
@@ -291,6 +283,7 @@ def main():
         prefetch_count=dataset_prefetch_count,
         key=dataset_loader_key,
         num_workers=dataset_num_workers,
+        epochs=100000,
     )
     dataset_loader_iter = iter(dataset_loader)
 
@@ -300,11 +293,12 @@ def main():
             trainloss_csv = csv.writer(trainloss_file)
             testloss_csv = csv.writer(testloss_file)
 
-            audio_to_midi, state = train(
+            audio_to_midi, state, opt_state = train(
                 audio_to_midi,
+                state,
                 tx,
                 dataset_loader_iter,
-                state,
+                opt_state,
                 checkpoint_manager,
                 trainloss_csv=trainloss_csv,
                 testloss_csv=testloss_csv,
@@ -312,7 +306,7 @@ def main():
                 device_mesh=device_mesh,
                 testset_dir=testset_dir,
                 num_steps=num_steps,
-                print_every=5,
+                print_every=1,
                 key=training_key,
                 testset_loss_every=checkpoint_every,
             )
