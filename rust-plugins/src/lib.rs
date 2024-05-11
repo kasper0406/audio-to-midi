@@ -352,6 +352,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                 .collect();
 
             let frame_count = (max_duration / duration_per_frame).round() as usize;
+            debug!("Event frame count {}, max_duration = {}, dps = {}", frame_count, max_duration, duration_per_frame);
             let events_by_frame: Vec<Vec<Vec<f32>>> = events.iter()
                 .map(|events| convert_to_frame_events(&events, frame_count))
                 .collect();
@@ -392,7 +393,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 #[pyfunction]
 fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
     let activation_threshold = 0.5;
-    let deactivation_threshold = 0.2;
+    let deactivation_threshold = 0.1;
 
     let mut events: MidiEvents = vec![];
 
@@ -411,7 +412,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
         if t < 10.0 {
             activation_prob
         } else {
-            activation_prob * (-0.01 * t).exp()
+            activation_prob * (-0.02 * t).exp()
         }
     };
 

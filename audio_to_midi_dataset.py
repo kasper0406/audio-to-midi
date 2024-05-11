@@ -32,7 +32,7 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 
 SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.95
+WINDOW_OVERLAP = 0.96
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 180
@@ -192,8 +192,10 @@ class AudioToMidiDatasetLoader:
             frames = frames[:-required_padding, ...]
 
         midi_events = jnp.stack(midi_events)
+        # HACK: This padding shouldn't really be necessary
+        midi_events = jnp.pad(midi_events, ((0,0), (0, frames.shape[2] - midi_events.shape[1]), (0, 0)), constant_values=0)
 
-        if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
+        if abs(calculated_duration_per_frame - duration_per_frame) > 0.0001:
             raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
         return midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
 
@@ -497,6 +499,7 @@ def visualize_sample(
     print("Frames shape:", frames.shape)
     print("Duration per frame:", duration_per_frame_in_secs)
     print("Frame width in seconds:", frame_width)
+    print(f"Events shape: {events.shape}")
     if events_human is not None:
         print(f"Human evnets: {_remove_zeros(events_human)}")
     plot_frequency_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames, events=events)
@@ -512,7 +515,8 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
         batch_size=4,
         prefetch_count=1,
         key=key,
