@@ -48,39 +48,94 @@ fn frame_position(time: f32, duration_per_frame: f32) -> u32 {
 type MidiEvents = Vec<(u32, u32, u32, u32)>;
 const VELOCITY_CATEGORIES: f32 = 10.0;
 
-async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
+type TempoTimeSignature = (Option<u16>, Option<(u8, u8)>);
+
+#[derive(Clone)]
+struct MidiInformation {
+    events: MidiEvents,
+    tts: TempoTimeSignature,
+}
+
+fn try_extract_tempo(input: &str) -> Option<u16> {
+    let find_str = "%tempo=";
+    if let Some(idx) = input.find(find_str) {
+        let tempo_idx = idx + find_str.len();
+        input[tempo_idx..].parse::<f32>().map(|tempo| tempo as u16).ok()
+    } else {
+        None
+    }
+}
+
+fn try_extract_time_signature(input: &str) -> Option<(u8, u8)> {
+    let find_str: &str = "%timeSignature=";
+    if let Some(find_idx) = input.find(find_str) {
+        let ts_idx = find_idx + find_str.len();
+        let parts: Vec<u8> = input[ts_idx..].split('/')
+            .flat_map(|part| part.parse::<u8>().ok())
+            .collect();
+        match parts[..] {
+            [notes_in_bar, note_count] => {
+                Some((notes_in_bar, note_count))
+            },
+            _ => None
+        }
+    } else {
+        None
+    }
+}
+
+async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiInformation, std::io::Error> {
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
-        .comment(Some(b'%'))
         .trim(csv::Trim::All)
         .from_reader(contents.as_bytes());
     reader.set_headers(csv::StringRecord::from(vec!["time", "duration", "key", "velocity"]));
 
     let mut events = vec![];
-    for result in reader.deserialize::<EventRecord>().skip(1) {
-        match result {
-            Ok(record) => {
-                if record.time > max_event_time {
-                    debug!["Skipping midi event because it happens after {} seconds", max_event_time];
-                    continue
-                }
+    let mut tempo: Option<u16> = None;
+    let mut time_signature: Option<(u8, u8)> = None;
+    for result in reader.records().skip(1) {
+        let record = result?;
+        let first_field = record.get(0).unwrap_or("");
+        debug!("Processing line: {}", first_field);
 
-                let attack_time = frame_position(record.time, duration_per_frame);
-                let key = key_to_event(record.key);
-                let duration = frame_position(record.duration, duration_per_frame).max(1);
-                let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
+        if first_field.starts_with('%') {
+            // Extract tempo and time signature
+            debug!("Processing comment line {}", first_field);
+            tempo = try_extract_tempo(&first_field).or(tempo);
+            debug!("Found tempo {:?}", tempo);
+            time_signature = try_extract_time_signature(&first_field).or(time_signature);
+            debug!("Found TS {:?}", time_signature);
+        } else {
+            debug!["Processing normal event..."];
+            let result: Result<EventRecord, _> = record.deserialize(None);
+            match result {
+                Ok(record) => {
+                    if record.time > max_event_time {
+                        debug!["Skipping midi event because it happens after {} seconds", max_event_time];
+                        continue;
+                    }
 
-                events.push( (attack_time, key, duration, velocity) );
-            },
-            Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
+                    let attack_time = frame_position(record.time, duration_per_frame);
+                    let key = key_to_event(record.key);
+                    let duration = frame_position(record.duration, duration_per_frame).max(1);
+                    let velocity = (record.velocity * (VELOCITY_CATEGORIES as f32)).round() as u32;
+
+                    events.push((attack_time, key, duration, velocity));
+                },
+                Err(e) => eprintln!("Failed to deserialize record: {:?}", e),
+            }
         }
     }
     events.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
-    Ok(events)
+    Ok(MidiInformation {
+        events: events,
+        tts: (tempo, time_signature),
+    })
 }
 
 fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
@@ -318,7 +373,7 @@ fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f
 }
 
 #[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let all_samples = py.allow_threads(move || {
@@ -345,7 +400,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                 .map(|result| result.unwrap())
                 .map(|result| result.unwrap())
                 .collect();
-            let events: Vec<MidiEvents> = join_all(event_futures).await
+            let midi_information: Vec<MidiInformation> = join_all(event_futures).await
                 .into_iter()
                 .map(|result| result.unwrap())
                 .map(|result| result.unwrap())
@@ -353,18 +408,21 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
             let frame_count = (max_duration / duration_per_frame).round() as usize;
             debug!("Event frame count {}, max_duration = {}, dps = {}", frame_count, max_duration, duration_per_frame);
-            let events_by_frame: Vec<Vec<Vec<f32>>> = events.iter()
+            let events_by_frame: Vec<Vec<Vec<f32>>> = midi_information.clone().into_iter().map(|m| m.events)
                 .map(|events| convert_to_frame_events(&events, frame_count))
                 .collect();
 
-            (audio_samples, events, events_by_frame)
+            let tempo_ts: Vec<TempoTimeSignature> = midi_information.iter().map(|m| m.tts).collect();
+
+            let events: Vec<MidiEvents> = midi_information.into_iter().map(|m| m.events).collect();
+            (audio_samples, events, events_by_frame, tempo_ts)
         })
     });
 
     let mut audio_results = vec![];
     let mut event_results = vec![];
     let mut events_by_frame_results = vec![];
-    let (all_audio_samples, all_events, events_by_frame) = all_samples;
+    let (all_audio_samples, all_events, events_by_frame, tempo_ts) = all_samples;
     let iter = all_audio_samples.into_iter()
         .zip(all_events.into_iter())
         .zip(events_by_frame.into_iter())
@@ -383,10 +441,12 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
         events_by_frame_results.push(converted_events_by_frame);
     }
+
     Ok((
         PyList::new(py, &audio_results).into(),
         PyList::new(py, &event_results).into(),
-        PyList::new(py, &events_by_frame_results).into()
+        PyList::new(py, &events_by_frame_results).into(),
+        PyList::new(py, &tempo_ts).into(),
     ))
 }
 
