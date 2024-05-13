@@ -475,6 +475,33 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
     Ok(PyList::new(py, &events).into())
 }
 
+#[pyfunction]
+fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyResult<Py<PyList>> {
+    let all_events: Vec<_> = py_events.as_ref(py).iter()
+        .map(|element| {
+            let mut events = vec![];
+            for event in element.iter().unwrap() {
+                let event = event.unwrap();
+                if let Ok((attack_time, key, duration, velocity)) = event.extract() {
+                    events.push((attack_time, key, duration, velocity))
+                } else {
+                    eprintln!("Unknown event: {:?}", event);
+                }
+            }
+            events
+        })
+        .collect();
+
+    let converted: Vec<_> = all_events.iter()
+        .map(|events| {
+            let rust_converted = convert_to_frame_events(&events, frame_count);
+            PyArray2::from_vec2(py, &rust_converted).unwrap().to_owned()
+        })
+        .collect();
+
+    Ok(PyList::new(py, &converted).into())
+}
+
 #[pymodule]
 fn rust_plugins(_py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::init();
@@ -482,5 +509,6 @@ fn rust_plugins(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
     m.add_function(wrap_pyfunction!(extract_events, m)?)?;
+    m.add_function(wrap_pyfunction!(to_frame_events, m)?)?;
     Ok(())
 }

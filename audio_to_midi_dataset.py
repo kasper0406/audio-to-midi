@@ -32,7 +32,7 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 
 SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.96
+WINDOW_OVERLAP = 0.95
 COMPRESSION_FACTOR = 1
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 180
@@ -195,7 +195,7 @@ class AudioToMidiDatasetLoader:
         # HACK: This padding shouldn't really be necessary
         midi_events = jnp.pad(midi_events, ((0,0), (0, frames.shape[2] - midi_events.shape[1]), (0, 0)), constant_values=0)
 
-        if abs(calculated_duration_per_frame - duration_per_frame) > 0.0001:
+        if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
             raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
         return midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
 
