@@ -12,10 +12,11 @@ from jaxtyping import Array, Float
 import numpy as np
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
-import heapq
+from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
+import rust_plugins
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     # Append a frame at the beginning with the start of the first frame to make the stitching
@@ -83,6 +84,46 @@ def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, o
         current_time = time
 
     midi.save(output_file)
+
+@dataclass
+class DetailedEventLoss:
+    full_diff: int
+    phantom_notes_diff: int
+    missed_notes_diff: int
+    notes_hit: int
+    hit_rate: float
+
+def detailed_event_loss(
+    output_probs: Float[Array, "seq_len midi_voccab_size"],
+    expected: Float[Array, "seq_len midi_voccab_size"]) -> DetailedEventLoss:
+    """
+    Given predicted and expected fram events, compute a more detailed loss,
+    to help evaluate how good a prediction is in a more detailed and "closer
+    to the music way" than the ordinary loss function.
+    """
+    predicted = rust_plugins.extract_events(np.array(output_probs))
+    predicted = rust_plugins.to_frame_events([predicted], output_probs.shape[0])[0]
+    expected = expected[:predicted.shape[0]]
+
+    full_diff = jnp.sum(jnp.abs(predicted - expected))
+
+    played_predicted = predicted > 0
+    played_expected = expected > 0
+
+    phantom_notes_diff = np.sum(played_predicted & ~played_expected)
+    missed_notes_diff = np.sum(played_expected & ~played_predicted)
+    notes_hit = np.sum(played_predicted & played_expected)
+
+    hit_rate = notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff)
+
+    return DetailedEventLoss(
+        full_diff=full_diff,
+        phantom_notes_diff=phantom_notes_diff,
+        missed_notes_diff=missed_notes_diff,
+        notes_hit=notes_hit,
+        hit_rate=hit_rate,
+    )
+
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()

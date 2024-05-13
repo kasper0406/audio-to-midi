@@ -77,9 +77,13 @@ if args.validation:
         losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, key, sharding=None)
         for sample_name, losses in losses.items():
             loss = losses["loss"]
-            print(f"{sample_name}\t{loss}")
+            hit_rate = losses["hit_rate"]
+            eventized_diff = losses["eventized_diff"]
+            print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}")
     else:
-        loss = compute_testset_loss(audio_to_midi, state, validation_dir, key, sharding=None)
+        loss, hit_rate, eventized_diff = compute_testset_loss(audio_to_midi, state, validation_dir, key, sharding=None)
         print(f"Validation loss: {loss}")
+        print(f"Hit rate: {hit_rate}")
+        print(f"Eventized diff: {eventized_diff}")
 
 plt.show() # Wait for matplotlib
