@@ -91,6 +91,7 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.ra
                 "loss": loss,
                 "hit_rate": detailed_loss.hit_rate,
                 "eventized_diff": detailed_loss.full_diff,
+                "phantom_miss_ratio": detailed_loss.phantom_miss_ratio,
             }
 
     print("Finished evaluating test loss")
@@ -102,14 +103,16 @@ def compute_testset_loss(model, state, testset_dir: Path, key: jax.random.PRNGKe
     test_loss = jnp.zeros((1,))
     hit_rate = jnp.zeros((1,))
     eventized_diff = jnp.zeros((1,))
+    phantom_miss_ratio = jnp.zeros((1,))
     count = jnp.array(0, dtype=jnp.int32)
     for losses in per_sample_map.values():
         test_loss += losses["loss"]
         hit_rate += losses["hit_rate"]
         eventized_diff += losses["eventized_diff"]
+        phantom_miss_ratio += losses["phantom_miss_ratio"]
         count += 1
 
-    return (test_loss / count)[0], (hit_rate / count)[0], (eventized_diff / count)[0]
+    return (test_loss / count)[0], (hit_rate / count)[0], (eventized_diff / count)[0], (phantom_miss_ratio / count)[0]
 
 
 def train(
@@ -198,10 +201,10 @@ def train(
             pass
             print("Evaluating test loss...")
             eval_key, key = jax.random.split(key, num=2)
-            testset_loss, hit_rate, eventized_diff = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
+            testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
             if testloss_csv is not None:
                 testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
-            print(f"Test loss: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
+            print(f"Test loss: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
 
     return model, state, opt_state
 

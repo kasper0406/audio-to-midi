@@ -90,6 +90,7 @@ class DetailedEventLoss:
     full_diff: int
     phantom_notes_diff: int
     missed_notes_diff: int
+    phantom_miss_ratio: float
     notes_hit: int
     hit_rate: float
 
@@ -111,15 +112,17 @@ def detailed_event_loss(
     played_expected = expected > 0
 
     phantom_notes_diff = np.sum(played_predicted & ~played_expected)
-    missed_notes_diff = np.sum(played_expected & ~played_predicted)
+    # Note we discount the missed notes weighed by its severity (if the node is basically decayed it doesn't make much of a difference)
+    missed_notes_diff = np.sum(expected[played_expected & ~played_predicted])
     notes_hit = np.sum(played_predicted & played_expected)
 
-    hit_rate = notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff)
+    hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
 
     return DetailedEventLoss(
         full_diff=full_diff,
         phantom_notes_diff=phantom_notes_diff,
         missed_notes_diff=missed_notes_diff,
+        phantom_miss_ratio=phantom_notes_diff / missed_notes_diff,
         notes_hit=notes_hit,
         hit_rate=hit_rate,
     )
