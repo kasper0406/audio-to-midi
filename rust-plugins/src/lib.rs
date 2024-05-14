@@ -294,17 +294,15 @@ async fn resolve_audio_samples(sample_file: &str) -> String {
 }
 
 fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f32>> {
-    let base = 0.6;
+    // TODO: Handle velocities somehow
 
     let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; frame_count];
 
     // Currently this is not a perfect representation, if a key is released and then attacked very quickly thereafter
     // but that will be an issue for another day...
     for (frame_start, key, frame_duration, velocity) in events {
-        let velocity_boost = ((*velocity as f32) / VELOCITY_CATEGORIES) / 2.25;
-        let start_strength = (base + velocity_boost).max(1.0);
         let decay_function = |t: f32| -> f32 {
-            start_strength * (-0.05 * t).exp()
+            (-0.05 * t).exp()
         };
 
         let frame_end = ((*frame_start + *frame_duration) as usize).min(frame_count);
@@ -409,7 +407,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
         7
     };
     let decay_function = |activation_prob: f32, t: f32| -> f32 {
-        if t < 10.0 {
+        if t < 5.0 {
             activation_prob
         } else {
             activation_prob * (-0.02 * t).exp()
@@ -422,11 +420,14 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
         for key in 0..num_keys {
             let get_activation_prob = || -> f32 {
                 let mut activation_prob = probs[(frame, key)];
+                let lookahead = 5;
                 for i in (frame + 1)..num_frames {
                     if probs[(i, key)] > activation_prob {
                         activation_prob = probs[(i, key)];
                     } else {
-                        break;
+                        if i - frame > lookahead {
+                            break;
+                        }
                     }
                 }
                 activation_prob
