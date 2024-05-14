@@ -501,3 +501,9 @@ class OutputSequenceGenerator(eqx.Module):
         output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
         return self.decoder(output, decoder_key), state
+
+    def predict(self, state, frames):
+        key = jax.random.PRNGKey(1)
+        inference_keys = jax.random.split(key, num=frames.shape[0])
+        (logits, probs), _state = jax.vmap(self, in_axes=(0, None, 0), out_axes=(0, None))(frames, state, inference_keys)
+        return logits, probs

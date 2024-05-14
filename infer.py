@@ -36,9 +36,8 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
 
     return output
 
-def forward(model, state, audio_frames, key, duration_per_frame: float, overlap=0.0):
-    inference_keys = jax.random.split(key, num=audio_frames.shape[0])
-    (_logits, probs), _state = jax.vmap(model, in_axes=(0, None, 0), out_axes=(0, None))(audio_frames, state, inference_keys)
+def predict_and_stitch(model, state, audio_frames, duration_per_frame: float, overlap=0.0):
+    _logits, probs = model.predict(state, audio_frames)
 
     # HACK: Get rid of this!
     #       Currently we train the model to not output the last three frames, so the overlap will be different

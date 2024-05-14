@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import jax
 import jax.numpy as jnp
-from infer import load_newest_checkpoint, forward, write_midi_file
+from infer import load_newest_checkpoint, predict_and_stitch, write_midi_file
 from train import compute_testset_loss, compute_testset_loss_individual
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
@@ -51,7 +51,7 @@ if not args.validation:
             plot_embedding(str(audio_file), embeddings)
         plt.show(block=False)
     
-    individual_probs, stitched_probs = forward(audio_to_midi, state, frames, key, duration_per_frame, overlap=overlap)
+    individual_probs, stitched_probs = predict_and_stitch(audio_to_midi, state, frames, duration_per_frame, overlap=overlap)
 
     if args.visualize_audio:
         for i in range(individual_probs.shape[0]):
