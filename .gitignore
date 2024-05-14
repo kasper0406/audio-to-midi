@@ -166,3 +166,5 @@ saved_checkpoints/**
 /*.csv
 
 *.tgz
+.vscode
+tf_export
