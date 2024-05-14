@@ -1,10 +1,6 @@
-use std::path::Path;
 use std::fmt;
-use std::str::EncodeUtf16;
 
-use numpy::{ PyArray2, PyArray3, PyReadonlyArray2 };
-use numpy::ToPyArray;
-use numpy::IntoPyArray;
+use numpy::PyArray2;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use pyo3::types::PyList;
@@ -21,19 +17,11 @@ use uuid::Uuid;
 use std::process::Stdio;
 use futures::future::join_all;
 
-use log::{debug, error, info, trace, warn};
+use log::{debug, error};
 
 static TOKIO_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     Runtime::new().expect("Failed to create Tokio runtime")
 });
-
-#[derive(Debug, Deserialize)]
-struct EventRecord {
-    time: f32,
-    duration: f32,
-    key: u32,
-    velocity: f32,
-}
 
 const NUM_EVENT_TYPES: usize = 90;
 
@@ -82,6 +70,14 @@ fn try_extract_time_signature(input: &str) -> Option<(u8, u8)> {
     } else {
         None
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct EventRecord {
+    time: f32,
+    duration: f32,
+    key: u32,
+    velocity: f32,
 }
 
 async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiInformation, std::io::Error> {
@@ -134,7 +130,7 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     })
 }
 
-fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
+fn get_sample_files(dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
     let mut sample_files = vec![];
     for maybe_sample_name in sample_names {
         match maybe_sample_name.extract::<String>() {
@@ -368,7 +364,7 @@ fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f
 
 #[pyfunction]
 fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>, Py<PyList>)> {
-    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+    let sample_files = get_sample_files(dataset_dir, sample_names)?;
 
     let all_samples = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
