@@ -445,22 +445,26 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 }
 
 #[pyfunction]
-fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
+fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>, py_velocities: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
     let activation_threshold = 0.5;
     let deactivation_threshold = 0.1;
 
     let mut events: MidiEvents = vec![];
 
-    let array = py_probs.as_ref(py).readonly();
-    let probs = array.as_array();
+    let probs_array = py_probs.as_ref(py).readonly();
+    let probs = probs_array.as_array();
+
+    let velocities_array = py_velocities.as_ref(py).readonly();
+    let velocities = velocities_array.as_array();
 
     let duration = |end_frame: usize, start_frame: usize| -> u32 {
         ((end_frame as i32) - (start_frame as i32) - 1).max(1) as u32
     };
 
-    let velocity = |activation_prob: f32| -> u32 {
-        // ((activation_prob - activation_threshold) * (1.0 / (1.0 - activation_threshold)) * VELOCITY_CATEGORIES).round() as u32
-        7
+    let velocity = |start_frame: usize, key: usize| -> u32 {
+        // Simply read off the value from the velocities array and convert into the velocity categories
+        let float_velocity = velocities[(start_frame, key)];
+        (float_velocity * VELOCITY_CATEGORIES).round() as u32
     };
     let decay_function = |activation_prob: f32, t: f32| -> f32 {
         if t < 5.0 {
@@ -493,7 +497,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
             if let Some((started_at, activation_prob)) = currently_playing[key] {
                 if probs[(frame, key)] < deactivation_threshold {
                     // Emit the event and stop playing
-                    events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob)));
+                    events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(started_at, key)));
                     currently_playing[key] = None;
                 }
             }
@@ -508,7 +512,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
                     // Either the key is already playing, and we may have a re-activation
                     let time_since_activation = frame as f32 - started_at as f32;
                     if probs[(frame, key)] > decay_function(activation_prob, time_since_activation) {
-                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob))); // Close the old event
+                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(started_at, key))); // Close the old event
                         currently_playing[key] = Some((frame, get_activation_prob()));
                     }
                 } else {
@@ -522,7 +526,7 @@ fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList
     // There may be currently playing events we need to meit
     for key in 0..num_keys {
         if let Some((started_at, activation_prob)) = currently_playing[key] {
-            events.push((started_at as u32, key as u32, duration(num_frames, started_at), velocity(activation_prob)));
+            events.push((started_at as u32, key as u32, duration(num_frames, started_at), velocity(started_at, key)));
             currently_playing[key] = None;
         }
     }
