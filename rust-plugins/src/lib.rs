@@ -92,6 +92,7 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .trim(csv::Trim::All)
+        .flexible(true)
         .from_reader(contents.as_bytes());
     reader.set_headers(csv::StringRecord::from(vec!["time", "duration", "key", "velocity"]));
 
@@ -101,17 +102,12 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     for result in reader.records().skip(1) {
         let record = result?;
         let first_field = record.get(0).unwrap_or("");
-        debug!("Processing line: {}", first_field);
 
         if first_field.starts_with('%') {
             // Extract tempo and time signature
-            debug!("Processing comment line {}", first_field);
             tempo = try_extract_tempo(&first_field).or(tempo);
-            debug!("Found tempo {:?}", tempo);
             time_signature = try_extract_time_signature(&first_field).or(time_signature);
-            debug!("Found TS {:?}", time_signature);
         } else {
-            debug!["Processing normal event..."];
             let result: Result<EventRecord, _> = record.deserialize(None);
             match result {
                 Ok(record) => {

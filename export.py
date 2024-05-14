@@ -2,8 +2,6 @@ from pathlib import Path
 
 import tensorflow as tf
 from jax.experimental import jax2tf
-import equinox as eqx
-import jax
 import equinox.internal as eqxi
 
 from infer import load_newest_checkpoint

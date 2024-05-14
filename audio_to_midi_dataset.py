@@ -176,7 +176,8 @@ class AudioToMidiDatasetLoader:
         hop_size = (1 - WINDOW_OVERLAP) * SAMPLES_PER_FFT
         num_frames = math.ceil((AudioToMidiDatasetLoader.SAMPLE_RATE * MAX_EVENT_TIMESTAMP) / hop_size)
         duration_per_frame = MAX_EVENT_TIMESTAMP / num_frames
-        audio_samples, midi_events_human, midi_events, tempo_ts = rust_plugins.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
+        audio_samples, midi_events_human, midi_events, tempo_ts = rust_plugins.load_events_and_audio(
+            str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
         audio_samples = jnp.stack(audio_samples)
 
         print(f"Tempo & TS: {tempo_ts}")
