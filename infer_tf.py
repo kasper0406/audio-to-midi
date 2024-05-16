@@ -34,7 +34,7 @@ overlap = args.overlap
 
 audio_samples = rust_plugins.load_full_audio(str(audio_file), AudioToMidiDatasetLoader.SAMPLE_RATE)
 windowed_samples = create_audio_samples_window(overlap)
-frames, duration_per_frame, frame_width_in_secs = model.prepare(windowed_samples)
+frames, duration_per_frame, frame_width_in_secs = AudioToMidiDatasetLoader._convert_samples(windowed_samples)
 
 _logits, probs = model.predict(frames)
 

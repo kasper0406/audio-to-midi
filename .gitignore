@@ -168,3 +168,4 @@ saved_checkpoints/**
 *.tgz
 .vscode
 tf_export
+*.tflite

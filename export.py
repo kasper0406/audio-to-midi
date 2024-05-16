@@ -8,7 +8,6 @@ import equinox.internal as eqxi
 
 from infer import load_newest_checkpoint
 from model import model_config
-from audio_to_midi_dataset import AudioToMidiDatasetLoader
 
 # TODO: Figure out a way to not hardcode this
 NUM_FRAMES = 197
@@ -23,25 +22,20 @@ def export_model_to_tf(model, state):
         enable_xla=False, # Disable XLA because TFlite and TFjs may have issues
     )
 
-    # The prepare function is used to create the spectrogram from the raw audio data
-    prepare_fn = jax2tf.convert(
-        AudioToMidiDatasetLoader._convert_samples,
-        polymorphic_shapes=[f"(b, 2, samples)"],
-        with_gradient=False,
-        enable_xla=False, # Disable XLA because TFlite and TFjs may have issues
-    )
-
     @tf.function(autograph=False, input_signature=[tf.TensorSpec(shape=(None, 2, NUM_FRAMES, FRAME_SIZE), dtype=tf.float32)])
     def predict(data):
         return predict_fn(state, data)
     module.predict = predict
 
-    @tf.function(autograph=False, input_signature=[tf.TensorSpec(shape=(None, 2, None), dtype=tf.float32)])
-    def prepare(samples):
-        return prepare_fn(samples)
-    module.prepare = prepare
-
     tf.saved_model.save(module, "./tf_export/")
+
+def export_model_to_tf_lite():
+    converter = tf.lite.TFLiteConverter.from_saved_model("./tf_export/")
+    # converter.optimizations = [ tf.lite.Optimize.DEFAULT ]
+    tflite_model = converter.convert()
+
+    with open('model.tflite', 'wb') as f:
+        f.write(tflite_model)
 
 if __name__ == "__main__":
     current_directory = Path(__file__).resolve().parent
@@ -49,3 +43,4 @@ if __name__ == "__main__":
     model, state = load_newest_checkpoint(checkpoint_path)
 
     export_model_to_tf(model, state)
+    export_model_to_tf_lite()
