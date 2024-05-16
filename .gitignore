@@ -165,6 +165,8 @@ audio_to_midi_checkpoints*
 saved_checkpoints/**
 /*.csv
 
+.DS_Store
+
 *.tgz
 .vscode
 tf_export

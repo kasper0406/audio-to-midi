@@ -1,5 +1,5 @@
 [package]
-name = "rust-plugins"
+name = "modelutil"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,8 +11,11 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-cbinds = []
 python = [ "pyo3", "numpy", "tokio", "futures", "once_cell", "csv", "serde", "uuid" ]
+cbinds = []
+
+[build-dependencies]
+cbindgen = "0.20"
 
 [dependencies]
 log = "0.4"
