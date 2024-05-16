@@ -6,7 +6,7 @@ from infer import load_newest_checkpoint, predict_and_stitch, write_midi_file
 from train import compute_testset_loss, compute_testset_loss_individual
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
-import rust_plugins
+import modelutil
 
 parser = argparse.ArgumentParser(description='audio_to_midi a utility to convert piano audio files to midi events.')
 parser.add_argument('path', help='The path to the audio file or directory for validation')
@@ -64,7 +64,7 @@ if not args.validation:
     plot_output_probs(args.path, duration_per_frame, stitched_probs)
     plt.show(block=False)
 
-    events = rust_plugins.extract_events(stitched_probs)
+    events = modelutil.extract_events(stitched_probs)
     if args.output:
         print(f"Writing MIDI file to {args.output}")
         write_midi_file(events, duration_per_frame, args.output)

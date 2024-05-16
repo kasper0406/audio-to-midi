@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
-import rust_plugins
+import modelutil
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     # Append a frame at the beginning with the start of the first frame to make the stitching
@@ -101,8 +101,8 @@ def detailed_event_loss(
     to help evaluate how good a prediction is in a more detailed and "closer
     to the music way" than the ordinary loss function.
     """
-    predicted = rust_plugins.extract_events(np.array(output_probs))
-    predicted = rust_plugins.to_frame_events([predicted], output_probs.shape[0])[0]
+    predicted = modelutil.extract_events(np.array(output_probs))
+    predicted = modelutil.to_frame_events([predicted], output_probs.shape[0])[0]
     expected = expected[:predicted.shape[0]]
 
     full_diff = jnp.sum(jnp.abs(predicted - expected))

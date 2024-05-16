@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 from typing import Optional, List
 from threading import Lock
 import math
-import rust_plugins
+import modelutil
 
 # TODO: Clean this up
 MIDI_EVENT_VOCCAB_SIZE = 90
@@ -176,7 +176,7 @@ class AudioToMidiDatasetLoader:
         hop_size = (1 - WINDOW_OVERLAP) * SAMPLES_PER_FFT
         num_frames = math.ceil((AudioToMidiDatasetLoader.SAMPLE_RATE * MAX_EVENT_TIMESTAMP) / hop_size)
         duration_per_frame = MAX_EVENT_TIMESTAMP / num_frames
-        audio_samples, midi_events_human, midi_events = rust_plugins.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
+        audio_samples, midi_events_human, midi_events = modelutil.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
         audio_samples = jnp.stack(audio_samples)
 
         required_padding = 0
@@ -263,7 +263,7 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
-        audio_samples = rust_plugins.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
+        audio_samples = modelutil.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
 
         window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
         overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)

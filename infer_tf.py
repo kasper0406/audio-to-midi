@@ -3,7 +3,7 @@ import tensorflow as tf
 from audio_to_midi_dataset import plot_output_probs
 from infer import stitch_output_probs
 import matplotlib.pyplot as plt
-import rust_plugins
+import modelutil
 import math
 import numpy as np
 from audio_to_midi_dataset import MAX_EVENT_TIMESTAMP, AudioToMidiDatasetLoader
@@ -32,7 +32,7 @@ args = parser.parse_args()
 audio_file = args.file
 overlap = args.overlap
 
-audio_samples = rust_plugins.load_full_audio(str(audio_file), AudioToMidiDatasetLoader.SAMPLE_RATE)
+audio_samples = modelutil.load_full_audio(str(audio_file), AudioToMidiDatasetLoader.SAMPLE_RATE)
 windowed_samples = create_audio_samples_window(overlap)
 frames, duration_per_frame, frame_width_in_secs = AudioToMidiDatasetLoader._convert_samples(windowed_samples)
 
