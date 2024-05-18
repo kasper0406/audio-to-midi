@@ -12,10 +12,10 @@ from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 1024,
-    "num_heads": 4,
-    "num_layers": 10,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
@@ -281,7 +281,7 @@ class AttentionBlock(eqx.Module):
             jnp.expand_dims(input_mask, axis=-1),
             jnp.expand_dims(kv_mask, axis=-2),
         )
-        return mask.astype(jnp.bool_)
+        return mask.astype(jnp.int32)
 
 
 class TransformerLayer(eqx.Module):
@@ -489,7 +489,7 @@ class OutputSequenceGenerator(eqx.Module):
         frame_embeddings, state = self.frame_embedding(
             input_frames, state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
-        mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int8)
+        mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int32)
 
         output = self.event_processor(
             inputs=frame_embeddings,
