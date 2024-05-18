@@ -151,9 +151,9 @@ def train(
     )
 
     loss_sum = jnp.array([0.0], dtype=jnp.float32)
-    testset_losses = {}
+    testset_hitrates = {}
     for name in testset_dirs.keys():
-        testset_losses[name] = sys.float_info.max
+        testset_hitrates[name] = sys.float_info.max
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         (audio_frames, events) = jax.device_put(
@@ -190,7 +190,7 @@ def train(
                     params=ocp.args.StandardSave(filtered_model),
                     state=ocp.args.StandardSave(state),
                 ),
-                metrics=testset_losses,
+                metrics=testset_hitrates,
             )
 
         loss_sum = loss_sum + loss
@@ -213,7 +213,7 @@ def train(
                 testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
                 if testloss_csv is not None:
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
-                testset_losses[name] = float(testset_loss)
+                testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
 
     return model, state, opt_state
@@ -273,7 +273,7 @@ def main():
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=checkpoints_to_keep,
         save_interval_steps=checkpoint_every,
-        best_mode='min',
+        best_mode='max',
         best_fn=lambda metrics: jnp.mean(jnp.array(list(metrics.values()))),
     )
     checkpoint_manager = ocp.CheckpointManager(
