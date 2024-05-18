@@ -4,6 +4,8 @@ from typing import Optional, Callable
 import os
 import csv
 import time
+import sys
+from typing import Dict
 
 import equinox as eqx
 import jax
@@ -126,7 +128,7 @@ def train(
     testloss_csv: Optional[any],
     learning_rate_schedule: Callable,
     device_mesh: [],
-    testset_dir: Optional[Path],
+    testset_dirs: Dict[str, Path],
     num_steps: int = 10000,
     print_every: int = 1000,
     testset_loss_every: int = 1000,
@@ -149,6 +151,9 @@ def train(
     )
 
     loss_sum = jnp.array([0.0], dtype=jnp.float32)
+    testset_losses = {}
+    for name in testset_dirs.keys():
+        testset_losses[name] = sys.float_info.max
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         (audio_frames, events) = jax.device_put(
@@ -179,10 +184,14 @@ def train(
 
         if checkpoint_manager.should_save(step):
             filtered_model = eqx.filter(model, eqx.is_array)
-            checkpoint_manager.save(step, args=ocp.args.Composite(
-                params=ocp.args.StandardSave(filtered_model),
-                state=ocp.args.StandardSave(state),
-            ))
+            checkpoint_manager.save(
+                step,
+                args=ocp.args.Composite(
+                    params=ocp.args.StandardSave(filtered_model),
+                    state=ocp.args.StandardSave(state),
+                ),
+                metrics=testset_losses,
+            )
 
         loss_sum = loss_sum + loss
 
@@ -197,14 +206,15 @@ def train(
 
             loss_sum = jnp.array([0.0], dtype=jnp.float32)
 
-        if step % testset_loss_every == 0 and testset_dir is not None:
-            pass
-            print("Evaluating test loss...")
-            eval_key, key = jax.random.split(key, num=2)
-            testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
-            if testloss_csv is not None:
-                testloss_csv.writerow([step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
-            print(f"Test loss: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
+        if step % testset_loss_every == 0:
+            print("Evaluating test losses...")
+            for (name, testset_dir) in testset_dirs.items():
+                eval_key, key = jax.random.split(key, num=2)
+                testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
+                if testloss_csv is not None:
+                    testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
+                testset_losses[name] = float(testset_loss)
+                print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
 
     return model, state, opt_state
 
@@ -227,7 +237,10 @@ def main():
 
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/true_harmonic")
-    testset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set")
+    testset_dirs = {
+        'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
+        'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
+    }
 
     num_devices = len(jax.devices())
 
@@ -235,7 +248,7 @@ def main():
     num_steps = 1000000
     learning_rate_schedule = create_learning_rate_schedule(2.5 * 1e-4, 1000, num_steps)
 
-    checkpoint_every = 200
+    checkpoint_every = 10
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -258,7 +271,10 @@ def main():
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
-        max_to_keep=checkpoints_to_keep, save_interval_steps=checkpoint_every
+        max_to_keep=checkpoints_to_keep,
+        save_interval_steps=checkpoint_every,
+        best_mode='min',
+        best_fn=lambda metrics: jnp.mean(jnp.array(list(metrics.values()))),
     )
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_path,
@@ -317,7 +333,7 @@ def main():
                 testloss_csv=testloss_csv,
                 learning_rate_schedule=learning_rate_schedule,
                 device_mesh=device_mesh,
-                testset_dir=testset_dir,
+                testset_dirs=testset_dirs,
                 num_steps=num_steps,
                 print_every=1,
                 key=training_key,
