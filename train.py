@@ -17,6 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
+import numpy as np
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample
 from model import OutputSequenceGenerator, model_config, get_model_metadata
@@ -232,6 +233,10 @@ def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, 
         boundaries=[warmup_steps]
     )
 
+def score_by_checkpoint_metrics(metrics):
+    mean_score = float(np.mean(np.array(list(metrics.values()))))
+    return mean_score
+
 def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
@@ -274,7 +279,7 @@ def main():
         max_to_keep=checkpoints_to_keep,
         save_interval_steps=checkpoint_every,
         best_mode='max',
-        best_fn=lambda metrics: jnp.mean(jnp.array(list(metrics.values()))),
+        best_fn=score_by_checkpoint_metrics,
     )
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_path,
