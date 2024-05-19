@@ -139,7 +139,7 @@ def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
         title=f"Probability distribution for {quantity}",
     )
 
-def load_newest_checkpoint(checkpoint_path: Path):
+def load_newest_checkpoint(checkpoint_path: Path, model_replication=True):
     num_devices = len(jax.devices())
 
     # The randomness does not matter as we will load a checkpoint model anyways
@@ -170,14 +170,15 @@ def load_newest_checkpoint(checkpoint_path: Path):
     
     audio_to_midi = eqx.combine(model_params, static_model)
 
-    # Replicate the model on all JAX devices
-    device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    if model_replication:
+        # Replicate the model on all JAX devices
+        device_mesh = mesh_utils.create_device_mesh((num_devices,))
+        mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
+        replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
 
-    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-    model_params = jax.device_put(model_params, replicate_everywhere)
-    audio_to_midi = eqx.combine(model_params, static_model)
+        model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+        model_params = jax.device_put(model_params, replicate_everywhere)
+        audio_to_midi = eqx.combine(model_params, static_model)
 
     audio_to_midi = eqx.nn.inference_mode(audio_to_midi)
     return audio_to_midi, state

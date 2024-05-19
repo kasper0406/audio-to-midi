@@ -50,6 +50,11 @@ def get_model_metadata():
         'data_prep': get_data_prep_config(),
     }
 
+def _split_key(key, num: int = 2):
+    if key is None:
+        return [ None ] * num
+    else:
+        return jax.random.split(key, num)
 
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
@@ -109,7 +114,7 @@ class FrameEmbedding(eqx.Module):
                 out_channels=output_shape,
                 kernel_size=(1, conv_height),
                 stride=(1, conv_height),
-                padding=0,
+                # padding=0,
                 key=output_conv_key
             )
         )
@@ -246,7 +251,7 @@ class AttentionBlock(eqx.Module):
             kv_mask = input_mask
         kv_seq_len = kv_context.shape[0] if kv_context is not None else inputs.shape[0]
         mask = self.make_attention_mask(inputs.shape[0], kv_seq_len, input_mask, kv_mask)
-        attention_key, dropout_key = jax.random.split(key)
+        attention_key, dropout_key = _split_key(key)
 
         result = self.attention(
             query=inputs,
@@ -326,15 +331,13 @@ class TransformerLayer(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        self_attention_key, encoder_attention_key, feed_forward_key = jax.random.split(
-            key, num=3
-        )
+        self_attention_key, encoder_attention_key, feed_forward_key = _split_key(key, num=3)
 
         output = self.attention_block(
             inputs, input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
 
-        feed_forward_keys = jax.random.split(feed_forward_key, num=inputs.shape[0])
+        feed_forward_keys = _split_key(feed_forward_key, num=inputs.shape[0])
         output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
             output, enable_dropout, feed_forward_keys
         )
@@ -375,13 +378,13 @@ class TransformerStack(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        layer_keys = jax.random.split(key, num=self.num_layers)
+        layer_keys = _split_key(key, num=self.num_layers)
 
         dynamic_layers, static_layers = eqx.partition(self.layers, eqx.is_array)
 
         def compute_layer(current_state, current_layer):
             idx, transformer_state = current_state
-            leyer_key = layer_keys[idx]
+            leyer_key = layer_keys[idx] if key is not None else None
             transformer_layer = eqx.combine(current_layer, static_layers)
 
             transformer_output = transformer_layer(
@@ -484,7 +487,7 @@ class OutputSequenceGenerator(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
-        event_processor_key, frame_embedding_key, decoder_key, dropout_key = jax.random.split(key, num=4)
+        event_processor_key, frame_embedding_key, decoder_key, dropout_key = _split_key(key, num=4)
 
         frame_embeddings, state = self.frame_embedding(
             input_frames, state, enable_dropout=enable_dropout, key=frame_embedding_key
@@ -503,7 +506,5 @@ class OutputSequenceGenerator(eqx.Module):
         return self.decoder(output, decoder_key), state
 
     def predict(self, state, frames):
-        key = jax.random.PRNGKey(1)
-        inference_keys = jax.random.split(key, num=frames.shape[0])
-        (logits, probs), _state = jax.vmap(self, in_axes=(0, None, 0), out_axes=(0, None))(frames, state, inference_keys)
+        (logits, probs), _state = jax.vmap(self, in_axes=(0, None, None), out_axes=(0, None))(frames, state, None)
         return logits, probs

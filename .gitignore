@@ -171,3 +171,4 @@ saved_checkpoints/**
 .vscode
 tf_export
 *.tflite
+*.mlpackage
