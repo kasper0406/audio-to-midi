@@ -7,7 +7,7 @@ edition = "2021"
 
 [lib]
 name = "modelutil"
-crate-type = ["cdylib"]
+crate-type = ["staticlib", "cdylib"]
 
 [features]
 default = []

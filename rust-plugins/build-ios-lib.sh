@@ -4,79 +4,31 @@ set -e
 
 # Build for all targets
 cargo build --release --target aarch64-apple-ios-sim --features cbinds
+cargo build --release --target aarch64-apple-ios --features cbinds
 cargo build --release --target x86_64-apple-ios --features cbinds
-# cargo build --release --target x86_64-apple-darwin --features cbinds
-# cargo build --release --target aarch64-apple-darwin --features cbinds
 
 # Create a universal binary for iOS
 mkdir -p target/universal-ios/release
-IOS_OUTPUT="target/universal-ios/release/libmodelutil.dylib"
-lipo -create -output "$IOS_OUTPUT" \
-  target/aarch64-apple-ios-sim/release/libmodelutil.dylib \
-  target/x86_64-apple-ios/release/libmodelutil.dylib
 
-# Create a universal binary for macOS
-#mkdir -p target/universal-darwin/release
-#OSX_OUTPUT="target/universal-darwin/release/libmodelutil.dylib"
-#lipo -create -output "$OSX_OUTPUT" \
-#  target/x86_64-apple-darwin/release/libmodelutil.dylib \
-#  target/aarch64-apple-darwin/release/libmodelutil.dylib
-
-echo "iOS lib: $IOS_OUTPUT"
-echo "OS X lib: $OSX_OUTPUT"
-
-IOS_FRAMEWORK=target/universal-ios/release/ModelUtil.framework
+IOS_FRAMEWORK=target/universal-ios/release/ModelUtil.xcframework
 rm -rf "$IOS_FRAMEWORK"
 mkdir -p "$IOS_FRAMEWORK"
-lipo -create "$IOS_OUTPUT" -output "$IOS_FRAMEWORK/ModelUtil"
+
+HEADERS="target/universal-ios/release/Headers"
+
+# Create a fat library for the simulator as xcodebuild -create-xcframework fails to do it
+lipo -create \
+    target/aarch64-apple-ios-sim/release/libmodelutil.a \
+    target/x86_64-apple-ios/release/libmodelutil.a \
+    -output target/universal-ios/release/libmodelutil.a
 
 # Copy in generated header files
-cbindgen --config cbindgen.toml --output "target/universal-ios/release/Headers/ModelUtil.h"
+cbindgen --config cbindgen.toml --output "$HEADERS/ModelUtil.h"
 
-tee "${IOS_FRAMEWORK}/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>
-    <string>com.knielsen.audio2midi.ModelUtil</string>
-
-    <key>CFBundleName</key>
-    <string>ModelUtil</string>
-
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-
-    <key>CFBundleVersion</key>
-    <string>1</string>
-
-    <key>LSMinimumSystemVersion</key>
-    <string>17.0</string>
-
-    <key>CFBundlePackageType</key>
-    <string>FMWK</string>
-
-    <key>NSPrincipalClass</key>
-    <string></string>
-
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-
-    <key>CFBundleSupportedPlatforms</key>
-    <array>
-        <string>iPhoneOS</string>
-    </array>
-
-    <key>UIRequiredDeviceCapabilities</key>
-    <array>
-        <string>arm64</string>
-    </array>
-
-    <key>CFBundleExecutable</key>
-    <string>ModelUtil</string>
-</dict>
-</plist>
-EOF
+xcodebuild -create-xcframework \
+    -library target/aarch64-apple-ios/release/libmodelutil.a -headers $HEADERS \
+    -library target/universal-ios/release/libmodelutil.a -headers $HEADERS \
+    -output "$IOS_FRAMEWORK"
 
 tee "${IOS_FRAMEWORK}/../ModelUtil.podspec" <<EOF
 Pod::Spec.new do |s|
@@ -90,8 +42,7 @@ Pod::Spec.new do |s|
   s.platform         = :ios, '17.0'
   s.requires_arc     = true
 
-  s.vendored_frameworks     = 'ModelUtil.framework'
-  # s.vendored_libraries      = 'ModelUtil.framework/libmodelutil.dylib'
+  s.vendored_frameworks     = 'ModelUtil.xcframework'
   s.source_files            = 'Headers/*.h'
   s.public_header_files     = 'Headers/*.h'
 end
