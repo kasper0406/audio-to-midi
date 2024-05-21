@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
-import rust_plugins
+import modelutil
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     # Append a frame at the beginning with the start of the first frame to make the stitching
@@ -37,7 +37,7 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     return output
 
 def predict_and_stitch(model, state, audio_frames, duration_per_frame: float, overlap=0.0):
-    _logits, probs = model.predict(state, audio_frames)
+    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, audio_frames)
 
     # HACK: Get rid of this!
     #       Currently we train the model to not output the last three frames, so the overlap will be different
@@ -101,8 +101,8 @@ def detailed_event_loss(
     to help evaluate how good a prediction is in a more detailed and "closer
     to the music way" than the ordinary loss function.
     """
-    predicted = rust_plugins.extract_events(np.array(output_probs))
-    predicted = rust_plugins.to_frame_events([predicted], output_probs.shape[0])[0]
+    predicted = modelutil.extract_events(np.array(output_probs))
+    predicted = modelutil.to_frame_events([predicted], output_probs.shape[0])[0]
     expected = expected[:predicted.shape[0]]
 
     full_diff = jnp.sum(jnp.abs(predicted - expected))
@@ -139,7 +139,7 @@ def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
         title=f"Probability distribution for {quantity}",
     )
 
-def load_newest_checkpoint(checkpoint_path: Path):
+def load_newest_checkpoint(checkpoint_path: Path, model_replication=True):
     num_devices = len(jax.devices())
 
     # The randomness does not matter as we will load a checkpoint model anyways
@@ -170,14 +170,15 @@ def load_newest_checkpoint(checkpoint_path: Path):
     
     audio_to_midi = eqx.combine(model_params, static_model)
 
-    # Replicate the model on all JAX devices
-    device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    if model_replication:
+        # Replicate the model on all JAX devices
+        device_mesh = mesh_utils.create_device_mesh((num_devices,))
+        mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
+        replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
 
-    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-    model_params = jax.device_put(model_params, replicate_everywhere)
-    audio_to_midi = eqx.combine(model_params, static_model)
+        model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+        model_params = jax.device_put(model_params, replicate_everywhere)
+        audio_to_midi = eqx.combine(model_params, static_model)
 
     audio_to_midi = eqx.nn.inference_mode(audio_to_midi)
     return audio_to_midi, state

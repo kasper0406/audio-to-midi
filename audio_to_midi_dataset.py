@@ -19,12 +19,12 @@ from numpy.typing import NDArray
 from typing import Optional, List
 from threading import Lock
 import math
-import rust_plugins
+import modelutil
 
 # TODO: Clean this up
 MIDI_EVENT_VOCCAB_SIZE = 90
 
-MAX_EVENT_TIMESTAMP = 5.0
+MAX_EVENT_TIMESTAMP = 3.0
 ACTIVE_EVENT_SEPARATOR = 2
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
@@ -32,8 +32,8 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 
 SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.95
-COMPRESSION_FACTOR = 1
+WINDOW_OVERLAP = 0.97
+COMPRESSION_FACTOR = None
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 180
 
@@ -87,7 +87,10 @@ def fft_audio(
     signal = signal.reshape(1, -1, 1)  # Batch size = 1, 1 feature
 
     # Window the input signal and apply a Hann window
-    hann_window = jnp.hanning(window_size)
+    # hann_window = jnp.hanning(window_size)
+    fun_window = jnp.arange(window_size) * (-0.001)
+    fun_window = jnp.exp(fun_window)
+
     patches = jax.lax.conv_general_dilated_patches(
         lhs=signal,
         filter_shape=(window_size,),
@@ -95,11 +98,21 @@ def fft_audio(
         padding='VALID',
         dimension_numbers=('NWC', 'WIO', 'NWC'),
     )
-    windows = patches.squeeze(axis=(0,)) * hann_window
+    windows = patches.squeeze(axis=(0,)) * fun_window
 
     # Apply the FFT
+    @jax.jit
+    def complex_absolute_value(complex_numbers):
+        # It is pretty lol that coremltools does not currently implement the absolute value
+        # of a complex number, so we can not use jnp.absolute.
+        # However, it does support extracting the real and imaginary parts, so we calculate the
+        # absolute value ourselves
+        real = jnp.real(complex_numbers)
+        imaginary = jnp.imag(complex_numbers)
+        return jnp.sqrt(jnp.square(real) + jnp.square(imaginary))
+
     fft = jax.vmap(jnp.fft.rfft)(windows)
-    absolute_values = jnp.transpose(jnp.absolute(fft)) / LINEAR_SCALING
+    absolute_values = jnp.transpose(complex_absolute_value(fft)) / LINEAR_SCALING
 
     if COMPRESSION_FACTOR is not None:
         # Do a logaritmic compression to emulate human hearing
@@ -176,7 +189,7 @@ class AudioToMidiDatasetLoader:
         hop_size = (1 - WINDOW_OVERLAP) * SAMPLES_PER_FFT
         num_frames = math.ceil((AudioToMidiDatasetLoader.SAMPLE_RATE * MAX_EVENT_TIMESTAMP) / hop_size)
         duration_per_frame = MAX_EVENT_TIMESTAMP / num_frames
-        audio_samples, midi_events_human, midi_events = rust_plugins.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
+        audio_samples, midi_events_human, midi_events = modelutil.load_events_and_audio(str(dataset_dir), samples, AudioToMidiDatasetLoader.SAMPLE_RATE, MAX_EVENT_TIMESTAMP, duration_per_frame)
         audio_samples = jnp.stack(audio_samples)
 
         required_padding = 0
@@ -263,7 +276,7 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
-        audio_samples = rust_plugins.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
+        audio_samples = modelutil.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
 
         window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
         overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
@@ -303,8 +316,8 @@ class AudioToMidiDatasetLoader:
     def _convert_samples(samples: Float[Array, "count channel samples"]):
         # Pad the signals with half the window size on each side to make sure the center of the Hann
         # window hits the full signal.
-        padding_width = int(SAMPLES_PER_FFT / 2)
-        padded_samples = jnp.pad(samples, ((0, 0), (0,0), (padding_width, padding_width)), mode='constant', constant_values=0)
+        padding_width = int(SAMPLES_PER_FFT)
+        padded_samples = jnp.pad(samples, ((0, 0), (0,0), (0, padding_width)), mode='constant', constant_values=0)
         left_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 0, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
         right_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 1, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
 
