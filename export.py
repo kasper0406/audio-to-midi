@@ -7,6 +7,7 @@ import jax
 import numpy as np
 import equinox.internal as eqxi
 import coremltools as ct
+import coremltools.optimize as cto
 
 from infer import load_newest_checkpoint
 from model import model_config
@@ -42,29 +43,27 @@ def export_model_to_tf(model, state):
     )
     def predict(data):
         logits, probs = predict_fn(state, data)
-        return {
-            "logits": logits,
-            "probs": probs,
-        }
+        return logits, probs
     module.predict = predict
 
     tf.saved_model.save(module, TF_MODEL_PATH,
         signatures={
             'predict': module.predict.get_concrete_function(),
         },
-        options=tf.saved_model.SaveOptions(save_debug_info=True)
+        options=tf.saved_model.SaveOptions(save_debug_info=False)
     )
 
 def export_data_prep_to_tf():
     module = tf.Module()
 
     @jax.jit
-    def foo(samples):
-        return AudioToMidiDatasetLoader._convert_samples(samples[np.newaxis, ...])
+    def prepare(samples):
+        frames, dpf, frame_width = AudioToMidiDatasetLoader._convert_samples(samples[np.newaxis, ...])
+        return frames, dpf, frame_width
 
     SAMPLE_COUNT = int(SAMPLE_RATE * DURATION)
     prepare_fn = jax2tf.convert(
-        foo,
+        prepare,
         polymorphic_shapes=[f"(2, {SAMPLE_COUNT})"],
         enable_xla=False,
     )
@@ -82,7 +81,7 @@ def export_data_prep_to_tf():
         signatures={
             'prepare': module.prepare.get_concrete_function(),
         },
-        options=tf.saved_model.SaveOptions(save_debug_info=True)
+        options=tf.saved_model.SaveOptions(save_debug_info=False)
     )
 
 
@@ -110,6 +109,13 @@ def export_model_to_coreml():
         # outputs=[ct.TensorType(dtype=np.float16), ct.TensorType(dtype=np.float16)],
         minimum_deployment_target=ct.target.iOS17,
         pass_pipeline=coreml_pipeline)
+    
+    # Kind of hacky output renaming, but better here then in the app...
+    spec = coreml_model.get_spec()
+    ct.utils.rename_feature(spec, "Identity", "logits")
+    ct.utils.rename_feature(spec, "Identity_1", "probs")
+    coreml_model = ct.models.model.MLModel(spec, weights_dir=coreml_model.weights_dir)
+
     coreml_model.save("Audio2Midi.mlpackage")
 
 def export_data_prep_to_coreml():
@@ -120,6 +126,22 @@ def export_data_prep_to_coreml():
         source='TensorFlow',
         minimum_deployment_target=ct.target.iOS17,
         pass_pipeline=coreml_pipeline)
+
+    # Kind of hacky output renaming, but better here then in the app...
+    spec = coreml_model.get_spec()
+    ct.utils.rename_feature(spec, "Identity", "frames")
+    ct.utils.rename_feature(spec, "Identity_1", "duration_per_frame")
+    ct.utils.rename_feature(spec, "Identity_2", "frame_width")
+    coreml_model = ct.models.model.MLModel(spec, weights_dir=coreml_model.weights_dir)
+    
+    # Try to optimize so our compute only function does not take 100MB storage...
+    coreml_model = cto.coreml.prune_weights(coreml_model, cto.coreml.OptimizationConfig(
+        global_config=cto.coreml.OpThresholdPrunerConfig(threshold=1e-5, weight_threshold=1)
+    ))
+    coreml_model = cto.coreml.palettize_weights(coreml_model, cto.coreml.OptimizationConfig(
+        global_config=cto.coreml.OpPalettizerConfig(mode="kmeans", nbits=4)
+    ))
+
     coreml_model.save("Audio2MidiSamplePrepare.mlpackage")
 
 if __name__ == "__main__":
@@ -134,10 +156,11 @@ if __name__ == "__main__":
         model_replication=False # Disable model sharding as it is not supported by coremlutils
     )
 
-    # export_model_to_tf(model, state)
+    print("Exporting the model itself...")
+    export_model_to_tf(model, state)
     # export_model_to_tf_lite()
-    # export_model_to_coreml()
+    export_model_to_coreml()
 
-
+    print("Exporting data prep...")
     export_data_prep_to_tf()
     export_data_prep_to_coreml()
