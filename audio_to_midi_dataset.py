@@ -24,7 +24,7 @@ import modelutil
 # TODO: Clean this up
 MIDI_EVENT_VOCCAB_SIZE = 90
 
-MAX_EVENT_TIMESTAMP = 5.0
+MAX_EVENT_TIMESTAMP = 3.0
 ACTIVE_EVENT_SEPARATOR = 2
 BLANK_MIDI_EVENT = -1
 BLANK_VELOCITY = 0
@@ -32,8 +32,8 @@ BLANK_DURATION = 0
 NUM_VELOCITY_CATEGORIES = 10
 
 SAMPLES_PER_FFT = 2 ** 12
-WINDOW_OVERLAP = 0.95
-COMPRESSION_FACTOR = 1
+WINDOW_OVERLAP = 0.97
+COMPRESSION_FACTOR = None
 FREQUENCY_CUTOFF = 4000
 LINEAR_SCALING = 180
 
@@ -87,7 +87,10 @@ def fft_audio(
     signal = signal.reshape(1, -1, 1)  # Batch size = 1, 1 feature
 
     # Window the input signal and apply a Hann window
-    hann_window = jnp.hanning(window_size)
+    # hann_window = jnp.hanning(window_size)
+    fun_window = jnp.arange(window_size) * (-0.001)
+    fun_window = jnp.exp(fun_window)
+
     patches = jax.lax.conv_general_dilated_patches(
         lhs=signal,
         filter_shape=(window_size,),
@@ -95,7 +98,7 @@ def fft_audio(
         padding='VALID',
         dimension_numbers=('NWC', 'WIO', 'NWC'),
     )
-    windows = patches.squeeze(axis=(0,)) * hann_window
+    windows = patches.squeeze(axis=(0,)) * fun_window
 
     # Apply the FFT
     fft = jax.vmap(jnp.fft.rfft)(windows)
@@ -303,8 +306,8 @@ class AudioToMidiDatasetLoader:
     def _convert_samples(samples: Float[Array, "count channel samples"]):
         # Pad the signals with half the window size on each side to make sure the center of the Hann
         # window hits the full signal.
-        padding_width = int(SAMPLES_PER_FFT / 2)
-        padded_samples = jnp.pad(samples, ((0, 0), (0,0), (padding_width, padding_width)), mode='constant', constant_values=0)
+        padding_width = int(SAMPLES_PER_FFT)
+        padded_samples = jnp.pad(samples, ((0, 0), (0,0), (0, padding_width)), mode='constant', constant_values=0)
         left_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 0, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
         right_frames = jax.vmap(fft_audio, (0, None, None))(padded_samples[:, 1, ...], SAMPLES_PER_FFT, WINDOW_OVERLAP)
 

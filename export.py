@@ -21,8 +21,8 @@ def export_model_to_tf(model, state):
     module = tf.Module()
     predict_fn = jax2tf.convert(
         eqxi.finalise_fn(model.predict),
-        polymorphic_shapes=["...", f"(1, 2, {NUM_FRAMES}, {FRAME_SIZE})"],
-        # with_gradient=False,
+        polymorphic_shapes=["...", f"(2, {NUM_FRAMES}, {FRAME_SIZE})"],
+        # with_gradient=False, We can not convert without gradients as it generates an PreventGradient op that coremltools does not know about
         enable_xla=False,
         # enable_xla=True, # coremltools does no support Xla :(
         # native_serialization=True,
@@ -31,14 +31,17 @@ def export_model_to_tf(model, state):
         # ]
     )
 
-    @tf.function(autograph=False, input_signature=[tf.TensorSpec(shape=(1, 2, NUM_FRAMES, FRAME_SIZE), dtype=tf.float32)], reduce_retracing=True)
+    @tf.function(
+        autograph=False,
+        input_signature=[tf.TensorSpec(shape=(2, NUM_FRAMES, FRAME_SIZE), dtype=tf.float32)],
+        reduce_retracing=True
+    )
     def predict(data):
         logits, probs = predict_fn(state, data)
-        # return {
-        #     "logits": logits,
-        #     "probs": probs,
-        # }
-        return probs
+        return {
+            "logits": logits,
+            "probs": probs,
+        }
     module.predict = predict
 
     tf.saved_model.save(module, TF_MODEL_PATH,
@@ -69,10 +72,10 @@ def export_model_to_coreml():
         source='TensorFlow',
         # debug=True,
         # inputs=[ct.TensorType(dtype=np.float16)],
-        # outputs=[ct.TensorType(dtype=np.float16)],
+        # outputs=[ct.TensorType(dtype=np.float16), ct.TensorType(dtype=np.float16)],
         minimum_deployment_target=ct.target.iOS17,
         pass_pipeline=coreml_pipeline)
-    coreml_model.save("audio2midi.mlpackage")
+    coreml_model.save("Audio2Midi.mlpackage")
 
 if __name__ == "__main__":
     tf.get_logger().setLevel('INFO')
@@ -89,5 +92,4 @@ if __name__ == "__main__":
     export_model_to_tf(model, state)
     # export_model_to_tf_lite()
 
-    # prepare_model_for_coreml()
     export_model_to_coreml()

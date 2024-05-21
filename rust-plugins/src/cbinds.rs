@@ -1,3 +1,5 @@
+use half::f16;
+use ndarray::ArrayView;
 
 #[repr(C)]
 pub struct MidiEvent {
@@ -15,26 +17,32 @@ pub struct MidiEventList {
 }
 
 #[no_mangle]
-pub extern "C" fn extract_midi_events(batch_size: i32, num_frames: i32, frame_size: i32, data: *const f32) -> *mut MidiEventList {
-    let mut result = vec![];
-    result.push(MidiEvent {
-        attack_time: 0,
-        note: 0,
-        duration: 0,
-        velocity: 0,
-    });
-    result.push(MidiEvent {
-        attack_time: 1,
-        note: 2,
-        duration: 3,
-        velocity: 4,
-    });
+pub extern "C" fn extract_midi_events(num_frames: i32, num_notes: i32, data: *const u8) -> *mut MidiEventList {
+    // Actually the pointer is to a f16 array, but we need to expose the pointer as something cbindgen knows about!
+    let data = data as *const f16;
+
+    let shape = [num_frames as usize, num_notes as usize];
+    let array_view = unsafe { ArrayView::from_shape_ptr(shape, data as *const f16) };
+    let raw_events = crate::common::extract_events(&array_view);
+
+    let mut events = vec![];
+    for (attack_time, note, duration, velocity) in raw_events {
+        let (attack_time, note, duration, velocity) = (
+            attack_time as u8,
+            note as u8,
+            duration as u8,
+            velocity as u8
+        );
+        events.push(MidiEvent {
+            attack_time, note, duration, velocity
+        })
+    }
 
     // The caller will be responsible for calling `free_midi_events` on the returned list
-    let length = result.len();
-    let _capacity = result.capacity();
-    let ptr = result.as_ptr() as *mut MidiEvent;
-    std::mem::forget(result);
+    let length = events.len();
+    let _capacity = events.capacity();
+    let ptr = events.as_ptr() as *mut MidiEvent;
+    std::mem::forget(events);
     Box::into_raw(Box::new(MidiEventList { ptr, length, _capacity }))
 }
 

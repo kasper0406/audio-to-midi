@@ -12,33 +12,68 @@ from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 model_config = {
     "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 512,
+    "intermediate_size": 512,
+    "num_heads": 2,
+    "num_layers": 4,
     "dropout_rate": 0.10,
     "midi_event_context_size": 1,
 
     "convolutions": [
         {
-            "internal_channels": 2,
-            "time_kernel": 2,
+            "internal_channels": 1,
+            "time_kernel": 4,
             "time_stride": 1,
             "freq_kernel": 3,
             "freq_stride": 1,
         },
         {
-            "internal_channels": 4,
-            "time_kernel": 3,
+            "internal_channels": 2,
+            "time_kernel": 6,
             "time_stride": 1,
-            "freq_kernel": 3,
+            "freq_kernel": 5,
             "freq_stride": 2,
         },
         {
-            "internal_channels": 6,
-            "time_kernel": 4,
+            "internal_channels": 2,
+            "time_kernel": 8,
+            "time_stride": 1,
+            "freq_kernel": 7,
+            "freq_stride": 1,
+        },
+        {
+            "internal_channels": 2,
+            "time_kernel": 10,
+            "time_stride": 1,
+            "freq_kernel": 5,
+            "freq_stride": 1,
+        },
+        {
+            "internal_channels": 4,
+            "time_kernel": 6,
             "time_stride": 1,
             "freq_kernel": 4,
+            "freq_stride": 2,
+        },
+        {
+            "internal_channels": 8,
+            "time_kernel": 8,
+            "time_stride": 1,
+            "freq_kernel": 4,
+            "freq_stride": 2,
+        },
+        {
+            "internal_channels": 16,
+            "time_kernel": 8,
+            "time_stride": 1,
+            "freq_kernel": 3,
+            "freq_stride": 1,
+        },
+        {
+            "internal_channels": 32,
+            "time_kernel": 8,
+            "time_stride": 1,
+            "freq_kernel": 5,
             "freq_stride": 2,
         }
     ],
@@ -506,5 +541,5 @@ class OutputSequenceGenerator(eqx.Module):
         return self.decoder(output, decoder_key), state
 
     def predict(self, state, frames):
-        (logits, probs), _state = jax.vmap(self, in_axes=(0, None, None), out_axes=(0, None))(frames, state, None)
+        (logits, probs), _state = self(frames, state, None)
         return logits, probs
