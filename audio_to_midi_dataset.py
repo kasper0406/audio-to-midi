@@ -101,8 +101,18 @@ def fft_audio(
     windows = patches.squeeze(axis=(0,)) * fun_window
 
     # Apply the FFT
+    @jax.jit
+    def complex_absolute_value(complex_numbers):
+        # It is pretty lol that coremltools does not currently implement the absolute value
+        # of a complex number, so we can not use jnp.absolute.
+        # However, it does support extracting the real and imaginary parts, so we calculate the
+        # absolute value ourselves
+        real = jnp.real(complex_numbers)
+        imaginary = jnp.imag(complex_numbers)
+        return jnp.sqrt(jnp.square(real) + jnp.square(imaginary))
+
     fft = jax.vmap(jnp.fft.rfft)(windows)
-    absolute_values = jnp.transpose(jnp.absolute(fft)) / LINEAR_SCALING
+    absolute_values = jnp.transpose(complex_absolute_value(fft)) / LINEAR_SCALING
 
     if COMPRESSION_FACTOR is not None:
         # Do a logaritmic compression to emulate human hearing

@@ -170,5 +170,6 @@ saved_checkpoints/**
 *.tgz
 .vscode
 tf_export
+tf_prepare
 *.tflite
 *.mlpackage

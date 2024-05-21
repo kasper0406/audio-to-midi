@@ -10,12 +10,16 @@ import coremltools as ct
 
 from infer import load_newest_checkpoint
 from model import model_config
+from audio_to_midi_dataset import AudioToMidiDatasetLoader
 
 # TODO: Figure out a way to not hardcode this
 NUM_FRAMES = 197
 FRAME_SIZE = model_config["frame_size"]
+SAMPLE_RATE = 8000.0
+DURATION = 3.0
 
 TF_MODEL_PATH = "./tf_export/"
+TF_PREPARE_PATH = "./tf_prepare/"
 
 def export_model_to_tf(model, state):
     module = tf.Module()
@@ -51,6 +55,37 @@ def export_model_to_tf(model, state):
         options=tf.saved_model.SaveOptions(save_debug_info=True)
     )
 
+def export_data_prep_to_tf():
+    module = tf.Module()
+
+    @jax.jit
+    def foo(samples):
+        return AudioToMidiDatasetLoader._convert_samples(samples[np.newaxis, ...])
+
+    SAMPLE_COUNT = int(SAMPLE_RATE * DURATION)
+    prepare_fn = jax2tf.convert(
+        foo,
+        polymorphic_shapes=[f"(2, {SAMPLE_COUNT})"],
+        enable_xla=False,
+    )
+
+    @tf.function(
+        autograph=False,
+        input_signature=[tf.TensorSpec(shape=(2, SAMPLE_COUNT), dtype=tf.float32)],
+        reduce_retracing=True
+    )
+    def prepare(samples):
+        return prepare_fn(samples)
+    module.prepare = prepare
+
+    tf.saved_model.save(module, TF_PREPARE_PATH,
+        signatures={
+            'prepare': module.prepare.get_concrete_function(),
+        },
+        options=tf.saved_model.SaveOptions(save_debug_info=True)
+    )
+
+
 def export_model_to_tf_lite():
     converter = tf.lite.TFLiteConverter.from_saved_model(TF_MODEL_PATH)
     # converter.optimizations = [ tf.lite.Optimize.DEFAULT ]
@@ -77,6 +112,16 @@ def export_model_to_coreml():
         pass_pipeline=coreml_pipeline)
     coreml_model.save("Audio2Midi.mlpackage")
 
+def export_data_prep_to_coreml():
+    coreml_pipeline = ct.PassPipeline()
+    coreml_pipeline.remove_passes([ "common::merge_consecutive_reshapes" ])
+
+    coreml_model = ct.convert(TF_PREPARE_PATH,
+        source='TensorFlow',
+        minimum_deployment_target=ct.target.iOS17,
+        pass_pipeline=coreml_pipeline)
+    coreml_model.save("Audio2MidiSamplePrepare.mlpackage")
+
 if __name__ == "__main__":
     tf.get_logger().setLevel('INFO')
 
@@ -89,7 +134,10 @@ if __name__ == "__main__":
         model_replication=False # Disable model sharding as it is not supported by coremlutils
     )
 
-    export_model_to_tf(model, state)
+    # export_model_to_tf(model, state)
     # export_model_to_tf_lite()
+    # export_model_to_coreml()
 
-    export_model_to_coreml()
+
+    export_data_prep_to_tf()
+    export_data_prep_to_coreml()
