@@ -19,7 +19,7 @@ from functools import reduce
 from more_itertools import chunked
 import numpy as np
 
-from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample
+from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
 
@@ -64,19 +64,19 @@ def compute_training_step(
 
 
 @lru_cache(maxsize=1)
-def load_test_set(testset_dir: Path, sharding, batch_size: int):
+def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
     chunks = chunked(sample_names, batch_size)
 
     batches = []
     for chunk in chunks:
-        midi_events, _, audio = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
+        midi_events, audio = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, chunk, sharding=sharding)
         batches.append((chunk, audio, midi_events))
     return batches
 
-def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
     inference_model = eqx.nn.inference_mode(model)
-    batches = load_test_set(testset_dir, sharding, batch_size=batch_size)
+    batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
     loss_map = {}
@@ -97,8 +97,8 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.ra
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model, state, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model, state, testset_dir, key, sharding, batch_size)
+def compute_testset_loss(model, state, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model, state, testset_dir, num_model_output_frames, key, sharding, batch_size)
 
     test_loss = jnp.zeros((1,))
     hit_rate = jnp.zeros((1,))
@@ -126,6 +126,7 @@ def train(
     testloss_csv: Optional[any],
     learning_rate_schedule: Callable,
     device_mesh: [],
+    num_model_output_frames: int,
     testset_dirs: Dict[str, Path],
     num_steps: int = 10000,
     print_every: int = 1000,
@@ -208,7 +209,7 @@ def train(
             print("Evaluating test losses...")
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, num_model_output_frames, eval_key, batch_sharding)
                 if testloss_csv is not None:
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 testset_hitrates[name] = float(hit_rate)
@@ -307,8 +308,17 @@ def main():
     # The filtering is necessary to have the opt-state flattening working
     opt_state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
 
+    # TODO(knielsen): Find a better way of doing this
+    (find_shape_output_logits, _), _ = audio_to_midi(
+        jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
+        state
+    )
+    num_model_output_frames = find_shape_output_logits.shape[0]
+    print(f"Model output frames: {num_model_output_frames}")
+
     print("Setting up dataset loader...")
     dataset_loader = AudioToMidiDatasetLoader(
+        num_model_output_frames=num_model_output_frames,
         dataset_dir=dataset_dir,
         batch_size=batch_size,
         prefetch_count=dataset_prefetch_count,
@@ -335,6 +345,7 @@ def main():
                 testloss_csv=testloss_csv,
                 learning_rate_schedule=learning_rate_schedule,
                 device_mesh=device_mesh,
+                num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
                 testset_dirs=testset_dirs,
                 num_steps=num_steps,
                 print_every=1,

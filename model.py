@@ -20,8 +20,8 @@ model_config = {
     "max_frame_sequence_length": 200,
     "attention_size": 32,
     "intermediate_size": 32,
-    "num_heads": 2,
-    "num_layers": 4,
+    "num_heads": 4,
+    "num_layers": 2,
     "dropout_rate": 0.10,
 
     "convolutions": [

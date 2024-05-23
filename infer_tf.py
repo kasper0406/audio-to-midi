@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import modelutil
 import math
 import numpy as np
-from audio_to_midi_dataset import MAX_EVENT_TIMESTAMP, AudioToMidiDatasetLoader
+from audio_to_midi_dataset import MODEL_AUDIO_LENGTH, AudioToMidiDatasetLoader
 
 parser = argparse.ArgumentParser(description='infer_tf Example utility to show how to infer using TensorFlow instead of JAX.')
 parser.add_argument('file', help='The path to the audio file to infer')
@@ -14,7 +14,7 @@ parser.add_argument('--overlap', type=float, default=0.5, help='The overlap valu
 parser.add_argument('--tflite', help='If set, the TFLite model will be used used for inference', action='store_true')
 
 def create_audio_samples_window(overlap: float):
-    window_size = round(MAX_EVENT_TIMESTAMP * AudioToMidiDatasetLoader.SAMPLE_RATE)
+    window_size = round(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)
     overlap = round(overlap * AudioToMidiDatasetLoader.SAMPLE_RATE)
 
     step = window_size - overlap
