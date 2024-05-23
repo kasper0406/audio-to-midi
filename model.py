@@ -1,13 +1,20 @@
 from functools import partial
 from typing import Dict, List, Optional
+import types
+import json
 
 import equinox as eqx
 import jax
+import jax.lib
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer, PRNGKeyArray
 
 import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
+
+@jax.jit
+def identity(arg):
+    return arg
 
 model_config = {
     "max_frame_sequence_length": 200,
@@ -22,50 +29,68 @@ model_config = {
             "internal_channels": 1,
             "kernel": 1,
             "stride": 1,
+            "activation": identity
         },
         {
             "internal_channels": 2,
             "kernel": 4,
             "stride": 2,
+            "activation": identity
         },
         {
             "internal_channels": 4,
             "kernel": 4,
             "stride": 2,
+            "activation": identity
         },
         {
             "internal_channels": 8,
             "kernel": 4,
             "stride": 2,
+            "activation": jax.nn.leaky_relu
         },
         {
             "internal_channels": 16,
             "kernel": 4,
             "stride": 2,
+            "activation": jax.nn.leaky_relu
         },
         {
             "internal_channels": 32,
             "kernel": 4,
             "stride": 2,
+            "activation": jax.nn.leaky_relu
         },
         {
             "internal_channels": 64,
             "kernel": 4,
             "stride": 2,
+            "activation": jax.nn.relu
         },
         {
             "internal_channels": 128,
             "kernel": 4,
             "stride": 2,
+            "activation": jax.nn.relu
         },
     ],
 }
 
+def serialize_function(obj):
+    if isinstance(obj, types.FunctionType):
+        return f"<function {obj.__name__}>"
+    if isinstance(obj, jax.lib.xla_extension.PjitFunction):
+        return f"<pjit_fn {obj.__name__}>"
+    if isinstance(obj, jax.custom_jvp):
+        return f"<custom_jvp {obj.__name__}>"
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
 def get_model_metadata():
-    return {
+    metadata = {
         'model': model_config,
         'data_prep': get_data_prep_config(),
     }
+    return json.dumps(metadata, default=serialize_function)
 
 def _split_key(key, num: int = 2):
     if key is None:
@@ -114,7 +139,7 @@ class FrameEmbedding(eqx.Module):
                     padding=(0,),
                     key=conv_key)
             )
-            self.layers.append(jax.nn.gelu)
+            self.layers.append(conv_settings["activation"])
             self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
 
             conv_inputs = conv_settings["internal_channels"]
