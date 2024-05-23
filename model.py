@@ -10,72 +10,54 @@ import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
 model_config = {
-    "frame_size": 2048,
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 512,
+    "attention_size": 32,
+    "intermediate_size": 32,
     "num_heads": 2,
     "num_layers": 4,
     "dropout_rate": 0.10,
-    "midi_event_context_size": 1,
 
     "convolutions": [
         {
             "internal_channels": 1,
-            "time_kernel": 4,
-            "time_stride": 1,
-            "freq_kernel": 3,
-            "freq_stride": 1,
+            "kernel": 1,
+            "stride": 1,
         },
         {
             "internal_channels": 2,
-            "time_kernel": 6,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 2,
-        },
-        {
-            "internal_channels": 2,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 7,
-            "freq_stride": 1,
-        },
-        {
-            "internal_channels": 2,
-            "time_kernel": 10,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 1,
+            "kernel": 4,
+            "stride": 2,
         },
         {
             "internal_channels": 4,
-            "time_kernel": 6,
-            "time_stride": 1,
-            "freq_kernel": 4,
-            "freq_stride": 2,
+            "kernel": 4,
+            "stride": 2,
         },
         {
             "internal_channels": 8,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 4,
-            "freq_stride": 2,
+            "kernel": 4,
+            "stride": 2,
         },
         {
             "internal_channels": 16,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 3,
-            "freq_stride": 1,
+            "kernel": 4,
+            "stride": 2,
         },
         {
             "internal_channels": 32,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 2,
-        }
+            "kernel": 4,
+            "stride": 2,
+        },
+        {
+            "internal_channels": 64,
+            "kernel": 4,
+            "stride": 2,
+        },
+        {
+            "internal_channels": 128,
+            "kernel": 4,
+            "stride": 2,
+        },
     ],
 }
 
@@ -94,7 +76,6 @@ def _split_key(key, num: int = 2):
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
-    frame_size: int
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
@@ -104,7 +85,6 @@ class FrameEmbedding(eqx.Module):
     def __init__(
         self,
         output_shape: int,
-        frame_size: int,  # Size of the processed audio frame
         max_frame_sequence_length: int,  # The maximum number of input frames
         dropout_rate: float,
         key: PRNGKeyArray,
@@ -112,7 +92,6 @@ class FrameEmbedding(eqx.Module):
     ):
         pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
 
-        self.frame_size = frame_size
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
@@ -124,32 +103,29 @@ class FrameEmbedding(eqx.Module):
 
         self.layers = []
         conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
-        conv_height = frame_size
         conv_inputs = input_channels
         for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
             self.layers.append(
-                eqx.nn.Conv2d(
+                eqx.nn.Conv1d(
                     in_channels=conv_inputs,
                     out_channels=conv_settings["internal_channels"],
-                    kernel_size=(conv_settings["time_kernel"], conv_settings["freq_kernel"]),
-                    stride=(conv_settings["time_stride"], conv_settings["freq_stride"]),
-                    padding=(int(conv_settings["time_kernel"] / 2) - 1, int(conv_settings["freq_kernel"] / 2)),
+                    kernel_size=(conv_settings["kernel"],),
+                    stride=(conv_settings["stride"],),
+                    padding=(0,),
                     key=conv_key)
             )
             self.layers.append(jax.nn.gelu)
             self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
 
-            conv_height = int(conv_height / conv_settings["freq_stride"])
             conv_inputs = conv_settings["internal_channels"]
             # print(f"Conv height: {conv_height}")
 
         self.layers.append(
-            eqx.nn.Conv2d(
+            eqx.nn.Conv1d(
                 in_channels=conv_inputs,
                 out_channels=output_shape,
-                kernel_size=(1, conv_height),
-                stride=(1, conv_height),
-                # padding=0,
+                kernel_size=(1,),
+                stride=(1,),
                 key=output_conv_key
             )
         )
@@ -480,8 +456,6 @@ class OutputSequenceGenerator(eqx.Module):
     decoder: Decoder
     dropout: eqx.nn.Dropout
 
-    midi_event_context_size: int = eqx.field(static=True)
-
     def __init__(
         self,
         conf: Dict[str, any],
@@ -500,7 +474,6 @@ class OutputSequenceGenerator(eqx.Module):
 
         self.frame_embedding = FrameEmbedding(
             output_shape=conf["attention_size"],
-            frame_size=conf["frame_size"],
             max_frame_sequence_length=conf["max_frame_sequence_length"],
             key=frame_embedding_key,
             dropout_rate=conf["dropout_rate"],
@@ -512,8 +485,6 @@ class OutputSequenceGenerator(eqx.Module):
         )
 
         self.dropout = eqx.nn.Dropout(conf["dropout_rate"])
-
-        self.midi_event_context_size = conf["midi_event_context_size"]
 
     def __call__(
         self,

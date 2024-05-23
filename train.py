@@ -34,28 +34,25 @@ def compute_loss_from_output(logits, expected_output):
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, audio_frames, expected_outputs, key):
-    batch_size = audio_frames.shape[0]
+def compute_loss(model, state, audio, expected_outputs, key):
+    batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     (logits, probs), state = jax.vmap(
         model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
-    )(audio_frames, state, batched_keys, True)
+    )(audio, state, batched_keys, True)
 
     loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
     return jnp.mean(loss), state
 
 @eqx.filter_jit
 def compute_training_step(
-    model, state, audio_frames, expected_outputs, opt_state, key, tx,
+    model, state, audio, expected_outputs, opt_state, key, tx,
 ):
-    # print(f"Audio frames shape: {audio_frames.shape}")
-    # print(f"Expected outputs shape: {expected_outputs.shape}")
-
     key, new_key = jax.random.split(key)
     (loss, state), grads = compute_loss(
         model,
         state,
-        audio_frames=audio_frames,
+        audio=audio,
         expected_outputs=expected_outputs,
         key=key,
     )
@@ -73,8 +70,8 @@ def load_test_set(testset_dir: Path, sharding, batch_size: int):
 
     batches = []
     for chunk in chunks:
-        midi_events, _, frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
-        batches.append((chunk, frames, midi_events))
+        midi_events, _, audio = AudioToMidiDatasetLoader.load_samples(testset_dir, chunk, minimum_midi_event_size=128, sharding=sharding)
+        batches.append((chunk, audio, midi_events))
     return batches
 
 def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.random.PRNGKey, sharding, batch_size=32):
@@ -83,9 +80,9 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, key: jax.ra
     print("Loaded test set")
 
     loss_map = {}
-    for sample_names, frames, midi_events in batches:
-        test_loss_keys = jax.random.split(key, num=frames.shape[0])
-        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(frames, state, test_loss_keys)
+    for sample_names, audio, midi_events in batches:
+        test_loss_keys = jax.random.split(key, num=audio.shape[0])
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(audio, state, test_loss_keys)
         test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
 
         for sample_name, loss, predicted_probs, events in zip(sample_names, test_losses, probs, midi_events):
@@ -157,8 +154,8 @@ def train(
         testset_hitrates[name] = sys.float_info.max
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
-        (audio_frames, events) = jax.device_put(
-            (batch["audio_frames"], batch["events"]),
+        (audio, events) = jax.device_put(
+            (batch["audio"], batch["events"]),
             batch_sharding,
         )
 
@@ -169,7 +166,7 @@ def train(
         loss, model, state, opt_state, key = compute_training_step(
             model,
             state,
-            audio_frames,
+            audio,
             events,
             opt_state,
             key,
@@ -202,7 +199,7 @@ def train(
             averaged_loss = (loss_sum / print_every)[0]
 
             if trainloss_csv is not None:
-                trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio_frames.shape[0], learning_rate])
+                trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio.shape[0], learning_rate])
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
 
             loss_sum = jnp.array([0.0], dtype=jnp.float32)
@@ -213,7 +210,7 @@ def train(
                 eval_key, key = jax.random.split(key, num=2)
                 testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, eval_key, batch_sharding)
                 if testloss_csv is not None:
-                    testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio_frames.shape[0]])
+                    testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
 

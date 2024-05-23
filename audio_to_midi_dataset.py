@@ -200,17 +200,9 @@ class AudioToMidiDatasetLoader:
                 audio_samples = jnp.repeat(audio_samples, repeats=required_padding, axis=0)
             audio_samples = jax.device_put(audio_samples, sharding)
 
-        frames, calculated_duration_per_frame, frame_width = AudioToMidiDatasetLoader._convert_samples(audio_samples)
-        if required_padding > 0:
-            frames = frames[:-required_padding, ...]
-
         midi_events = jnp.stack(midi_events)
-        # HACK: This padding shouldn't really be necessary
-        midi_events = jnp.pad(midi_events, ((0,0), (0, frames.shape[2] - midi_events.shape[1]), (0, 0)), constant_values=0)
 
-        if abs(calculated_duration_per_frame - duration_per_frame) > 0.001:
-            raise CalculatedFrameDurationInvalid(calculated_duration_per_frame, duration_per_frame)
-        return midi_events, midi_events_human, frames, calculated_duration_per_frame, frame_width
+        return midi_events, midi_events_human, audio_samples
 
     def _data_load_thread(
         self,
@@ -249,30 +241,22 @@ class AudioToMidiDatasetLoader:
                     self._stop_event.set()
                     return
 
-            try:
-                # print(f"Loading {len(samples_to_load)} samples")
-                # print(f"Actual samplpes: {samples_to_load}")
-                midi_events, midi_events_human, frames, dps, frame_width = self.load_samples(self.dataset_dir, samples_to_load, None, self.sharding)
+            # print(f"Loading {len(samples_to_load)} samples")
+            # print(f"Actual samplpes: {samples_to_load}")
+            midi_events, midi_events_human, audio = self.load_samples(self.dataset_dir, samples_to_load, None, self.sharding)
 
-                sample_keys = jax.random.split(batch_key, num=batch_size)
-                selected_audio_frames = jax.vmap(perturb_audio_frames)(frames, sample_keys)
+            # sample_keys = jax.random.split(batch_key, num=batch_size)
+            # selected_audio_frames = jax.vmap(perturb_audio_frames)(frames, sample_keys)
 
-                while len(self.queue) >= self.prefetch_count:
-                    # print("Backing off, as the queue is full")
-                    time.sleep(0.05)
-                self.queue.append({
-                    "audio_frames": selected_audio_frames,
-                    "events": midi_events,
-                    "events_human": midi_events_human,
-                    "duration_per_frame_in_secs": dps,
-                    "frame_width_in_secs": frame_width,
-                    "sample_names": samples_to_load,
-                })
-            except CalculatedFrameDurationInvalid as e:
-                calc_dpf = e.calculated_dpf
-                actual_dpf = e.actual_dpf
-                print(f"Calculated duration per frame {calc_dpf} does not line up with actual duration per frame {actual_dpf}." +
-                    f"Difference was {abs(calc_dpf - actual_dpf)}. Trying again...")
+            while len(self.queue) >= self.prefetch_count:
+                # print("Backing off, as the queue is full")
+                time.sleep(0.05)
+            self.queue.append({
+                "audio": audio,
+                "events": midi_events,
+                "events_human": midi_events_human,
+                "sample_names": samples_to_load,
+            })
 
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
