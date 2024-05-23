@@ -59,7 +59,7 @@ def export_data_prep_to_tf():
     @jax.jit
     def prepare(samples):
         frames, dpf, frame_width = AudioToMidiDatasetLoader._convert_samples(samples[np.newaxis, ...])
-        return frames, dpf, frame_width
+        return frames[0], dpf, frame_width
 
     SAMPLE_COUNT = int(SAMPLE_RATE * DURATION)
     prepare_fn = jax2tf.convert(
@@ -144,6 +144,23 @@ def export_data_prep_to_coreml():
 
     coreml_model.save("Audio2MidiSamplePrepare.mlpackage")
 
+def test_coreml_preparation():
+    coreml_model = ct.models.MLModel("Audio2MidiSamplePrepare.mlpackage")
+
+    import modelutil
+    testfile = "/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha/C major scale.aif"
+    audio_samples = modelutil.load_full_audio(str(testfile), AudioToMidiDatasetLoader.SAMPLE_RATE)
+
+    result = coreml_model.predict({
+        "samples": audio_samples[:, 0 : int(SAMPLE_RATE * DURATION)]
+    })
+    frames = result["frames"]
+    dpf = result["duration_per_frame"]
+    frame_width = result["frame_width"]
+    print(f"Frames: {frames}, max_value = {np.max(frames)}")
+    print(f"Duration Per Frame: {dpf}")
+    print(f"Frame width: {frame_width}")
+
 if __name__ == "__main__":
     tf.get_logger().setLevel('INFO')
 
@@ -164,3 +181,4 @@ if __name__ == "__main__":
     print("Exporting data prep...")
     export_data_prep_to_tf()
     export_data_prep_to_coreml()
+    test_coreml_preparation()
