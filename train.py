@@ -25,10 +25,6 @@ from infer import detailed_event_loss
 
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
-    # TODO: Get rid of this hack!
-    #       This is due to the convolution shrinking the output logits.
-    #       This should be handled in a better way...
-    expected_output = expected_output[:logits.shape[0], ...]
     loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
     return jnp.sum(loss)
 
