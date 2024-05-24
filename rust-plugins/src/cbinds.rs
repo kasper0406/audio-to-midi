@@ -1,5 +1,6 @@
 use half::f16;
 use ndarray::ArrayView;
+use ndarray::ShapeBuilder;
 
 #[repr(C)]
 pub struct MidiEvent {
@@ -17,11 +18,11 @@ pub struct MidiEventList {
 }
 
 #[no_mangle]
-pub extern "C" fn extract_midi_events(num_frames: i32, num_notes: i32, data: *const u8) -> *mut MidiEventList {
+pub extern "C" fn extract_midi_events(num_frames: i32, frame_stride: i32, num_notes: i32, note_stride: i32, data: *const u8) -> *mut MidiEventList {
     // Actually the pointer is to a f16 array, but we need to expose the pointer as something cbindgen knows about!
     let data = data as *const f16;
 
-    let shape = [num_frames as usize, num_notes as usize];
+    let shape = (num_frames as usize, num_notes as usize).strides((frame_stride as usize, note_stride as usize));
     let array_view = unsafe { ArrayView::from_shape_ptr(shape, data as *const f16) };
     let raw_events = crate::common::extract_events(&array_view);
 
