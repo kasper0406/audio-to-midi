@@ -187,7 +187,7 @@ class AudioToMidiDatasetLoader:
 
     @classmethod
     def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sharding = None):
-        audio_samples, midi_events = modelutil.load_events_and_audio(
+        audio_samples, midi_events, sample_names = modelutil.load_events_and_audio(
             str(dataset_dir),
             samples,
             AudioToMidiDatasetLoader.SAMPLE_RATE,
@@ -205,7 +205,7 @@ class AudioToMidiDatasetLoader:
 
         midi_events = jnp.stack(midi_events)
 
-        return midi_events, audio_samples
+        return midi_events, audio_samples, sample_names
 
     def _data_load_thread(
         self,
@@ -225,6 +225,7 @@ class AudioToMidiDatasetLoader:
         #       Currently needed because load_samples can return more samples than request for longer audio files.
         audio_batch = jnp.zeros((0, 2, int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)))
         event_batch = jnp.zeros((0, self.num_model_output_frames, MIDI_EVENT_VOCCAB_SIZE))
+        sample_names_batch = []
         while True:
             if self._stop_event.is_set():
                 return
@@ -250,10 +251,11 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            midi_events, audio = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, self.sharding)
+            midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, self.sharding)
 
             audio_batch = jnp.concatenate([ audio_batch, audio ])
             event_batch = jnp.concatenate([ event_batch, midi_events ])
+            sample_names_batch.extend(sample_names)
 
             # sample_keys = jax.random.split(batch_key, num=batch_size)
             # selected_audio_frames = jax.vmap(perturb_audio_frames)(frames, sample_keys)
@@ -261,9 +263,11 @@ class AudioToMidiDatasetLoader:
             while audio_batch.shape[0] > batch_size:
                 next_audio = audio_batch[0:batch_size, ...]
                 next_events = event_batch[0:batch_size, ...]
+                next_sample_names = sample_names_batch[0:batch_size]
 
                 audio_batch = audio_batch[batch_size:, ...]
                 event_batch = event_batch[batch_size:, ...]
+                sample_names_batch = sample_names_batch[batch_size:]
 
                 while len(self.queue) >= self.prefetch_count:
                     # print("Backing off, as the queue is full")
@@ -271,7 +275,7 @@ class AudioToMidiDatasetLoader:
                 self.queue.append({
                     "audio": next_audio,
                     "events": next_events,
-                    # "sample_names": samples_to_load, # TODO: Fix this, now multiple samples can come from the same file
+                    "sample_names": next_sample_names,
                 })
 
     @classmethod
@@ -518,8 +522,8 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
-        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
         batch_size=1,
         prefetch_count=1,
         key=key,
@@ -541,8 +545,7 @@ if __name__ == "__main__":
 
         batch_idx = random.randint(0, loaded_batch["audio"].shape[0] - 1)
         visualize_sample(
-            # loaded_batch["sample_names"][batch_idx], TODO: FIX
-            "",
+            loaded_batch["sample_names"][batch_idx],
             loaded_batch["audio"][batch_idx],
             loaded_batch["events"][batch_idx],
         )

@@ -22,6 +22,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 use std::process::Stdio;
 use futures::future::join_all;
+use half::f16;
+use num_traits::cast::AsPrimitive;
 
 use log::{debug, error, info, trace, warn};
 
@@ -219,10 +221,27 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
         Err(err) => return Err(AudioLoadingError::IoError(err, String::from(input_file))),
     }
 
-    let left_samples = read_samples_from_file(left_output_file, sample_rate, maybe_max_duration);
-    let right_samples = read_samples_from_file(right_output_file, sample_rate, maybe_max_duration);
+    let left_samples_future = read_samples_from_file(left_output_file, sample_rate, maybe_max_duration);
+    let right_samples_future = read_samples_from_file(right_output_file, sample_rate, maybe_max_duration);
 
-    Ok((left_samples.await?, right_samples.await?))
+    let left_samples = left_samples_future.await?;
+    let right_samples = right_samples_future.await?;
+
+    // Normalize the audio samples and convert to fp16 precision
+    let max_value_left = left_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
+    let max_value_right = right_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
+    let total_max = max_value_left.max(max_value_right);
+
+    let normalized_left: Vec<f32> = left_samples.iter()
+        .map(|sample| f16::from_f32(sample / total_max))
+        .map(|sample| sample.as_()) // TODO: Kind of hacky, but this is support returning f32
+        .collect();
+    let normalized_right: Vec<f32> = right_samples.iter()
+        .map(|sample| f16::from_f32(sample / total_max))
+        .map(|sample| sample.as_()) // TODO: Kind of hacky, but this is support returning f32
+        .collect();
+
+    Ok((normalized_left, normalized_right))
 }
 
 async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
@@ -309,7 +328,7 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 }
 
 #[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32) -> PyResult<(Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
     let duration_per_frame = model_duration as f64 / num_model_outputs as f64;
 
@@ -318,7 +337,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
             let mut audio_futures = vec![];
             let mut event_futures = vec![];
 
-            for sample_file in sample_files {
+            for sample_file in &sample_files {
                 let sampel_file_clone = sample_file.clone();
 
                 let audio_future = TOKIO_RUNTIME.spawn(async move {
@@ -345,8 +364,10 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
             debug!("Event frame count {}, max_duration = {}, dpf = {}", num_model_outputs, model_duration, duration_per_frame);
             // TODO: Try to make this nicer...
-            let (audio_samples, events_by_frame): (Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<Vec<f32>>>) = events.iter().zip(audio_samples.iter())
-                .map(|(events, samples)| {
+            let (audio_samples, events_by_frame, sample_names): (Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<Vec<f32>>>, Vec<String>) = events.iter()
+                    .zip(audio_samples.iter())
+                    .zip(sample_files.iter())
+                .map(|((events, samples), sample_file_name)| {
                     // events and samples may be too big for the model to handle. We will split them out
                     let (left_samples, right_samples) = samples;
                     let samples_per_model_call = (sample_rate as f32 * model_duration) as usize;
@@ -354,6 +375,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
                     let mut sample_splits = vec![];
                     let mut event_splits = vec![];
+                    let mut sample_name_split = vec![];
                     for split in 0..num_splits {
                         let start_frame = split * num_model_outputs as i32;
                         let start_sample = (split * samples_per_model_call as i32) as usize;
@@ -372,38 +394,45 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                         if samples_to_copy > samples_per_model_call / 2 {
                             sample_splits.push((split_samples_left, split_samples_right));
                             event_splits.push(frame_events);
+                            sample_name_split.push(format!["{}+{}", sample_file_name, split]);
                         }
                     }
 
-                    (sample_splits, event_splits)
+                    (sample_splits, event_splits, sample_name_split)
                 })
-                .fold((Vec::new(), Vec::new()), |(mut acc_a, mut acc_b), (a, b)| {
+                .fold((Vec::new(), Vec::new(), Vec::new()), |(mut acc_a, mut acc_b, mut acc_c), (a, b, c)| {
                     acc_a.extend(a.into_iter().collect::<Vec<_>>());
                     acc_b.extend(b.into_iter().collect::<Vec<_>>());
-                    (acc_a, acc_b)
+                    acc_c.extend(c.into_iter().collect::<Vec<_>>());
+                    (acc_a, acc_b, acc_c)
                 });
 
-            (audio_samples, events_by_frame)
+            (audio_samples, events_by_frame, sample_names)
         })
     });
 
     let mut audio_results = vec![];
     let mut events_by_frame_results = vec![];
-    let (all_audio_samples, events_by_frame) = all_samples;
+    let mut sample_name_results = vec![];
+    let (all_audio_samples, events_by_frame, sample_names) = all_samples;
     let iter = all_audio_samples.into_iter()
         .zip(events_by_frame.into_iter())
-        .map(|((a, b), c)| (a, b, c));
-    for (left_samples, right_samples, events_by_frame) in iter {
+        .zip(sample_names.into_iter())
+        .map(|((((a, b), c), d))| (a, b, c, d));
+    for (left_samples, right_samples, events_by_frame, sample_name) in iter {
         let samples_vec = vec![left_samples, right_samples];
         let audio_array = PyArray2::from_vec2(py, &samples_vec)?.to_owned();
         audio_results.push(audio_array);
 
         let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
         events_by_frame_results.push(converted_events_by_frame);
+
+        sample_name_results.push(sample_name);
     }
     Ok((
         PyList::new(py, &audio_results).into(),
-        PyList::new(py, &events_by_frame_results).into()
+        PyList::new(py, &events_by_frame_results).into(),
+        PyList::new(py, &sample_name_results).into()
     ))
 }
 
