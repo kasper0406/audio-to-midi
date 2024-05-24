@@ -230,7 +230,12 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
     // Normalize the audio samples and convert to fp16 precision
     let max_value_left = left_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
     let max_value_right = right_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
-    let total_max = max_value_left.max(max_value_right);
+    let mut total_max = max_value_left.max(max_value_right);
+    if total_max < 0.03 {
+        // If the audio is very quite, there is a good chance it is silent everywhere, or it is simply noise
+        // We do not want to normalize this due to division by 0 concerns
+        total_max = 1.0
+    }
 
     let normalized_left: Vec<f32> = left_samples.iter()
         .map(|sample| f16::from_f32(sample / total_max))
