@@ -66,7 +66,7 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for chunk in chunks:
-        midi_events, audio = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, chunk, sharding=sharding)
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, chunk, sharding=sharding)
         batches.append((chunk, audio, midi_events))
     return batches
 

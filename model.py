@@ -18,60 +18,93 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 1024,
-    "num_heads": 6,
-    "num_layers": 14,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.10,
 
     "convolutions": [
         {
-            "internal_channels": 2,
-            "kernel": 1,
+            "internal_channels": 4,
+            "kernel": 2,
             "stride": 1,
             "activation": identity
         },
         {
-            "internal_channels": 4,
-            "kernel": 4,
+            "internal_channels": 6,
+            "kernel": 5,
             "stride": 2,
             "activation": identity
         },
         {
-            "internal_channels": 8,
-            "kernel": 4,
-            "stride": 2,
+            "internal_channels": 10,
+            "kernel": 5,
+            "stride": 1,
             "activation": identity
         },
         {
             "internal_channels": 16,
-            "kernel": 4,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu
+            "kernel": 5,
+            "stride": 1,
+            "activation": jax.nn.leaky_relu,
+            "use_dropout": True,
         },
         {
             "internal_channels": 32,
-            "kernel": 4,
+            "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.leaky_relu
+            "activation": jax.nn.leaky_relu,
+            "use_dropout": True,
         },
         {
             "internal_channels": 64,
-            "kernel": 4,
+            "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.leaky_relu
+            "activation": jax.nn.leaky_relu,
+            "use_dropout": True,
         },
         {
             "internal_channels": 128,
-            "kernel": 4,
+            "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.relu
+            "activation": jax.nn.leaky_relu,
+            "use_dropout": True,
         },
         {
             "internal_channels": 256,
-            "kernel": 4,
+            "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.relu
+            "activation": jax.nn.relu,
+            "use_dropout": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 5,
+            "stride": 2,
+            "activation": jax.nn.relu,
+            "use_dropout": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 5,
+            "stride": 2,
+            "activation": jax.nn.relu,
+            "use_dropout": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 3,
+            "stride": 1,
+            "activation": jax.nn.relu,
+            "use_dropout": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 3,
+            "stride": 1,
+            "activation": jax.nn.relu,
+            "use_dropout": True,
         },
     ],
 }
@@ -140,6 +173,8 @@ class FrameEmbedding(eqx.Module):
                     key=conv_key)
             )
             self.layers.append(conv_settings["activation"])
+            if "use_dropout" in conv_settings and conv_settings["use_dropout"]:
+                self.layers.append(eqx.nn.Dropout(dropout_rate))
             self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
 
             conv_inputs = conv_settings["internal_channels"]
@@ -166,10 +201,13 @@ class FrameEmbedding(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         frame_embeddings = input_frames
-        for layer in self.layers:
+        layer_keys = _split_key(key, len(self.layers))
+        for layer, layer_key in zip(self.layers, layer_keys):
             # print(f"Frame embedding shape: {frame_embeddings.shape}")
             if isinstance(layer, eqx.nn.BatchNorm):
                 frame_embeddings, state = layer(frame_embeddings, state, inference=not enable_dropout)
+            elif isinstance(layer, eqx.nn.Dropout):
+                frame_embeddings = layer(frame_embeddings, inference=not enable_dropout, key=layer_key)
             else:
                 frame_embeddings = layer(frame_embeddings)
 
