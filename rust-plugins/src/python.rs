@@ -313,17 +313,17 @@ async fn resolve_audio_samples(sample_file: &str) -> String {
     panic!["Audio not found for sample: {}", sample_file];
 }
 
-fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_frame: i32) -> Vec<Vec<f32>> {
+fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_frame: i32, num_frames_with_backing_samples: i32) -> Vec<Vec<f32>> {
     let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; model_output_size as usize];
 
     for (attack_frame, key, frame_duration, velocity) in events {
         let decay_function = |t: f32| -> f32 {
-            (-0.05 * t).exp()
+            (-0.05 * t).exp().max(0.2) // Do not drop below 0.2 while the note is actually playing
         };
 
         let frame_start = (*attack_frame as i32) - start_frame;
         let frame_end = frame_start + *frame_duration as i32;
-        for frame in frame_start.max(0)..frame_end.min(model_output_size) {
+        for frame in frame_start.max(0)..frame_end.min(model_output_size).min(num_frames_with_backing_samples) {
             let t: f32 = frame as f32 - frame_start as f32;
             frames[frame as usize][*key as usize] = decay_function(t);
         }
@@ -384,12 +384,14 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                     for split in 0..num_splits {
                         let start_frame = split * num_model_outputs as i32;
                         let start_sample = (split * samples_per_model_call as i32) as usize;
+                        let samples_to_copy = samples_per_model_call.min(left_samples.len() - start_sample);
+                        let num_frames_with_backing_samples = ((samples_to_copy as f32 / samples_per_model_call as f32) * (num_model_outputs as f32)).ceil() as i32;
+                        debug!["Copying {} samples starting at {} for split {}", samples_to_copy, start_sample, split];
 
-                        let frame_events = convert_to_frame_events(&events, num_model_outputs, start_frame);
+                        let frame_events = convert_to_frame_events(&events, num_model_outputs, start_frame, num_frames_with_backing_samples);
                         let mut split_samples_left = vec![0.0; samples_per_model_call as usize];
                         let mut split_samples_right = vec![0.0; samples_per_model_call as usize];
 
-                        let samples_to_copy = samples_per_model_call.min(left_samples.len() - start_sample);
                         for i in 0..samples_to_copy {
                             split_samples_left[i] = left_samples[start_sample + i];
                             split_samples_right[i] = right_samples[start_sample + i];
@@ -469,7 +471,7 @@ fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyR
 
     let converted: Vec<_> = all_events.iter()
         .map(|events| {
-            let rust_converted = convert_to_frame_events(&events, frame_count as i32, 0);
+            let rust_converted = convert_to_frame_events(&events, frame_count as i32, 0, frame_count as i32);
             PyArray2::from_vec2(py, &rust_converted).unwrap().to_owned()
         })
         .collect();
