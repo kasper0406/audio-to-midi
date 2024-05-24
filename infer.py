@@ -36,14 +36,11 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
 
     return output
 
-def predict_and_stitch(model, state, audio_frames, duration_per_frame: float, overlap=0.0):
-    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, audio_frames)
-
-    # HACK: Get rid of this!
-    #       Currently we train the model to not output the last three frames, so the overlap will be different
-    hacked_overlap = overlap - (audio_frames.shape[2] - probs.shape[1]) * duration_per_frame
-    print(f"Hacked overlap: {hacked_overlap}")
-    return probs, stitch_output_probs(probs, duration_per_frame, hacked_overlap)
+def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
+    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, samples)
+    duration_per_frame = window_duration / probs.shape[1]
+    print(f"Duration per frame: {duration_per_frame}")
+    return probs, stitch_output_probs(probs, duration_per_frame, overlap), duration_per_frame
 
 def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, output_file: str):
     midi = MidiFile()

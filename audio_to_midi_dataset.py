@@ -275,7 +275,7 @@ class AudioToMidiDatasetLoader:
                 })
 
     @classmethod
-    def load_and_slice_full_audio(cls, filename: Path, overlap = 0.5):
+    def load_and_slice_full_audio(cls, filename: Path, overlap = 0.25):
         audio_samples = modelutil.load_full_audio(str(filename), AudioToMidiDatasetLoader.SAMPLE_RATE)
 
         window_size = round(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)
@@ -291,7 +291,7 @@ class AudioToMidiDatasetLoader:
             windows.append(window_samples)
         windowed = jnp.stack(windows)
         
-        return AudioToMidiDatasetLoader._convert_samples(windowed)
+        return windowed, MODEL_AUDIO_LENGTH
 
 
     @classmethod

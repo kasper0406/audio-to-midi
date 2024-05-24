@@ -15,9 +15,6 @@ parser.add_argument('output', help='The output MIDI file', nargs='?')
 parser.add_argument('--visualize-audio',
     help='Visualize the audio samples and event probabilities using matplotlib',
     action='store_true')
-parser.add_argument('--visualize-audio-embeddings',
-    help='Visualize the audio embeddings',
-    action='store_true')
 parser.add_argument('--validation',
     help='Test the provided validation set on the model',
     action='store_true')
@@ -38,26 +35,15 @@ if not args.validation:
     if not audio_file.exists():
         raise f"The specified audio file {audio_file} does not exist!"
 
-    overlap = 0.5
-    frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
+    overlap = 0.25
+    sample_windows, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
     print("Loaded samples")
-
-    if args.visualize_audio_embeddings:
-        # import code
-        # code.interact(local=locals())
-        for frame in frames:
-            embeddings = audio_to_midi.frame_embedding(frame)
-            print(f"Embeddings shape: {embeddings.shape}")
-            plot_embedding(str(audio_file), embeddings)
-        plt.show(block=False)
     
-    individual_probs, stitched_probs = predict_and_stitch(audio_to_midi, state, frames, duration_per_frame, overlap=overlap)
+    individual_probs, stitched_probs, duration_per_frame = predict_and_stitch(audio_to_midi, state, sample_windows, window_duration, overlap=overlap)
 
     if args.visualize_audio:
         for i in range(individual_probs.shape[0]):
-            # TODO: Fix this hack!
-            padded_output = jnp.pad(individual_probs[i], ((0, frames[i].shape[1] - individual_probs[i].shape[0]), (0, 0)), 'constant', constant_values=0)
-            visualize_sample(args.path, frames[i], padded_output, None, duration_per_frame, frame_width)
+            visualize_sample(args.path, sample_windows[i], individual_probs[i])
             plt.show(block=False)
     
     print(f"Stitched probs shape: {stitched_probs.shape}")

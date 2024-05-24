@@ -18,23 +18,17 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 4,
-    "num_layers": 2,
+    "attention_size": 512,
+    "intermediate_size": 1024,
+    "num_heads": 6,
+    "num_layers": 14,
     "dropout_rate": 0.10,
 
     "convolutions": [
         {
-            "internal_channels": 1,
+            "internal_channels": 2,
             "kernel": 1,
             "stride": 1,
-            "activation": identity
-        },
-        {
-            "internal_channels": 2,
-            "kernel": 4,
-            "stride": 2,
             "activation": identity
         },
         {
@@ -47,7 +41,7 @@ model_config = {
             "internal_channels": 8,
             "kernel": 4,
             "stride": 2,
-            "activation": jax.nn.leaky_relu
+            "activation": identity
         },
         {
             "internal_channels": 16,
@@ -65,10 +59,16 @@ model_config = {
             "internal_channels": 64,
             "kernel": 4,
             "stride": 2,
-            "activation": jax.nn.relu
+            "activation": jax.nn.leaky_relu
         },
         {
             "internal_channels": 128,
+            "kernel": 4,
+            "stride": 2,
+            "activation": jax.nn.relu
+        },
+        {
+            "internal_channels": 256,
             "kernel": 4,
             "stride": 2,
             "activation": jax.nn.relu
@@ -513,7 +513,7 @@ class OutputSequenceGenerator(eqx.Module):
 
     def __call__(
         self,
-        input_frames: Float[Array, "frame_seq_len frame_size"],
+        samples: Float[Array, "frame_seq_len frame_size"],
         state,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
@@ -521,7 +521,7 @@ class OutputSequenceGenerator(eqx.Module):
         event_processor_key, frame_embedding_key, decoder_key, dropout_key = _split_key(key, num=4)
 
         frame_embeddings, state = self.frame_embedding(
-            input_frames, state, enable_dropout=enable_dropout, key=frame_embedding_key
+            samples, state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
         mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int32)
 
@@ -536,6 +536,6 @@ class OutputSequenceGenerator(eqx.Module):
 
         return self.decoder(output, decoder_key), state
 
-    def predict(self, state, frames):
-        (logits, probs), _state = self(frames, state, None)
+    def predict(self, state, samples):
+        (logits, probs), _state = self(samples, state, None)
         return logits, probs
