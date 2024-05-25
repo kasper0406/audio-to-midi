@@ -3,6 +3,7 @@ use crate::common::MidiEvents;
 use std::path::Path;
 use std::fmt;
 use std::str::EncodeUtf16;
+use std::env;
 
 use numpy::{ PyArray2, PyArray3, PyReadonlyArray2 };
 use numpy::ToPyArray;
@@ -16,7 +17,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 use tokio::process::Command;
-use tokio::io::{BufReader, AsyncBufReadExt};
+use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -24,6 +25,8 @@ use std::process::Stdio;
 use futures::future::join_all;
 use half::f16;
 use num_traits::cast::AsPrimitive;
+use futures::TryFutureExt;
+use sha2::{Sha256, Digest};
 
 use log::{debug, error, info, trace, warn};
 
@@ -165,7 +168,7 @@ async fn read_samples_from_file(raw_file: &str, sample_rate: u32, maybe_max_dura
     Ok(samples)
 }
 
-async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     // TODO: Consider sending back all audio channels
     let mut command = Command::new("ffmpeg");
     if let Some(max_duration) = maybe_max_duration {
@@ -237,19 +240,17 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
         total_max = 1.0
     }
 
-    let normalized_left: Vec<f32> = left_samples.iter()
+    let normalized_left: Vec<f16> = left_samples.iter()
         .map(|sample| f16::from_f32(sample / total_max))
-        .map(|sample| sample.as_()) // TODO: Kind of hacky, but this is support returning f32
         .collect();
-    let normalized_right: Vec<f32> = right_samples.iter()
+    let normalized_right: Vec<f16> = right_samples.iter()
         .map(|sample| f16::from_f32(sample / total_max))
-        .map(|sample| sample.as_()) // TODO: Kind of hacky, but this is support returning f32
         .collect();
 
     Ok((normalized_left, normalized_right))
 }
 
-async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+async fn load_audio_sample_uncached(file_path: &str, sample_rate: u32) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     let uuid = Uuid::new_v4();
     let left_output_file = format!["/tmp/audio-to-midi-{}_left.raw", uuid];
     let right_output_file = format!["/tmp/audio-to-midi-{}_right.raw", uuid];
@@ -261,6 +262,80 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32
     tokio::fs::remove_file(right_output_file.clone()).await
         .map_err(|err| AudioLoadingError::IoError(err, String::from(right_output_file)))?;
     audio_sampels
+}
+
+fn generate_cache_filename(path: &str, sample_rate: u32) -> String {
+    // Hashing the complete path to ensure uniqueness
+    let mut hasher = Sha256::new();
+    hasher.update(path);
+    let hash_result = hasher.finalize();
+    let hash_str = format!("{:x}", hash_result); // Convert hash to hex string
+
+    // Truncate hash to first 30 characters for brevity
+    let short_hash = &hash_str[..30];
+
+    // Combine truncated hash with filename
+    format!("{}_{}", short_hash, sample_rate)
+}
+
+fn path_to_string_lossy<P: AsRef<Path>>(path: P) -> String {
+    path.as_ref().to_string_lossy().into_owned()
+}
+
+async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+    let (left_samples, right_samples) = match env::var("SAMPLE_CACHE_DIR") {
+        Ok(cache_dir) => {
+            let cache_filename = generate_cache_filename(file_path, sample_rate);
+            let left_cache_file = Path::new(&cache_dir).join(&cache_filename[..4]).join(format!["{}_left.raw", cache_filename]);
+            let right_cache_file = Path::new(&cache_dir).join(&cache_filename[..4]).join(format!["{}_right.raw", cache_filename]);
+
+            tokio::fs::create_dir_all(left_cache_file.parent().unwrap()).await
+                .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+            tokio::fs::create_dir_all(right_cache_file.parent().unwrap()).await
+                .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?;
+
+            if left_cache_file.exists() && right_cache_file.exists() {
+                debug!["Reading samples from cache {} {}", file_path, sample_rate];
+
+                // Read the cached files
+                let mut encoded_left = Vec::new();
+                File::open(&left_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?
+                    .read_to_end(&mut encoded_left).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                let left_samples: Vec<f16> = bincode::deserialize(&encoded_left[..]).unwrap();
+
+                let mut encoded_right = Vec::new();
+                File::open(&right_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?
+                    .read_to_end(&mut encoded_right).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                let right_samples: Vec<f16> = bincode::deserialize(&encoded_right[..]).unwrap();
+
+                Ok((left_samples, right_samples))
+            } else {
+                let (left_samples, right_samples) = load_audio_sample_uncached(file_path, sample_rate).await?;
+
+                // Update the cache
+                File::create(&left_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?
+                    .write_all(&bincode::serialize(&left_samples).unwrap()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                File::create(&right_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?
+                    .write_all(&bincode::serialize(&right_samples).unwrap()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+
+                Ok((left_samples, right_samples))
+            }
+        },
+        Err(e) => Ok(load_audio_sample_uncached(file_path, sample_rate).await?)
+    }?;
+
+    Ok((
+        left_samples.iter().map(|sample| sample.to_f32()).collect(),
+        right_samples.iter().map(|sample| sample.to_f32()).collect()
+    ))
 }
 
 #[pyfunction]
