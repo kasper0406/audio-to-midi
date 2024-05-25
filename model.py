@@ -26,85 +26,88 @@ model_config = {
 
     "convolutions": [
         {
-            "internal_channels": 4,
-            "kernel": 2,
-            "stride": 1,
-            "activation": identity
-        },
-        {
             "internal_channels": 6,
-            "kernel": 5,
-            "stride": 2,
-            "activation": identity
-        },
-        {
-            "internal_channels": 10,
-            "kernel": 5,
+            "kernel": 3,
             "stride": 1,
             "activation": identity
         },
         {
-            "internal_channels": 16,
-            "kernel": 5,
+            "internal_channels": 12,
+            "kernel": 3,
             "stride": 1,
-            "activation": jax.nn.leaky_relu,
-            "use_dropout": True,
+            "activation": eqx.nn.PReLU(),
         },
         {
             "internal_channels": 32,
+            "kernel": 3,
+            "stride": 1,
+            "dilation": 2,
+            "activation": eqx.nn.PReLU(),
+        },
+        {
+            "internal_channels": 64,
+            "kernel": 3,
+            "stride": 1,
+            "activation": eqx.nn.PReLU(),
+            "use_dropout": True,
+            "max_pool": True,
+        },
+        {
+            "internal_channels": 64,
             "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu,
+            "dilation": 2,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
         },
         {
             "internal_channels": 64,
             "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
         {
             "internal_channels": 128,
             "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.leaky_relu,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
         },
         {
             "internal_channels": 256,
             "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
         {
-            "internal_channels": 512,
+            "internal_channels": 256,
             "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
+            "dilation": 2,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
         {
             "internal_channels": 512,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
+            "kernel": 7,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
         {
             "internal_channels": 512,
-            "kernel": 3,
-            "stride": 1,
-            "activation": jax.nn.relu,
+            "kernel": 7,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
         {
-            "internal_channels": 512,
-            "kernel": 3,
-            "stride": 1,
-            "activation": jax.nn.relu,
+            "internal_channels": 1024,
+            "kernel": 7,
+            "activation": jax.nn.gelu,
             "use_dropout": True,
+            "max_pool": True,
         },
     ],
 }
@@ -116,6 +119,8 @@ def serialize_function(obj):
         return f"<pjit_fn {obj.__name__}>"
     if isinstance(obj, jax.custom_jvp):
         return f"<custom_jvp {obj.__name__}>"
+    if isinstance(obj, eqx.nn.PReLU):
+        return "<eqx.nn.PReLU>"
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 def get_model_metadata():
@@ -131,6 +136,59 @@ def _split_key(key, num: int = 2):
     else:
         return jax.random.split(key, num)
 
+class ResidualConv(eqx.Module):
+    conv: eqx.nn.Conv
+    activation_function: types.FunctionType
+    batch_norm_1: eqx.nn.BatchNorm
+    batch_norm_2: eqx.nn.BatchNorm
+    dropout: eqx.nn.Dropout | None = None
+    shortcut: eqx.nn.Conv # Residual connections
+    max_pool: eqx.nn.MaxPool1d | None = None
+
+    def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
+        conv_key, shortcut_key = _split_key(key, 2)
+        
+        padding = ((kernel - 1) // 2) * dilation
+        self.conv = eqx.nn.Conv1d(
+            in_channels=conv_inputs,
+            out_channels=channels,
+            kernel_size=(kernel,),
+            stride=(stride,),
+            dilation=(dilation,),
+            padding=(padding,),
+            key=conv_key
+        )
+
+        self.activation_function = activation
+        self.batch_norm_1 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+
+        if dropout_rate is not None:
+            self.dropout = eqx.nn.Dropout(dropout_rate)
+        
+        self.shortcut = eqx.nn.Conv1d(in_channels=conv_inputs, out_channels=channels, kernel_size=1, stride=stride, key=shortcut_key)
+        self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+
+        if max_pool:
+            self.max_pool = eqx.nn.MaxPool1d(kernel_size=2, stride=2)
+    
+    def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
+        out = self.conv(x)
+        out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+        out = self.activation_function(out)
+
+        # Residual
+        out = out + self.shortcut(x)
+        out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+        out = self.activation_function(out)
+
+        if self.max_pool:
+            out = self.max_pool(out)
+
+        if self.dropout:
+            out = self.dropout(out, inference=not enable_dropout, key=key)
+        
+        return out, state
+
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
@@ -139,6 +197,8 @@ class FrameEmbedding(eqx.Module):
     dropout: eqx.nn.Dropout
     position_embedder: eqx.nn.Linear
     layers: [eqx.Module]
+    final_pooling: eqx.nn.Conv1d
+    final_batch_norm: eqx.nn.BatchNorm
 
     def __init__(
         self,
@@ -163,35 +223,31 @@ class FrameEmbedding(eqx.Module):
         conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
         conv_inputs = input_channels
         for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
+            dilation = 1 if "dilation" not in conv_settings else conv_settings["dilation"]
+            stride = 1 if "stride" not in conv_settings else conv_settings["stride"]
             self.layers.append(
-                eqx.nn.Conv1d(
-                    in_channels=conv_inputs,
-                    out_channels=conv_settings["internal_channels"],
-                    kernel_size=(conv_settings["kernel"],),
-                    stride=(conv_settings["stride"],),
-                    padding=(0,),
-                    key=conv_key)
+                ResidualConv(
+                    conv_inputs=conv_inputs,
+                    channels=conv_settings["internal_channels"],
+                    kernel=conv_settings["kernel"],
+                    stride=stride,
+                    dilation=dilation,
+                    activation=conv_settings["activation"],
+                    max_pool=conv_settings["max_pool"] if "max_pool" in conv_settings else False,
+                    dropout_rate=dropout_rate if "use_dropout" in conv_settings and conv_settings["use_dropout"] else None,
+                    key=conv_key,
+                )
             )
-            self.layers.append(conv_settings["activation"])
-            if "use_dropout" in conv_settings and conv_settings["use_dropout"]:
-                self.layers.append(eqx.nn.Dropout(dropout_rate))
-            self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
-
             conv_inputs = conv_settings["internal_channels"]
-            # print(f"Conv height: {conv_height}")
 
-        self.layers.append(
-            eqx.nn.Conv1d(
-                in_channels=conv_inputs,
-                out_channels=output_shape,
-                kernel_size=(1,),
-                stride=(1,),
-                key=output_conv_key
-            )
+        self.final_pooling = eqx.nn.Conv1d(
+            in_channels=conv_inputs,
+            out_channels=output_shape,
+            kernel_size=(1,),
+            stride=(1,),
+            key=output_conv_key
         )
-        self.layers.append(jax.nn.gelu)
-        self.layers.append(eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch"))
-        self.layers.append(jax.nn.tanh)
+        self.final_batch_norm = eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch")
 
     def __call__(
         self,
@@ -204,12 +260,11 @@ class FrameEmbedding(eqx.Module):
         layer_keys = _split_key(key, len(self.layers))
         for layer, layer_key in zip(self.layers, layer_keys):
             # print(f"Frame embedding shape: {frame_embeddings.shape}")
-            if isinstance(layer, eqx.nn.BatchNorm):
-                frame_embeddings, state = layer(frame_embeddings, state, inference=not enable_dropout)
-            elif isinstance(layer, eqx.nn.Dropout):
-                frame_embeddings = layer(frame_embeddings, inference=not enable_dropout, key=layer_key)
-            else:
-                frame_embeddings = layer(frame_embeddings)
+            frame_embeddings, state = layer(frame_embeddings, state, enable_dropout, layer_key)
+
+        frame_embeddings = self.final_pooling(frame_embeddings)
+        frame_embeddings, state = self.final_batch_norm(frame_embeddings, state, inference=not enable_dropout)
+        frame_embeddings = jax.nn.tanh(frame_embeddings)
 
         # Make the last layer fit what we need for the transformer
         frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))

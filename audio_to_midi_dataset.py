@@ -43,11 +43,6 @@ def get_data_prep_config():
         "midi_voccab_size": MIDI_EVENT_VOCCAB_SIZE,
         "max_event_timestamp": MODEL_AUDIO_LENGTH,
         "num_velocity_categories": NUM_VELOCITY_CATEGORIES,
-        "samples_per_fft": SAMPLES_PER_FFT,
-        "window_overlap": WINDOW_OVERLAP,
-        "compression_factor": COMPRESSION_FACTOR,
-        "frequency_cutoff": FREQUENCY_CUTOFF,
-        "linear_scaling": LINEAR_SCALING
     }
 
 @partial(jax.jit, donate_argnames=["frames"])
