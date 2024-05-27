@@ -8,9 +8,9 @@ use ndarray::Dim;
 
 #[repr(C)]
 pub struct MidiEvent {
-    attack_time: u8,
+    attack_time: u64,
     note: u8,
-    duration: u8,
+    duration: u64,
     velocity: u8,
 }
 
@@ -59,9 +59,9 @@ pub extern "C" fn extract_midi_events(data: MLMultiArrayWrapper3, overlap: f64, 
     let mut events = vec![];
     for (attack_time, note, duration, velocity) in raw_events {
         let (attack_time, note, duration, velocity) = (
-            attack_time as u8,
+            attack_time as u64,
             note as u8,
-            duration as u8,
+            duration as u64,
             velocity as u8
         );
         events.push(MidiEvent {
