@@ -16,8 +16,9 @@ where
     let (num_windows, frames_per_window, event_categories) = (num_windows as i64, frames_per_window as i64, event_categories as i64);
 
     let overlapping_frames = (overlap / duration_per_frame) as i64;
+    println!("Overlapping frames: {}, overlap: {}, dpf: {}", overlapping_frames, overlap, duration_per_frame);
     let output_frames = (num_windows * frames_per_window - overlapping_frames * (num_windows - 1)) as usize;
-    let mut stitched: Array2<f32> = Array::zeros((output_frames, all_probs.shape()[2]));
+    let mut stitched: Array2<f32> = Array::zeros((output_frames, event_categories as usize));
     let mut output_frame_base = 0;
     for window in 0..num_windows {
         for frame in 0..frames_per_window {
@@ -28,7 +29,7 @@ where
 
                 // We have double counted the overlapping frames
                 // Divide the value by 2 to get the mean of the probs
-                if window > 0 && frame < overlapping_frames {
+                if window > 0 && frame <= overlapping_frames {
                     stitched[stitched_idx] = stitched[stitched_idx] / 2.0;
                 }
             }

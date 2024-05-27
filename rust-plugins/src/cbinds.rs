@@ -23,8 +23,8 @@ pub struct MidiEventList {
 
 #[repr(C)]
 pub struct MLMultiArrayWrapper<const N: usize> {
-    strides: [u16; N],
-    dims: [u16; N],
+    strides: [u64; N],
+    dims: [u64; N],
     data: *const u8,
 }
 
@@ -33,9 +33,9 @@ macro_rules! define_mlmultiarray_helpers {
         $(
             impl MLMultiArrayWrapper<$N> {
                 pub fn view<'a, T>(&self) -> ArrayView<'a, T, Dim<[Ix; $N]>> {
-                    let shape: [usize; $N] = self.dims.map(|d| d as usize);
+                    let dims: [usize; $N] = self.dims.map(|d| d as usize);
                     let strides: [usize; $N] = self.strides.map(|s| s as usize);
-                    let shape = Dim(shape).strides(Dim(strides));
+                    let shape = Dim(dims).strides(Dim(strides));
                     unsafe { ArrayView::from_shape_ptr(shape, self.data as *const T) }
                 }
             }
@@ -52,6 +52,7 @@ define_mlmultiarray_helpers!(1, 2, 3);
 pub extern "C" fn extract_midi_events(data: MLMultiArrayWrapper3, overlap: f64, duration_per_frame: f64) -> *mut MidiEventList {
     // Actually the pointer is to a f16 array, but we need to expose the pointer as something cbindgen knows about!
     let array_view = data.view::<f16>();
+
     let stitched = crate::common::stitch_probs(&array_view, overlap, duration_per_frame);
     let raw_events = crate::common::extract_events(&stitched.view());
 
