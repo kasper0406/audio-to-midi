@@ -1,8 +1,43 @@
 use ndarray::ArrayView2;
+use ndarray::ArrayView3;
+use ndarray::Array;
+use ndarray::Array2;
+use num_traits::Zero;
 
 use num_traits::cast::AsPrimitive;
 
 pub type MidiEvents = Vec<(u32, u32, u32, u32)>;
+
+pub fn stitch_probs<'a, T>(all_probs: &ArrayView3<'a, T>, overlap: f64, duration_per_frame: f64) -> Array2<f32>
+where
+    T: Zero + Clone + Copy + std::ops::Div<Output = T> + AsPrimitive<f32>
+{
+    let [num_windows, frames_per_window, event_categories] = *all_probs.shape() else { todo!() };
+    let (num_windows, frames_per_window, event_categories) = (num_windows as i64, frames_per_window as i64, event_categories as i64);
+
+    let overlapping_frames = (overlap / duration_per_frame) as i64;
+    let output_frames = (num_windows * frames_per_window - overlapping_frames * (num_windows - 1)) as usize;
+    let mut stitched: Array2<f32> = Array::zeros((output_frames, all_probs.shape()[2]));
+    let mut output_frame_base = 0;
+    for window in 0..num_windows {
+        for frame in 0..frames_per_window {
+            for event in 0..event_categories {
+                let stitched_idx = ((output_frame_base + frame) as usize, event as usize);
+                let probs_idx = (window as usize, frame as usize, event as usize);
+                stitched[stitched_idx] = stitched[stitched_idx] + all_probs[probs_idx].as_();
+
+                // We have double counted the overlapping frames
+                // Divide the value by 2 to get the mean of the probs
+                if window > 0 && frame < overlapping_frames {
+                    stitched[stitched_idx] = stitched[stitched_idx] / 2.0;
+                }
+            }
+        }
+        output_frame_base += frames_per_window - overlapping_frames;
+    }
+
+    stitched
+}
 
 pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where

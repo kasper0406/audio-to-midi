@@ -1,6 +1,10 @@
 use half::f16;
 use ndarray::ArrayView;
+use ndarray::ArrayView2;
+use ndarray::ArrayView3;
 use ndarray::ShapeBuilder;
+use ndarray::Ix;
+use ndarray::Dim;
 
 #[repr(C)]
 pub struct MidiEvent {
@@ -17,14 +21,39 @@ pub struct MidiEventList {
     _capacity: usize,
 }
 
-#[no_mangle]
-pub extern "C" fn extract_midi_events(num_frames: i32, frame_stride: i32, num_notes: i32, note_stride: i32, data: *const u8) -> *mut MidiEventList {
-    // Actually the pointer is to a f16 array, but we need to expose the pointer as something cbindgen knows about!
-    let data = data as *const f16;
+#[repr(C)]
+pub struct MLMultiArrayWrapper<const N: usize> {
+    strides: [u16; N],
+    dims: [u16; N],
+    data: *const u8,
+}
 
-    let shape = (num_frames as usize, num_notes as usize).strides((frame_stride as usize, note_stride as usize));
-    let array_view = unsafe { ArrayView::from_shape_ptr(shape, data as *const f16) };
-    let raw_events = crate::common::extract_events(&array_view);
+macro_rules! define_mlmultiarray_helpers {
+    ($($N:expr),*) => {
+        $(
+            impl MLMultiArrayWrapper<$N> {
+                pub fn view<'a, T>(&self) -> ArrayView<'a, T, Dim<[Ix; $N]>> {
+                    let shape: [usize; $N] = self.dims.map(|d| d as usize);
+                    let strides: [usize; $N] = self.strides.map(|s| s as usize);
+                    let shape = Dim(shape).strides(Dim(strides));
+                    unsafe { ArrayView::from_shape_ptr(shape, self.data as *const T) }
+                }
+            }
+        )*
+    };
+}
+
+pub type MLMultiArrayWrapper1 = MLMultiArrayWrapper<1>;
+pub type MLMultiArrayWrapper2 = MLMultiArrayWrapper<2>;
+pub type MLMultiArrayWrapper3 = MLMultiArrayWrapper<3>;
+define_mlmultiarray_helpers!(1, 2, 3);
+
+#[no_mangle]
+pub extern "C" fn extract_midi_events(data: MLMultiArrayWrapper3, overlap: f64, duration_per_frame: f64) -> *mut MidiEventList {
+    // Actually the pointer is to a f16 array, but we need to expose the pointer as something cbindgen knows about!
+    let array_view = data.view::<f16>();
+    let stitched = crate::common::stitch_probs(&array_view, overlap, duration_per_frame);
+    let raw_events = crate::common::extract_events(&stitched.view());
 
     let mut events = vec![];
     for (attack_time, note, duration, velocity) in raw_events {
