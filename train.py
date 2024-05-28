@@ -58,6 +58,14 @@ def compute_training_step(
 
     return loss, update_model, state, update_opt_state, new_key
 
+def compute_model_output_frames(model, state):
+    # TODO(knielsen): Find a better way of doing this
+    (find_shape_output_logits, _), _ = model(
+        jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
+        state
+    )
+    num_model_output_frames = find_shape_output_logits.shape[0]
+    return num_model_output_frames
 
 @lru_cache(maxsize=1)
 def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, batch_size: int):
@@ -304,12 +312,7 @@ def main():
     # The filtering is necessary to have the opt-state flattening working
     opt_state = tx.init(eqx.filter(audio_to_midi, eqx.is_inexact_array))
 
-    # TODO(knielsen): Find a better way of doing this
-    (find_shape_output_logits, _), _ = audio_to_midi(
-        jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
-        state
-    )
-    num_model_output_frames = find_shape_output_logits.shape[0]
+    num_model_output_frames = compute_model_output_frames(audio_to_midi, state)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")

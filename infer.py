@@ -123,7 +123,6 @@ def detailed_event_loss(
         hit_rate=hit_rate,
     )
 
-
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()
 

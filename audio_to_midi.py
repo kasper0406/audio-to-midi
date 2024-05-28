@@ -3,7 +3,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 from infer import load_newest_checkpoint, predict_and_stitch, write_midi_file
-from train import compute_testset_loss, compute_testset_loss_individual
+from train import compute_testset_loss, compute_testset_loss_individual, compute_model_output_frames
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
 import modelutil
@@ -59,15 +59,16 @@ if not args.validation:
 if args.validation:
     validation_dir = Path(args.path)
 
+    num_model_output_frames = compute_model_output_frames(audio_to_midi, state)
     if args.individual:
-        losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, key, sharding=None)
+        losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
         for sample_name, losses in losses.items():
             loss = losses["loss"]
             hit_rate = losses["hit_rate"]
             eventized_diff = losses["eventized_diff"]
             print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}")
     else:
-        loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(audio_to_midi, state, validation_dir, key, sharding=None)
+        loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
         print(f"Validation loss: {loss}")
         print(f"Hit rate: {hit_rate}")
         print(f"Eventized diff: {eventized_diff}")
