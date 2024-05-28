@@ -112,7 +112,9 @@ def detailed_event_loss(
     missed_notes_diff = np.sum(expected[played_expected & ~played_predicted])
     notes_hit = np.sum(played_predicted & played_expected)
 
-    hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
+    hit_rate = 1.0
+    if notes_hit + phantom_notes_diff + missed_notes_diff > 0:
+        hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
 
     return DetailedEventLoss(
         full_diff=full_diff,

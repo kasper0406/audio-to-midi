@@ -70,12 +70,11 @@ def compute_model_output_frames(model, state):
 @lru_cache(maxsize=1)
 def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
-    chunks = chunked(sample_names, batch_size)
 
     batches = []
-    for chunk in chunks:
-        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, chunk, sharding=sharding)
-        batches.append((chunk, audio, midi_events))
+    for sample_name in sample_names:
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], sharding=sharding)
+        batches.append((sample_name, audio, midi_events))
     return batches
 
 def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
@@ -84,19 +83,26 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_o
     print("Loaded test set")
 
     loss_map = {}
-    for sample_names, audio, midi_events in batches:
+    for sample_name, audio, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=audio.shape[0])
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(audio, state, test_loss_keys)
         test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
 
-        for sample_name, loss, predicted_probs, events in zip(sample_names, test_losses, probs, midi_events):
+        hit_rates_sum = 0.0
+        full_diff_sum = 0.0
+        phantom_miss_ratio_sum = 0.0
+        for predicted_probs, events in zip(probs, midi_events):
             detailed_loss = detailed_event_loss(predicted_probs, events)
-            loss_map[sample_name] = {
-                "loss": loss,
-                "hit_rate": detailed_loss.hit_rate,
-                "eventized_diff": detailed_loss.full_diff,
-                "phantom_miss_ratio": detailed_loss.phantom_miss_ratio,
-            }
+            hit_rates_sum += detailed_loss.hit_rate
+            full_diff_sum += detailed_loss.full_diff
+            phantom_miss_ratio_sum += detailed_loss.phantom_miss_ratio
+        
+        loss_map[sample_name] = {
+            "loss": jnp.mean(test_losses),
+            "hit_rate": hit_rates_sum / probs.shape[0],
+            "eventized_diff": full_diff_sum / probs.shape[0],
+            "phantom_miss_ratio": phantom_miss_ratio_sum / probs.shape[0],
+        }
 
     print("Finished evaluating test loss")
     return loss_map
