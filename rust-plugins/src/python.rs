@@ -402,8 +402,8 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 
         // Ensure that the frame before the start is blank
         // To ensure we handle potentially fast re-activations
-        if frame_start > 0 {
-            frames[frame_start as usize][*key as usize] = 0.0;
+        if frame_start > 0 && frame_start < model_output_size {
+            frames[(frame_start - 1) as usize][*key as usize] = 0.0;
         }
 
         for frame in frame_start.max(0)..frame_end.min(model_output_size).min(num_frames_with_backing_samples) {
