@@ -399,9 +399,15 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 
         let frame_start = (*attack_frame as i32) - start_frame;
         let frame_end = frame_start + *frame_duration as i32;
+
+        // Ensure that the frame before the start is blank
+        // To ensure we handle potentially fast re-activations
+        if frame_start > 0 {
+            frames[frame_start as usize][*key as usize] = 0.0;
+        }
+
         for frame in frame_start.max(0)..frame_end.min(model_output_size).min(num_frames_with_backing_samples) {
-            // let t: f32 = frame as f32 - frame_start as f32;
-            frames[frame as usize][*key as usize] = if frame - frame_start == 0 { 1.0 } else { 0.6 };
+            frames[frame as usize][*key as usize] = 1.0;
         }
     }
 
