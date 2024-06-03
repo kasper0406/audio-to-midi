@@ -51,7 +51,7 @@ where
     let [num_frames, num_notes] = *probs.shape() else { todo!("Unsupported probs format") };
 
     let duration = |end_frame: usize, start_frame: usize| -> u32 {
-        ((end_frame as i32) - (start_frame as i32) - 1).max(1) as u32
+        ((end_frame as i32) - (start_frame as i32)).max(1) as u32
     };
 
     let velocity = |activation_prob: f32| -> u32 {
@@ -103,7 +103,7 @@ where
                     // Either the key is already playing, and we may have a re-activation
                     let time_since_activation = frame as f32 - started_at as f32;
                     if probs[(frame, key)].as_() > decay_function(activation_prob, time_since_activation) {
-                        events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob))); // Close the old event
+                        events.push((started_at as u32, key as u32, duration(frame - 1, started_at), velocity(activation_prob))); // Close the old event
                         currently_playing[key] = Some((frame, get_activation_prob()));
                     }
                 } else {
