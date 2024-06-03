@@ -392,15 +392,16 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
     let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; model_output_size as usize];
 
     for (attack_frame, key, frame_duration, velocity) in events {
+        /*
         let decay_function = |t: f32| -> f32 {
             (-0.05 * t).exp().max(0.6) // Do not drop below 0.6 while the note is actually playing
-        };
+        }; */
 
         let frame_start = (*attack_frame as i32) - start_frame;
         let frame_end = frame_start + *frame_duration as i32;
         for frame in frame_start.max(0)..frame_end.min(model_output_size).min(num_frames_with_backing_samples) {
-            let t: f32 = frame as f32 - frame_start as f32;
-            frames[frame as usize][*key as usize] = decay_function(t);
+            // let t: f32 = frame as f32 - frame_start as f32;
+            frames[frame as usize][*key as usize] = if frame - frame_start == 0 { 1.0 } else { 0.6 };
         }
     }
 

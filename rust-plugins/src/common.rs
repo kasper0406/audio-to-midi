@@ -44,6 +44,7 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
+    let reactivation_threshold = 0.8 as f32;
     let activation_threshold = 0.5 as f32;
     let deactivation_threshold = 0.1 as f32;
 
@@ -62,7 +63,7 @@ where
         if t < 5.0 {
             activation_prob
         } else {
-            activation_prob * (-0.02 * t).exp()
+            activation_prob * (-0.01 * t).exp()
         }
     };
 
@@ -102,7 +103,7 @@ where
                 if let Some((started_at, activation_prob)) = currently_playing[key] {
                     // Either the key is already playing, and we may have a re-activation
                     let time_since_activation = frame as f32 - started_at as f32;
-                    if probs[(frame, key)].as_() > decay_function(activation_prob, time_since_activation) {
+                    if probs[(frame, key)].as_() > reactivation_threshold && probs[(frame, key)].as_() > decay_function(activation_prob, time_since_activation) {
                         events.push((started_at as u32, key as u32, duration(frame - 1, started_at), velocity(activation_prob))); // Close the old event
                         currently_playing[key] = Some((frame, get_activation_prob()));
                     }
