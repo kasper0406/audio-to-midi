@@ -44,9 +44,9 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
-    let reactivation_threshold = 0.8 as f32;
+    let reactivation_threshold = 0.7 as f32;
     let activation_threshold = 0.9 as f32;
-    let deactivation_threshold = 0.7 as f32;
+    let deactivation_threshold = 0.1 as f32;
 
     let mut events: MidiEvents = vec![];
     let [num_frames, num_notes] = *probs.shape() else { todo!("Unsupported probs format") };

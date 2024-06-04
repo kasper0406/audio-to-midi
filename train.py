@@ -26,7 +26,7 @@ from infer import detailed_event_loss
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
     # Prioritize the initial attacks a lot more in the loss than the roll-off
-    only_attack_logits = jnp.select([expected_output > 0.95], [logits], 1.0)
+    only_attack_logits = jnp.select([expected_output > 0.95], [logits], -100.0)
     only_attack_expected = jnp.select([expected_output > 0.95], [expected_output], 0.0)
     attack_loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(only_attack_logits, only_attack_expected)
 
@@ -94,23 +94,16 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_o
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(audio, state, test_loss_keys)
         test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
 
-        hit_rates_sum = 0.0
-        full_diff_sum = 0.0
-        phantom_note_diff_sum = 0.0
-        missed_note_diff_sum = 0.0
-        for predicted_probs, events in zip(probs, midi_events):
-            detailed_loss = detailed_event_loss(predicted_probs, events)
-            hit_rates_sum += detailed_loss.hit_rate
-            full_diff_sum += detailed_loss.full_diff
-            phantom_note_diff_sum += detailed_loss.phantom_notes_diff
-            missed_note_diff_sum += detailed_loss.missed_notes_diff
-        
+        stitched_probs = jnp.concatenate(probs, axis=0)
+        stitched_events = jnp.concatenate(midi_events, axis=0)
+
+        detailed_loss = detailed_event_loss(stitched_probs, stitched_events)
         loss_map[sample_name] = {
             "loss": jnp.mean(test_losses),
-            "hit_rate": hit_rates_sum / probs.shape[0],
-            "eventized_diff": full_diff_sum / probs.shape[0],
-            "phantom_note_diff": phantom_note_diff_sum / probs.shape[0],
-            "missed_note_diff": missed_note_diff_sum / probs.shape[0],
+            "hit_rate": detailed_loss.hit_rate,
+            "eventized_diff": detailed_loss.full_diff,
+            "phantom_note_diff": detailed_loss.phantom_notes_diff,
+            "missed_note_diff": detailed_loss.missed_notes_diff,
         }
 
     print("Finished evaluating test loss")
