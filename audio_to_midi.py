@@ -35,7 +35,7 @@ if not args.validation:
     if not audio_file.exists():
         raise f"The specified audio file {audio_file} does not exist!"
 
-    overlap = 0.25
+    overlap = 0.0
     sample_windows, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
     print("Loaded samples")
     
@@ -66,12 +66,13 @@ if args.validation:
             loss = losses["loss"]
             hit_rate = losses["hit_rate"]
             eventized_diff = losses["eventized_diff"]
-            print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}")
+            phantom_note_diff = losses["phantom_note_diff"]
+            missed_note_diff = losses["missed_note_diff"]
+            print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}\t{phantom_note_diff}\t{missed_note_diff}")
     else:
-        loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
+        loss, hit_rate, eventized_diff = compute_testset_loss(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
         print(f"Validation loss: {loss}")
         print(f"Hit rate: {hit_rate}")
         print(f"Eventized diff: {eventized_diff}")
-        print(f"Phantom/Miss: {phantom_miss_ratio}")
 
 plt.show() # Wait for matplotlib

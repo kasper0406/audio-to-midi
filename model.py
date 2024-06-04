@@ -18,95 +18,96 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 32,
-    "intermediate_size": 32,
-    "num_heads": 1,
-    "num_layers": 2,
+    "attention_size": 512,
+    "intermediate_size": 512,
+    "num_heads": 6,
+    "num_layers": 12,
     "dropout_rate": 0.10,
 
     "convolutions": [
         {
-            "internal_channels": 6,
-            "kernel": 3,
-            "stride": 1,
-            "activation": identity
-        },
-        {
-            "internal_channels": 12,
-            "kernel": 3,
-            "stride": 1,
-            "activation": eqx.nn.PReLU(),
+            "internal_channels": 24,
+            "kernel": 5,
+            "stride": 2,
+            "activation": jax.nn.relu,
         },
         {
             "internal_channels": 32,
-            "kernel": 3,
-            "stride": 1,
-            "dilation": 2,
-            "activation": eqx.nn.PReLU(),
-        },
-        {
-            "internal_channels": 64,
-            "kernel": 3,
-            "stride": 1,
-            "activation": eqx.nn.PReLU(),
-            "use_dropout": True,
-            "max_pool": True,
-        },
-        {
-            "internal_channels": 64,
             "kernel": 5,
-            "dilation": 2,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
         },
         {
-            "internal_channels": 64,
+            "internal_channels": 48,
             "kernel": 5,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
-            "max_pool": True,
+            # "dilation": 2,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 96,
+            "kernel": 5,
+            # "dilation": 2,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"max_pool": True,
+            # "stride": 2,
+            #"use_dropout": True,
         },
         {
             "internal_channels": 128,
             "kernel": 5,
             "stride": 2,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"activation": jax.nn.glu,
+            #"use_dropout": True,
         },
         {
             "internal_channels": 256,
             "kernel": 5,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
-            "max_pool": True,
+            "stride": 2,
+            #"activation": jax.nn.glu,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
         },
         {
-            "internal_channels": 256,
+            "internal_channels": 512,
             "kernel": 5,
-            "dilation": 2,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            #"activation": jax.nn.relu,
+            "activation": jax.nn.glu,
+            #"use_dropout": True,
             "max_pool": True,
         },
         {
             "internal_channels": 512,
-            "kernel": 7,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
-            "max_pool": True,
-        },
-        {
-            "internal_channels": 512,
-            "kernel": 7,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
-            "max_pool": True,
-        },
-        {
-            "internal_channels": 1024,
-            "kernel": 7,
-            "activation": jax.nn.gelu,
-            "use_dropout": True,
+            "kernel": 5,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            # "activation": identity,
+            #"activation": jax.nn.relu,
+            "activation": jax.nn.glu,
+            # "stride": 2,
+            #"use_dropout": True,
             "max_pool": True,
         },
     ],
@@ -147,20 +148,24 @@ class ResidualConv(eqx.Module):
 
     def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
         conv_key, shortcut_key = _split_key(key, 2)
+
+        self.activation_function = activation
+        out_channels = channels
+        if activation == jax.nn.glu:
+            out_channels = channels * 2
+            self.activation_function = partial(jax.nn.glu, axis=0)
         
         padding = ((kernel - 1) // 2) * dilation
         self.conv = eqx.nn.Conv1d(
             in_channels=conv_inputs,
-            out_channels=channels,
+            out_channels=out_channels,
             kernel_size=(kernel,),
             stride=(stride,),
             dilation=(dilation,),
             padding=(padding,),
             key=conv_key
         )
-
-        self.activation_function = activation
-        self.batch_norm_1 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+        self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
 
         if dropout_rate is not None:
             self.dropout = eqx.nn.Dropout(dropout_rate)
@@ -179,7 +184,6 @@ class ResidualConv(eqx.Module):
         # Residual
         out = out + self.shortcut(x)
         out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
-        out = self.activation_function(out)
 
         if self.max_pool:
             out = self.max_pool(out)

@@ -90,18 +90,21 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_o
 
         hit_rates_sum = 0.0
         full_diff_sum = 0.0
-        phantom_miss_ratio_sum = 0.0
+        phantom_note_diff_sum = 0.0
+        missed_note_diff_sum = 0.0
         for predicted_probs, events in zip(probs, midi_events):
             detailed_loss = detailed_event_loss(predicted_probs, events)
             hit_rates_sum += detailed_loss.hit_rate
             full_diff_sum += detailed_loss.full_diff
-            phantom_miss_ratio_sum += detailed_loss.phantom_miss_ratio
+            phantom_note_diff_sum += detailed_loss.phantom_notes_diff
+            missed_note_diff_sum += detailed_loss.missed_notes_diff
         
         loss_map[sample_name] = {
             "loss": jnp.mean(test_losses),
             "hit_rate": hit_rates_sum / probs.shape[0],
             "eventized_diff": full_diff_sum / probs.shape[0],
-            "phantom_miss_ratio": phantom_miss_ratio_sum / probs.shape[0],
+            "phantom_note_diff": phantom_note_diff_sum / probs.shape[0],
+            "missed_note_diff": missed_note_diff_sum / probs.shape[0],
         }
 
     print("Finished evaluating test loss")
@@ -113,16 +116,14 @@ def compute_testset_loss(model, state, testset_dir: Path, num_model_output_frame
     test_loss = jnp.zeros((1,))
     hit_rate = jnp.zeros((1,))
     eventized_diff = jnp.zeros((1,))
-    phantom_miss_ratio = jnp.zeros((1,))
     count = jnp.array(0, dtype=jnp.int32)
     for losses in per_sample_map.values():
         test_loss += losses["loss"]
         hit_rate += losses["hit_rate"]
         eventized_diff += losses["eventized_diff"]
-        phantom_miss_ratio += losses["phantom_miss_ratio"]
         count += 1
 
-    return (test_loss / count)[0], (hit_rate / count)[0], (eventized_diff / count)[0], (phantom_miss_ratio / count)[0]
+    return (test_loss / count)[0], (hit_rate / count)[0], (eventized_diff / count)[0]
 
 
 def train(
@@ -219,11 +220,11 @@ def train(
             print("Evaluating test losses...")
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(model, state, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff = compute_testset_loss(model, state, testset_dir, num_model_output_frames, eval_key, batch_sharding)
                 if testloss_csv is not None:
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 testset_hitrates[name] = float(hit_rate)
-                print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, phantom_miss_ratio = {phantom_miss_ratio}")
+                print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
 
     return model, state, opt_state
 

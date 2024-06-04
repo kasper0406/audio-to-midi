@@ -15,10 +15,13 @@ from mido import MidiFile, MidiTrack, Message, MetaMessage
 from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, plot_output_probs
 import modelutil
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
+    if overlap <= 0.0:
+        return np.concatenate(all_probs)
+
     # Append a frame at the beginning with the start of the first frame to make the stitching
     # below work out as intended
     overlapping_frames = int(overlap / duration_per_frame)
@@ -84,9 +87,8 @@ def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, o
 @dataclass
 class DetailedEventLoss:
     full_diff: int
-    phantom_notes_diff: int
-    missed_notes_diff: int
-    phantom_miss_ratio: float
+    phantom_notes_diff: float
+    missed_notes_diff: float
     notes_hit: int
     hit_rate: float
 
@@ -112,6 +114,15 @@ def detailed_event_loss(
     missed_notes_diff = np.sum(expected[played_expected & ~played_predicted])
     notes_hit = np.sum(played_predicted & played_expected)
 
+    visual_missed = np.zeros_like(expected)
+    mask = played_expected & ~played_predicted
+    visual_missed[mask] = expected[mask]
+
+    #plot_output_probs("Missed diff", 0.03225806451612903, visual_missed)
+    #plot_output_probs("Predicted", 0.03225806451612903, predicted)
+    #plot_output_probs("Expected", 0.03225806451612903, expected)
+    #plt.show(block = True)
+
     hit_rate = 1.0
     if notes_hit + phantom_notes_diff + missed_notes_diff > 0:
         hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
@@ -120,7 +131,6 @@ def detailed_event_loss(
         full_diff=full_diff,
         phantom_notes_diff=phantom_notes_diff,
         missed_notes_diff=missed_notes_diff,
-        phantom_miss_ratio=phantom_notes_diff / missed_notes_diff,
         notes_hit=notes_hit,
         hit_rate=hit_rate,
     )
