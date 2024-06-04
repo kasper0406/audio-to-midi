@@ -119,14 +119,6 @@ def fft_audio(
 
     return absolute_values
 
-def compute_activations(frame_events: Float[Array, "num_frames num_events"]):
-    activations = jnp.array(frame_events)
-    shifted_events = jnp.roll(frame_events, 1, axis=0)
-    shifted_events.at[:1, ...].set(1.0) # We do not want activations in the very first frame
-    zeros = jnp.zeros_like(frame_events)
-    activations = jnp.maximum(activations - shifted_events, zeros)
-    return activations
-
 class AudioToMidiDatasetLoader:
     SAMPLE_RATE = 2 * FREQUENCY_CUTOFF
 
@@ -272,8 +264,6 @@ class AudioToMidiDatasetLoader:
                 event_batch = event_batch[batch_size:, ...]
                 sample_names_batch = sample_names_batch[batch_size:]
 
-                activations = jax.vmap(compute_activations)(next_events)
-
                 while len(self.queue) >= self.prefetch_count:
                     # print("Backing off, as the queue is full")
                     time.sleep(0.05)
@@ -281,7 +271,6 @@ class AudioToMidiDatasetLoader:
                     "audio": next_audio,
                     "events": next_events,
                     "sample_names": next_sample_names,
-                    "activations": activations,
                 })
 
     @classmethod
@@ -382,7 +371,6 @@ def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
 def plot_frequency_domain_audio(
     sample_name: str, samples: NDArray[jnp.float32],
     events: Float[Array, "frame_count midi_voccab_size"] = None,
-    activations: Integer[Array, "num_frames midi_voccab_size"] = None,
 ):
     if events is None:
         fig, (ax1) = plt.subplots(nrows=1, ncols=1)
@@ -513,12 +501,11 @@ def visualize_sample(
     sample_name: str,
     samples: Float[Array, "num_samples"],
     events: Integer[Array, "num_frames midi_voccab_size"],
-    activations: Integer[Array, "num_frames midi_voccab_size"],
 ):
     print(f"Sample name: {sample_name}")
     print("Samples shape:", samples.shape)
     print(f"Events shape: {events.shape}")
-    plot_frequency_domain_audio(sample_name, samples, events=events, activations=activations)
+    plot_frequency_domain_audio(sample_name, samples, events=events)
     # plot_with_frequency_normalization_domain_audio(sample_name, duration_per_frame_in_secs, frame_width, frames)
 
 if __name__ == "__main__":
@@ -558,6 +545,5 @@ if __name__ == "__main__":
             loaded_batch["sample_names"][batch_idx],
             loaded_batch["audio"][batch_idx],
             loaded_batch["events"][batch_idx],
-            loaded_batch["activations"][batch_idx],
         )
         plt.show(block=True)
