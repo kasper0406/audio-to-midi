@@ -618,7 +618,7 @@ class OutputSequenceGenerator(eqx.Module):
         event_processor_key, frame_embedding_key, decoder_key, dropout_key = _split_key(key, num=4)
 
         frame_embeddings, state = self.frame_embedding(
-            samples, state, enable_dropout=enable_dropout, key=frame_embedding_key
+            OutputSequenceGenerator.__compress_samples(samples), state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
         mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int32)
 
@@ -636,3 +636,10 @@ class OutputSequenceGenerator(eqx.Module):
     def predict(self, state, samples):
         (logits, probs), _state = self(samples, state, None)
         return logits, probs
+
+    @eqx.filter_jit
+    def __compress_samples(samples):
+        def compress_channel(channel_samples):
+            mu = 255
+            return jnp.sign(channel_samples) * jnp.log1p(mu * jnp.abs(channel_samples)) / jnp.log1p(mu)
+        return jax.vmap(compress_channel)(samples)
