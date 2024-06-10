@@ -35,7 +35,7 @@ if not args.validation:
     if not audio_file.exists():
         raise f"The specified audio file {audio_file} does not exist!"
 
-    overlap = 0.0
+    overlap = 0.5
     sample_windows, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
     print("Loaded samples")
     

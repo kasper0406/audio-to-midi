@@ -6,6 +6,8 @@ use num_traits::Zero;
 
 use num_traits::cast::AsPrimitive;
 
+use log::{debug, error, info, trace, warn};
+
 pub type MidiEvents = Vec<(u32, u32, u32, u32)>;
 
 pub fn stitch_probs<'a, T>(all_probs: &ArrayView3<'a, T>, overlap: f64, duration_per_frame: f64) -> Array2<f32>
@@ -15,26 +17,28 @@ where
     let [num_windows, frames_per_window, event_categories] = *all_probs.shape() else { todo!() };
     let (num_windows, frames_per_window, event_categories) = (num_windows as i64, frames_per_window as i64, event_categories as i64);
 
-    let overlapping_frames = (overlap / duration_per_frame) as i64;
-    println!("Overlapping frames: {}, overlap: {}, dpf: {}", overlapping_frames, overlap, duration_per_frame);
-    let output_frames = (num_windows * frames_per_window - overlapping_frames * (num_windows - 1)) as usize;
+    let overlapping_frames = overlap as f64 / duration_per_frame as f64;
+    debug!("Overlapping frames: {}, overlap: {}, dpf: {}", overlapping_frames, overlap, duration_per_frame);
+    let output_frames = (num_windows * frames_per_window - (overlapping_frames as i64) * (num_windows - 1)) as usize;
     let mut stitched: Array2<f32> = Array::zeros((output_frames, event_categories as usize));
-    let mut output_frame_base = 0;
+    let mut output_frame_base = 0.0;
     for window in 0..num_windows {
         for frame in 0..frames_per_window {
             for event in 0..event_categories {
-                let stitched_idx = ((output_frame_base + frame) as usize, event as usize);
+                let stitched_idx = (((output_frame_base as i64) + frame) as usize, event as usize);
                 let probs_idx = (window as usize, frame as usize, event as usize);
-                stitched[stitched_idx] = stitched[stitched_idx] + all_probs[probs_idx].as_();
 
-                // We have double counted the overlapping frames
-                // Divide the value by 2 to get the mean of the probs
-                if window > 0 && frame <= overlapping_frames {
-                    stitched[stitched_idx] = stitched[stitched_idx] / 2.0;
+                // If we are in the overlapping frames area, we need to blend the results
+                if window > 0 && frame <= overlapping_frames.ceil() as i64 {
+                    // We do a linear blend from 0 to 1 in the region of overlapping frames
+                    let blend = (frame as f64) / (overlapping_frames as f64); // Blend will be in [0; 1]
+                    stitched[stitched_idx] = ((1.0 - blend) * (stitched[stitched_idx] as f64) + blend * (all_probs[probs_idx].as_() as f64)) as f32;
+                } else {
+                    stitched[stitched_idx] = all_probs[probs_idx].as_();
                 }
             }
         }
-        output_frame_base += frames_per_window - overlapping_frames;
+        output_frame_base += (frames_per_window as f64) - overlapping_frames;
     }
 
     stitched
@@ -45,7 +49,7 @@ where
     T: AsPrimitive<f32>,
 {
     let reactivation_threshold = 0.7 as f32;
-    let activation_threshold = 0.9 as f32;
+    let activation_threshold = 0.6 as f32;
     let deactivation_threshold = 0.1 as f32;
 
     let mut events: MidiEvents = vec![];
@@ -94,12 +98,12 @@ where
                 }
             }
 
-            if frame + 1 < num_frames && probs[(frame, key)].as_() < probs[(frame + 1, key)].as_() {
-                // We will handle this key in the next frame
-                continue
+            let mut key_modifier = 0.0;
+            if key <= 30 {
+                key_modifier += ((30.0 - key as f32) / 30.0) * 0.3;
             }
 
-            if probs[(frame, key)].as_() > activation_threshold {
+            if probs[(frame, key)].as_() > activation_threshold + key_modifier {
                 if let Some((started_at, activation_prob)) = currently_playing[key] {
                     // Either the key is already playing, and we may have a re-activation
                     let time_since_activation = frame as f32 - started_at as f32;

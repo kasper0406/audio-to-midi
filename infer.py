@@ -19,25 +19,7 @@ from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, plot_output_probs
 import modelutil
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
-    if overlap <= 0.0:
-        return np.concatenate(all_probs)
-
-    # Append a frame at the beginning with the start of the first frame to make the stitching
-    # below work out as intended
-    overlapping_frames = int(overlap / duration_per_frame)
-    replicated_frame = np.zeros((all_probs.shape[1], all_probs.shape[2]), dtype=np.float32)
-    replicated_frame[-overlapping_frames:] += all_probs[0, :overlapping_frames, ...]
-    all_probs = np.concatenate([ replicated_frame[np.newaxis, ...], all_probs ])
-
-    output = np.zeros((0, all_probs.shape[2]), dtype=np.float32)
-    for i in range(1, all_probs.shape[0]):
-        overlap = (all_probs[i - 1, -overlapping_frames:, ...] + all_probs[i, :overlapping_frames]) / 2
-        non_overlap = all_probs[i, (overlapping_frames + 1):-(overlapping_frames + 1), ...]
-        output = np.concatenate([output, overlap, non_overlap])
-    # For the last probs there are no overlap, so we just add the region directly
-    output = np.concatenate([output, all_probs[-1, -overlapping_frames:, ...]])
-
-    return output
+    return modelutil.stitch_probs(np.stack(all_probs), overlap, duration_per_frame)
 
 def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
     _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, samples)

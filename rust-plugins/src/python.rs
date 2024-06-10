@@ -526,6 +526,15 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 }
 
 #[pyfunction]
+fn stitch_probs(py: Python, py_probs: Py<PyArray3<f32>>, overlap: f64, duration_per_frame: f64) -> PyResult<Py<PyArray2<f32>>> {
+    let array = py_probs.as_ref(py).readonly();
+    let probs = array.as_array();
+
+    let stitched_probs = crate::common::stitch_probs(&probs, overlap, duration_per_frame);
+    Ok(stitched_probs.into_pyarray_bound(py).into())
+}
+
+#[pyfunction]
 fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
     let array = py_probs.as_ref(py).readonly();
     let probs = array.as_array();
@@ -567,6 +576,7 @@ fn modelutil(_py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(stitch_probs, m)?)?;
     m.add_function(wrap_pyfunction!(extract_events, m)?)?;
     m.add_function(wrap_pyfunction!(to_frame_events, m)?)?;
     Ok(())
