@@ -3,6 +3,7 @@ use crate::common::MidiEvents;
 use std::path::Path;
 use std::fmt;
 use std::str::EncodeUtf16;
+use std::env;
 
 use numpy::{ PyArray2, PyArray3, PyReadonlyArray2 };
 use numpy::ToPyArray;
@@ -16,12 +17,16 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 use tokio::process::Command;
-use tokio::io::{BufReader, AsyncBufReadExt};
+use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use uuid::Uuid;
 use std::process::Stdio;
 use futures::future::join_all;
+use half::f16;
+use num_traits::cast::AsPrimitive;
+use futures::TryFutureExt;
+use sha2::{Sha256, Digest};
 
 use log::{debug, error, info, trace, warn};
 
@@ -49,7 +54,7 @@ fn frame_position(time: f32, duration_per_frame: f32) -> u32 {
 
 const VELOCITY_CATEGORIES: f32 = 10.0;
 
-async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
+async fn get_events_from_file(path: &str, duration_per_frame: f32) -> Result<MidiEvents, std::io::Error> {
     let mut file = File::open(path).await?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).await?;
@@ -65,11 +70,6 @@ async fn get_events_from_file(path: &str, max_event_time: f32, duration_per_fram
     for result in reader.deserialize::<EventRecord>().skip(1) {
         match result {
             Ok(record) => {
-                if record.time > max_event_time {
-                    debug!["Skipping midi event because it happens after {} seconds", max_event_time];
-                    continue
-                }
-
                 let attack_time = frame_position(record.time, duration_per_frame);
                 let key = key_to_event(record.key);
                 let duration = frame_position(record.duration, duration_per_frame).max(1);
@@ -168,7 +168,7 @@ async fn read_samples_from_file(raw_file: &str, sample_rate: u32, maybe_max_dura
     Ok(samples)
 }
 
-async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     // TODO: Consider sending back all audio channels
     let mut command = Command::new("ffmpeg");
     if let Some(max_duration) = maybe_max_duration {
@@ -224,18 +224,38 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
         Err(err) => return Err(AudioLoadingError::IoError(err, String::from(input_file))),
     }
 
-    let left_samples = read_samples_from_file(left_output_file, sample_rate, maybe_max_duration);
-    let right_samples = read_samples_from_file(right_output_file, sample_rate, maybe_max_duration);
+    let left_samples_future = read_samples_from_file(left_output_file, sample_rate, maybe_max_duration);
+    let right_samples_future = read_samples_from_file(right_output_file, sample_rate, maybe_max_duration);
 
-    Ok((left_samples.await?, right_samples.await?))
+    let left_samples = left_samples_future.await?;
+    let right_samples = right_samples_future.await?;
+
+    // Normalize the audio samples and convert to fp16 precision
+    let max_value_left = left_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
+    let max_value_right = right_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
+    let mut total_max = max_value_left.max(max_value_right);
+    if total_max < 0.03 {
+        // If the audio is very quite, there is a good chance it is silent everywhere, or it is simply noise
+        // We do not want to normalize this due to division by 0 concerns
+        total_max = 1.0
+    }
+
+    let normalized_left: Vec<f16> = left_samples.iter()
+        .map(|sample| f16::from_f32(sample / total_max))
+        .collect();
+    let normalized_right: Vec<f16> = right_samples.iter()
+        .map(|sample| f16::from_f32(sample / total_max))
+        .collect();
+
+    Ok((normalized_left, normalized_right))
 }
 
-async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: Option<f32>) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+async fn load_audio_sample_uncached(file_path: &str, sample_rate: u32) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     let uuid = Uuid::new_v4();
     let left_output_file = format!["/tmp/audio-to-midi-{}_left.raw", uuid];
     let right_output_file = format!["/tmp/audio-to-midi-{}_right.raw", uuid];
     
-    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &left_output_file, &right_output_file, sample_rate, max_duration).await;
+    let audio_sampels = generate_raw_audio_using_ffmpeg(file_path, &left_output_file, &right_output_file, sample_rate, None).await;
 
     tokio::fs::remove_file(left_output_file.clone()).await
         .map_err(|err| AudioLoadingError::IoError(err, String::from(left_output_file)))?;
@@ -244,11 +264,85 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32, max_duration: Opti
     audio_sampels
 }
 
+fn generate_cache_filename(path: &str, sample_rate: u32) -> String {
+    // Hashing the complete path to ensure uniqueness
+    let mut hasher = Sha256::new();
+    hasher.update(path);
+    let hash_result = hasher.finalize();
+    let hash_str = format!("{:x}", hash_result); // Convert hash to hex string
+
+    // Truncate hash to first 30 characters for brevity
+    let short_hash = &hash_str[..30];
+
+    // Combine truncated hash with filename
+    format!("{}_{}", short_hash, sample_rate)
+}
+
+fn path_to_string_lossy<P: AsRef<Path>>(path: P) -> String {
+    path.as_ref().to_string_lossy().into_owned()
+}
+
+async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+    let (left_samples, right_samples) = match env::var("SAMPLE_CACHE_DIR") {
+        Ok(cache_dir) => {
+            let cache_filename = generate_cache_filename(file_path, sample_rate);
+            let left_cache_file = Path::new(&cache_dir).join(&cache_filename[..4]).join(format!["{}_left.raw", cache_filename]);
+            let right_cache_file = Path::new(&cache_dir).join(&cache_filename[..4]).join(format!["{}_right.raw", cache_filename]);
+
+            tokio::fs::create_dir_all(left_cache_file.parent().unwrap()).await
+                .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+            tokio::fs::create_dir_all(right_cache_file.parent().unwrap()).await
+                .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?;
+
+            if left_cache_file.exists() && right_cache_file.exists() {
+                debug!["Reading samples from cache {} {}", file_path, sample_rate];
+
+                // Read the cached files
+                let mut encoded_left = Vec::new();
+                File::open(&left_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?
+                    .read_to_end(&mut encoded_left).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                let left_samples: Vec<f16> = bincode::deserialize(&encoded_left[..]).unwrap();
+
+                let mut encoded_right = Vec::new();
+                File::open(&right_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?
+                    .read_to_end(&mut encoded_right).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                let right_samples: Vec<f16> = bincode::deserialize(&encoded_right[..]).unwrap();
+
+                Ok((left_samples, right_samples))
+            } else {
+                let (left_samples, right_samples) = load_audio_sample_uncached(file_path, sample_rate).await?;
+
+                // Update the cache
+                File::create(&left_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?
+                    .write_all(&bincode::serialize(&left_samples).unwrap()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                File::create(&right_cache_file).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?
+                    .write_all(&bincode::serialize(&right_samples).unwrap()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+
+                Ok((left_samples, right_samples))
+            }
+        },
+        Err(e) => Ok(load_audio_sample_uncached(file_path, sample_rate).await?)
+    }?;
+
+    Ok((
+        left_samples.iter().map(|sample| sample.to_f32()).collect(),
+        right_samples.iter().map(|sample| sample.to_f32()).collect()
+    ))
+}
+
 #[pyfunction]
 fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<PyArray2<f32>>> {
     let (left_samples, right_samples) = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
-            let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate, None).await });
+            let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate).await });
             match future.await {
                 Ok(Ok(samples)) => {
                     Ok(samples)
@@ -294,22 +388,26 @@ async fn resolve_audio_samples(sample_file: &str) -> String {
     panic!["Audio not found for sample: {}", sample_file];
 }
 
-fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f32>> {
-    // TODO: Handle velocities somehow
+fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_frame: i32, num_frames_with_backing_samples: i32) -> Vec<Vec<f32>> {
+    let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; model_output_size as usize];
 
-    let mut frames = vec![vec![0.0; NUM_EVENT_TYPES]; frame_count];
-
-    // Currently this is not a perfect representation, if a key is released and then attacked very quickly thereafter
-    // but that will be an issue for another day...
-    for (frame_start, key, frame_duration, velocity) in events {
+    for (attack_frame, key, frame_duration, velocity) in events {
         let decay_function = |t: f32| -> f32 {
-            (-0.05 * t).exp()
+            (-0.05 * t).exp().max(0.2) // Do not drop below 0.2 while the note is actually playing
         };
 
-        let frame_end = ((*frame_start + *frame_duration) as usize).min(frame_count);
-        for frame in (*frame_start as usize)..frame_end {
-            let t: f32 = frame as f32 - *frame_start as f32;
-            frames[frame][*key as usize] = decay_function(t);
+        let frame_start = (*attack_frame as i32) - start_frame;
+        let frame_end = frame_start + *frame_duration as i32;
+
+        // Ensure that the frame before the start is blank
+        // To ensure we handle potentially fast re-activations
+        if frame_start > 0 && frame_start < model_output_size {
+            frames[(frame_start - 1) as usize][*key as usize] = 0.0;
+        }
+
+        for frame in frame_start.max(0)..frame_end.min(model_output_size).min(num_frames_with_backing_samples) {
+            let t = frame as f32 - frame_start as f32;
+            frames[frame as usize][*key as usize] = decay_function(t);
         }
     }
 
@@ -317,25 +415,26 @@ fn convert_to_frame_events(events: &MidiEvents, frame_count: usize) -> Vec<Vec<f
 }
 
 #[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, max_duration: f32, duration_per_frame: f32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+    let duration_per_frame = model_duration as f64 / num_model_outputs as f64;
 
     let all_samples = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
             let mut audio_futures = vec![];
             let mut event_futures = vec![];
 
-            for sample_file in sample_files {
+            for sample_file in &sample_files {
                 let sampel_file_clone = sample_file.clone();
 
                 let audio_future = TOKIO_RUNTIME.spawn(async move {
                     let audio_filename = resolve_audio_samples(&sampel_file_clone).await;
-                    load_audio_sample(&audio_filename, sample_rate, Some(max_duration)).await
+                    load_audio_sample(&audio_filename, sample_rate).await
                 });
                 audio_futures.push(audio_future);
 
                 let event_filename = format!["{}.csv", sample_file.clone()];
-                let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, max_duration, duration_per_frame).await });
+                let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, duration_per_frame as f32).await });
                 event_futures.push(event_future);
             }
 
@@ -350,43 +449,89 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
                 .map(|result| result.unwrap())
                 .collect();
 
-            let frame_count = (max_duration / duration_per_frame).round() as usize;
-            debug!("Event frame count {}, max_duration = {}, dps = {}", frame_count, max_duration, duration_per_frame);
-            let events_by_frame: Vec<Vec<Vec<f32>>> = events.iter()
-                .map(|events| convert_to_frame_events(&events, frame_count))
-                .collect();
+            debug!("Event frame count {}, max_duration = {}, dpf = {}", num_model_outputs, model_duration, duration_per_frame);
+            // TODO: Try to make this nicer...
+            let (audio_samples, events_by_frame, sample_names): (Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<Vec<f32>>>, Vec<String>) = events.iter()
+                    .zip(audio_samples.iter())
+                    .zip(sample_files.iter())
+                .map(|((events, samples), sample_file_name)| {
+                    // events and samples may be too big for the model to handle. We will split them out
+                    let (left_samples, right_samples) = samples;
+                    let samples_per_model_call = (sample_rate as f32 * model_duration) as usize;
+                    let num_splits = ((left_samples.len() as f32) / samples_per_model_call as f32).ceil() as i32;
 
-            (audio_samples, events, events_by_frame)
+                    let mut sample_splits = vec![];
+                    let mut event_splits = vec![];
+                    let mut sample_name_split = vec![];
+                    for split in 0..num_splits {
+                        let start_frame = split * num_model_outputs as i32;
+                        let start_sample = (split * samples_per_model_call as i32) as usize;
+                        let samples_to_copy = samples_per_model_call.min(left_samples.len() - start_sample);
+                        let num_frames_with_backing_samples = ((samples_to_copy as f32 / samples_per_model_call as f32) * (num_model_outputs as f32)).ceil() as i32;
+                        debug!["Copying {} samples starting at {} for split {}", samples_to_copy, start_sample, split];
+
+                        let frame_events = convert_to_frame_events(&events, num_model_outputs, start_frame, num_frames_with_backing_samples);
+                        let mut split_samples_left = vec![0.0; samples_per_model_call as usize];
+                        let mut split_samples_right = vec![0.0; samples_per_model_call as usize];
+
+                        for i in 0..samples_to_copy {
+                            split_samples_left[i] = left_samples[start_sample + i];
+                            split_samples_right[i] = right_samples[start_sample + i];
+                        }
+
+                        // Only include it if we have more than half of the samples so we do not train on too much silence
+                        if samples_to_copy > samples_per_model_call / 2 {
+                            sample_splits.push((split_samples_left, split_samples_right));
+                            event_splits.push(frame_events);
+                            sample_name_split.push(format!["{}+{}", sample_file_name, split]);
+                        }
+                    }
+
+                    (sample_splits, event_splits, sample_name_split)
+                })
+                .fold((Vec::new(), Vec::new(), Vec::new()), |(mut acc_a, mut acc_b, mut acc_c), (a, b, c)| {
+                    acc_a.extend(a.into_iter().collect::<Vec<_>>());
+                    acc_b.extend(b.into_iter().collect::<Vec<_>>());
+                    acc_c.extend(c.into_iter().collect::<Vec<_>>());
+                    (acc_a, acc_b, acc_c)
+                });
+
+            (audio_samples, events_by_frame, sample_names)
         })
     });
 
     let mut audio_results = vec![];
-    let mut event_results = vec![];
     let mut events_by_frame_results = vec![];
-    let (all_audio_samples, all_events, events_by_frame) = all_samples;
+    let mut sample_name_results = vec![];
+    let (all_audio_samples, events_by_frame, sample_names) = all_samples;
     let iter = all_audio_samples.into_iter()
-        .zip(all_events.into_iter())
         .zip(events_by_frame.into_iter())
-        .map(|((a, b), c)| (a, b, c));
-    for ((left_samples, right_samples), events, events_by_frame) in iter {
+        .zip(sample_names.into_iter())
+        .map(|((((a, b), c), d))| (a, b, c, d));
+    for (left_samples, right_samples, events_by_frame, sample_name) in iter {
         let samples_vec = vec![left_samples, right_samples];
         let audio_array = PyArray2::from_vec2(py, &samples_vec)?.to_owned();
         audio_results.push(audio_array);
 
-        let converted_events: Vec<Vec<u16>> = events.iter()
-            .map(|(attack_time, key, duration, velocity)| vec![*attack_time as u16, *key as u16, *duration as u16, *velocity as u16])
-            .collect();
-        let event_array: Py<PyArray2<u16>> = PyArray2::from_vec2(py, &converted_events)?.to_owned();
-        event_results.push(event_array);
-
         let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
         events_by_frame_results.push(converted_events_by_frame);
+
+        sample_name_results.push(sample_name);
     }
     Ok((
         PyList::new(py, &audio_results).into(),
-        PyList::new(py, &event_results).into(),
-        PyList::new(py, &events_by_frame_results).into()
+        PyList::new(py, &events_by_frame_results).into(),
+        PyList::new(py, &sample_name_results).into()
     ))
+}
+
+#[pyfunction]
+fn stitch_probs(py: Python, py_probs: Py<PyArray3<f32>>, overlap: f64, duration_per_frame: f64) -> PyResult<Py<PyArray2<f32>>> {
+    let array = py_probs.as_ref(py).readonly();
+    let probs = array.as_array();
+
+    let stitched_probs = crate::common::stitch_probs(&probs, overlap, duration_per_frame);
+    Ok(stitched_probs.into_pyarray_bound(py).into())
 }
 
 #[pyfunction]
@@ -417,7 +562,7 @@ fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyR
 
     let converted: Vec<_> = all_events.iter()
         .map(|events| {
-            let rust_converted = convert_to_frame_events(&events, frame_count);
+            let rust_converted = convert_to_frame_events(&events, frame_count as i32, 0, frame_count as i32);
             PyArray2::from_vec2(py, &rust_converted).unwrap().to_owned()
         })
         .collect();
@@ -431,6 +576,7 @@ fn modelutil(_py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(stitch_probs, m)?)?;
     m.add_function(wrap_pyfunction!(extract_events, m)?)?;
     m.add_function(wrap_pyfunction!(to_frame_events, m)?)?;
     Ok(())

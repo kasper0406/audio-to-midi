@@ -15,35 +15,17 @@ from mido import MidiFile, MidiTrack, Message, MetaMessage
 from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, plot_output_probs
 import modelutil
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
-    # Append a frame at the beginning with the start of the first frame to make the stitching
-    # below work out as intended
-    overlapping_frames = int(overlap / duration_per_frame)
-    replicated_frame = np.zeros((all_probs.shape[1], all_probs.shape[2]), dtype=np.float32)
-    replicated_frame[-overlapping_frames:] += all_probs[0, :overlapping_frames, ...]
-    all_probs = np.concatenate([ replicated_frame[np.newaxis, ...], all_probs ])
+    return modelutil.stitch_probs(np.stack(all_probs), overlap, duration_per_frame)
 
-    output = np.zeros((0, all_probs.shape[2]), dtype=np.float32)
-    for i in range(1, all_probs.shape[0]):
-        overlap = (all_probs[i - 1, -overlapping_frames:, ...] + all_probs[i, :overlapping_frames]) / 2
-        non_overlap = all_probs[i, (overlapping_frames + 1):-(overlapping_frames + 1), ...]
-        output = np.concatenate([output, overlap, non_overlap])
-    # For the last probs there are no overlap, so we just add the region directly
-    output = np.concatenate([output, all_probs[-1, -overlapping_frames:, ...]])
-
-    return output
-
-def predict_and_stitch(model, state, audio_frames, duration_per_frame: float, overlap=0.0):
-    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, audio_frames)
-
-    # HACK: Get rid of this!
-    #       Currently we train the model to not output the last three frames, so the overlap will be different
-    hacked_overlap = overlap - (audio_frames.shape[2] - probs.shape[1]) * duration_per_frame
-    print(f"Hacked overlap: {hacked_overlap}")
-    return probs, stitch_output_probs(probs, duration_per_frame, hacked_overlap)
+def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
+    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, samples)
+    duration_per_frame = window_duration / probs.shape[1]
+    print(f"Duration per frame: {duration_per_frame}")
+    return probs, stitch_output_probs(probs, duration_per_frame, overlap), duration_per_frame
 
 def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, output_file: str):
     midi = MidiFile()
@@ -87,9 +69,8 @@ def write_midi_file(events: [(int, int, int, int)], duration_per_frame: float, o
 @dataclass
 class DetailedEventLoss:
     full_diff: int
-    phantom_notes_diff: int
-    missed_notes_diff: int
-    phantom_miss_ratio: float
+    phantom_notes_diff: float
+    missed_notes_diff: float
     notes_hit: int
     hit_rate: float
 
@@ -115,17 +96,26 @@ def detailed_event_loss(
     missed_notes_diff = np.sum(expected[played_expected & ~played_predicted])
     notes_hit = np.sum(played_predicted & played_expected)
 
-    hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
+    visual_missed = np.zeros_like(expected)
+    mask = played_expected & ~played_predicted
+    visual_missed[mask] = expected[mask]
+
+    #plot_output_probs("Missed diff", 0.03225806451612903, visual_missed)
+    #plot_output_probs("Predicted", 0.03225806451612903, predicted)
+    #plot_output_probs("Expected", 0.03225806451612903, expected)
+    #plt.show(block = True)
+
+    hit_rate = 1.0
+    if notes_hit + phantom_notes_diff + missed_notes_diff > 0:
+        hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
 
     return DetailedEventLoss(
         full_diff=full_diff,
         phantom_notes_diff=phantom_notes_diff,
         missed_notes_diff=missed_notes_diff,
-        phantom_miss_ratio=phantom_notes_diff / missed_notes_diff,
         notes_hit=notes_hit,
         hit_rate=hit_rate,
     )
-
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
     fig, ax1 = plt.subplots()

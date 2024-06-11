@@ -1,89 +1,135 @@
 from functools import partial
 from typing import Dict, List, Optional
+import types
+import json
 
 import equinox as eqx
 import jax
+import jax.lib
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer, PRNGKeyArray
 
 import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
+@jax.jit
+def identity(arg):
+    return arg
+
 model_config = {
-    "frame_size": 2048,
     "max_frame_sequence_length": 200,
     "attention_size": 512,
     "intermediate_size": 512,
-    "num_heads": 2,
-    "num_layers": 4,
+    "num_heads": 6,
+    "num_layers": 12,
     "dropout_rate": 0.10,
-    "midi_event_context_size": 1,
 
     "convolutions": [
         {
-            "internal_channels": 1,
-            "time_kernel": 4,
-            "time_stride": 1,
-            "freq_kernel": 3,
-            "freq_stride": 1,
-        },
-        {
-            "internal_channels": 2,
-            "time_kernel": 6,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 2,
-        },
-        {
-            "internal_channels": 2,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 7,
-            "freq_stride": 1,
-        },
-        {
-            "internal_channels": 2,
-            "time_kernel": 10,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 1,
-        },
-        {
-            "internal_channels": 4,
-            "time_kernel": 6,
-            "time_stride": 1,
-            "freq_kernel": 4,
-            "freq_stride": 2,
-        },
-        {
-            "internal_channels": 8,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 4,
-            "freq_stride": 2,
-        },
-        {
-            "internal_channels": 16,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 3,
-            "freq_stride": 1,
+            "internal_channels": 24,
+            "kernel": 5,
+            "stride": 2,
+            "activation": jax.nn.relu,
         },
         {
             "internal_channels": 32,
-            "time_kernel": 8,
-            "time_stride": 1,
-            "freq_kernel": 5,
-            "freq_stride": 2,
-        }
+            "kernel": 5,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 48,
+            "kernel": 5,
+            # "dilation": 2,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 96,
+            "kernel": 5,
+            # "dilation": 2,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"max_pool": True,
+            # "stride": 2,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 128,
+            "kernel": 5,
+            "stride": 2,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"activation": jax.nn.glu,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 256,
+            "kernel": 5,
+            "stride": 2,
+            #"activation": jax.nn.glu,
+            #"activation": jax.nn.gelu,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": identity,
+            "activation": jax.nn.relu,
+            #"use_dropout": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 5,
+            "stride": 2,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            #"activation": identity,
+            #"activation": jax.nn.relu,
+            "activation": jax.nn.glu,
+            #"use_dropout": True,
+            "max_pool": True,
+        },
+        {
+            "internal_channels": 512,
+            "kernel": 5,
+            #"activation": eqx.nn.PReLU(),
+            #"activation": jax.nn.gelu,
+            # "activation": identity,
+            #"activation": jax.nn.relu,
+            "activation": jax.nn.glu,
+            # "stride": 2,
+            #"use_dropout": True,
+            "max_pool": True,
+        },
     ],
 }
 
+def serialize_function(obj):
+    if isinstance(obj, types.FunctionType):
+        return f"<function {obj.__name__}>"
+    if isinstance(obj, jax.lib.xla_extension.PjitFunction):
+        return f"<pjit_fn {obj.__name__}>"
+    if isinstance(obj, jax.custom_jvp):
+        return f"<custom_jvp {obj.__name__}>"
+    if isinstance(obj, eqx.nn.PReLU):
+        return "<eqx.nn.PReLU>"
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
 def get_model_metadata():
-    return {
+    metadata = {
         'model': model_config,
         'data_prep': get_data_prep_config(),
     }
+    return json.dumps(metadata, default=serialize_function)
 
 def _split_key(key, num: int = 2):
     if key is None:
@@ -91,20 +137,76 @@ def _split_key(key, num: int = 2):
     else:
         return jax.random.split(key, num)
 
+class ResidualConv(eqx.Module):
+    conv: eqx.nn.Conv
+    activation_function: types.FunctionType
+    batch_norm_1: eqx.nn.BatchNorm
+    batch_norm_2: eqx.nn.BatchNorm
+    dropout: eqx.nn.Dropout | None = None
+    shortcut: eqx.nn.Conv # Residual connections
+    max_pool: eqx.nn.MaxPool1d | None = None
+
+    def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
+        conv_key, shortcut_key = _split_key(key, 2)
+
+        self.activation_function = activation
+        out_channels = channels
+        if activation == jax.nn.glu:
+            out_channels = channels * 2
+            self.activation_function = partial(jax.nn.glu, axis=0)
+        
+        padding = ((kernel - 1) // 2) * dilation
+        self.conv = eqx.nn.Conv1d(
+            in_channels=conv_inputs,
+            out_channels=out_channels,
+            kernel_size=(kernel,),
+            stride=(stride,),
+            dilation=(dilation,),
+            padding=(padding,),
+            key=conv_key
+        )
+        self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
+
+        if dropout_rate is not None:
+            self.dropout = eqx.nn.Dropout(dropout_rate)
+        
+        self.shortcut = eqx.nn.Conv1d(in_channels=conv_inputs, out_channels=channels, kernel_size=1, stride=stride, key=shortcut_key)
+        self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+
+        if max_pool:
+            self.max_pool = eqx.nn.MaxPool1d(kernel_size=2, stride=2)
+    
+    def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
+        out = self.conv(x)
+        out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+        out = self.activation_function(out)
+
+        # Residual
+        out = out + self.shortcut(x)
+        out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+
+        if self.max_pool:
+            out = self.max_pool(out)
+
+        if self.dropout:
+            out = self.dropout(out, inference=not enable_dropout, key=key)
+        
+        return out, state
+
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
-    frame_size: int
     layernorm: eqx.nn.LayerNorm
     position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
     position_embedder: eqx.nn.Linear
     layers: [eqx.Module]
+    final_pooling: eqx.nn.Conv1d
+    final_batch_norm: eqx.nn.BatchNorm
 
     def __init__(
         self,
         output_shape: int,
-        frame_size: int,  # Size of the processed audio frame
         max_frame_sequence_length: int,  # The maximum number of input frames
         dropout_rate: float,
         key: PRNGKeyArray,
@@ -112,7 +214,6 @@ class FrameEmbedding(eqx.Module):
     ):
         pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
 
-        self.frame_size = frame_size
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
         self.position_embeddings = position_encoding.for_input_frame(
@@ -124,38 +225,33 @@ class FrameEmbedding(eqx.Module):
 
         self.layers = []
         conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
-        conv_height = frame_size
         conv_inputs = input_channels
         for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
+            dilation = 1 if "dilation" not in conv_settings else conv_settings["dilation"]
+            stride = 1 if "stride" not in conv_settings else conv_settings["stride"]
             self.layers.append(
-                eqx.nn.Conv2d(
-                    in_channels=conv_inputs,
-                    out_channels=conv_settings["internal_channels"],
-                    kernel_size=(conv_settings["time_kernel"], conv_settings["freq_kernel"]),
-                    stride=(conv_settings["time_stride"], conv_settings["freq_stride"]),
-                    padding=(int(conv_settings["time_kernel"] / 2) - 1, int(conv_settings["freq_kernel"] / 2)),
-                    key=conv_key)
+                ResidualConv(
+                    conv_inputs=conv_inputs,
+                    channels=conv_settings["internal_channels"],
+                    kernel=conv_settings["kernel"],
+                    stride=stride,
+                    dilation=dilation,
+                    activation=conv_settings["activation"],
+                    max_pool=conv_settings["max_pool"] if "max_pool" in conv_settings else False,
+                    dropout_rate=dropout_rate if "use_dropout" in conv_settings and conv_settings["use_dropout"] else None,
+                    key=conv_key,
+                )
             )
-            self.layers.append(jax.nn.gelu)
-            self.layers.append(eqx.nn.BatchNorm(input_size=conv_settings["internal_channels"], axis_name="batch"))
-
-            conv_height = int(conv_height / conv_settings["freq_stride"])
             conv_inputs = conv_settings["internal_channels"]
-            # print(f"Conv height: {conv_height}")
 
-        self.layers.append(
-            eqx.nn.Conv2d(
-                in_channels=conv_inputs,
-                out_channels=output_shape,
-                kernel_size=(1, conv_height),
-                stride=(1, conv_height),
-                # padding=0,
-                key=output_conv_key
-            )
+        self.final_pooling = eqx.nn.Conv1d(
+            in_channels=conv_inputs,
+            out_channels=output_shape,
+            kernel_size=(1,),
+            stride=(1,),
+            key=output_conv_key
         )
-        self.layers.append(jax.nn.gelu)
-        self.layers.append(eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch"))
-        self.layers.append(jax.nn.tanh)
+        self.final_batch_norm = eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch")
 
     def __call__(
         self,
@@ -165,12 +261,14 @@ class FrameEmbedding(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         frame_embeddings = input_frames
-        for layer in self.layers:
+        layer_keys = _split_key(key, len(self.layers))
+        for layer, layer_key in zip(self.layers, layer_keys):
             # print(f"Frame embedding shape: {frame_embeddings.shape}")
-            if isinstance(layer, eqx.nn.BatchNorm):
-                frame_embeddings, state = layer(frame_embeddings, state, inference=not enable_dropout)
-            else:
-                frame_embeddings = layer(frame_embeddings)
+            frame_embeddings, state = layer(frame_embeddings, state, enable_dropout, layer_key)
+
+        frame_embeddings = self.final_pooling(frame_embeddings)
+        frame_embeddings, state = self.final_batch_norm(frame_embeddings, state, inference=not enable_dropout)
+        frame_embeddings = jax.nn.tanh(frame_embeddings)
 
         # Make the last layer fit what we need for the transformer
         frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))
@@ -480,8 +578,6 @@ class OutputSequenceGenerator(eqx.Module):
     decoder: Decoder
     dropout: eqx.nn.Dropout
 
-    midi_event_context_size: int = eqx.field(static=True)
-
     def __init__(
         self,
         conf: Dict[str, any],
@@ -500,7 +596,6 @@ class OutputSequenceGenerator(eqx.Module):
 
         self.frame_embedding = FrameEmbedding(
             output_shape=conf["attention_size"],
-            frame_size=conf["frame_size"],
             max_frame_sequence_length=conf["max_frame_sequence_length"],
             key=frame_embedding_key,
             dropout_rate=conf["dropout_rate"],
@@ -513,11 +608,9 @@ class OutputSequenceGenerator(eqx.Module):
 
         self.dropout = eqx.nn.Dropout(conf["dropout_rate"])
 
-        self.midi_event_context_size = conf["midi_event_context_size"]
-
     def __call__(
         self,
-        input_frames: Float[Array, "frame_seq_len frame_size"],
+        samples: Float[Array, "frame_seq_len frame_size"],
         state,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
@@ -525,7 +618,7 @@ class OutputSequenceGenerator(eqx.Module):
         event_processor_key, frame_embedding_key, decoder_key, dropout_key = _split_key(key, num=4)
 
         frame_embeddings, state = self.frame_embedding(
-            input_frames, state, enable_dropout=enable_dropout, key=frame_embedding_key
+            OutputSequenceGenerator.__compress_samples(samples), state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
         mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int32)
 
@@ -540,6 +633,13 @@ class OutputSequenceGenerator(eqx.Module):
 
         return self.decoder(output, decoder_key), state
 
-    def predict(self, state, frames):
-        (logits, probs), _state = self(frames, state, None)
+    def predict(self, state, samples):
+        (logits, probs), _state = self(samples, state, None)
         return logits, probs
+
+    @eqx.filter_jit
+    def __compress_samples(samples):
+        def compress_channel(channel_samples):
+            mu = 255
+            return jnp.sign(channel_samples) * jnp.log1p(mu * jnp.abs(channel_samples)) / jnp.log1p(mu)
+        return jax.vmap(compress_channel)(samples)

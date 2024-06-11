@@ -3,7 +3,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 from infer import load_newest_checkpoint, predict_and_stitch, write_midi_file
-from train import compute_testset_loss, compute_testset_loss_individual
+from train import compute_testset_loss, compute_testset_loss_individual, compute_model_output_frames
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, plot_frequency_domain_audio, plot_embedding, visualize_sample, plot_output_probs
 import matplotlib.pyplot as plt
 import modelutil
@@ -14,9 +14,6 @@ parser.add_argument('output', help='The output MIDI file', nargs='?')
 
 parser.add_argument('--visualize-audio',
     help='Visualize the audio samples and event probabilities using matplotlib',
-    action='store_true')
-parser.add_argument('--visualize-audio-embeddings',
-    help='Visualize the audio embeddings',
     action='store_true')
 parser.add_argument('--validation',
     help='Test the provided validation set on the model',
@@ -39,25 +36,14 @@ if not args.validation:
         raise f"The specified audio file {audio_file} does not exist!"
 
     overlap = 0.5
-    frames, duration_per_frame, frame_width = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
+    sample_windows, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(audio_file, overlap=overlap)
     print("Loaded samples")
-
-    if args.visualize_audio_embeddings:
-        # import code
-        # code.interact(local=locals())
-        for frame in frames:
-            embeddings = audio_to_midi.frame_embedding(frame)
-            print(f"Embeddings shape: {embeddings.shape}")
-            plot_embedding(str(audio_file), embeddings)
-        plt.show(block=False)
     
-    individual_probs, stitched_probs = predict_and_stitch(audio_to_midi, state, frames, duration_per_frame, overlap=overlap)
+    individual_probs, stitched_probs, duration_per_frame = predict_and_stitch(audio_to_midi, state, sample_windows, window_duration, overlap=overlap)
 
     if args.visualize_audio:
         for i in range(individual_probs.shape[0]):
-            # TODO: Fix this hack!
-            padded_output = jnp.pad(individual_probs[i], ((0, frames[i].shape[1] - individual_probs[i].shape[0]), (0, 0)), 'constant', constant_values=0)
-            visualize_sample(args.path, frames[i], padded_output, None, duration_per_frame, frame_width)
+            visualize_sample(args.path, sample_windows[i], individual_probs[i])
             plt.show(block=False)
     
     print(f"Stitched probs shape: {stitched_probs.shape}")
@@ -73,18 +59,20 @@ if not args.validation:
 if args.validation:
     validation_dir = Path(args.path)
 
+    num_model_output_frames = compute_model_output_frames(audio_to_midi, state)
     if args.individual:
-        losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, key, sharding=None)
+        losses = compute_testset_loss_individual(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
         for sample_name, losses in losses.items():
             loss = losses["loss"]
             hit_rate = losses["hit_rate"]
             eventized_diff = losses["eventized_diff"]
-            print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}")
+            phantom_note_diff = losses["phantom_note_diff"]
+            missed_note_diff = losses["missed_note_diff"]
+            print(f"{sample_name}\t{loss}\t{hit_rate}\t{eventized_diff}\t{phantom_note_diff}\t{missed_note_diff}")
     else:
-        loss, hit_rate, eventized_diff, phantom_miss_ratio = compute_testset_loss(audio_to_midi, state, validation_dir, key, sharding=None)
+        loss, hit_rate, eventized_diff = compute_testset_loss(audio_to_midi, state, validation_dir, num_model_output_frames, key, sharding=None)
         print(f"Validation loss: {loss}")
         print(f"Hit rate: {hit_rate}")
         print(f"Eventized diff: {eventized_diff}")
-        print(f"Phantom/Miss: {phantom_miss_ratio}")
 
 plt.show() # Wait for matplotlib
