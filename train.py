@@ -32,7 +32,7 @@ def compute_loss_from_output(logits, expected_output):
 
     full_loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
 
-    return jnp.sum(attack_loss) + 0.1 * jnp.sum(full_loss)
+    return 2 * jnp.sum(attack_loss) + jnp.sum(full_loss)
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
@@ -94,12 +94,12 @@ def compute_testset_loss_individual(model, state, testset_dir: Path, num_model_o
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(audio, state, test_loss_keys)
         test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
 
-        stitched_probs = jnp.concatenate(probs, axis=0)
-        stitched_events = jnp.concatenate(midi_events, axis=0)
+        stitched_probs = np.concatenate(probs, axis=0)
+        stitched_events = np.concatenate(midi_events, axis=0)
 
         detailed_loss = detailed_event_loss(stitched_probs, stitched_events)
         loss_map[sample_name] = {
-            "loss": jnp.mean(test_losses),
+            "loss": np.mean(test_losses),
             "hit_rate": detailed_loss.hit_rate,
             "eventized_diff": detailed_loss.full_diff,
             "phantom_note_diff": detailed_loss.phantom_notes_diff,
