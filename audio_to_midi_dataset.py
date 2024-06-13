@@ -180,24 +180,15 @@ class AudioToMidiDatasetLoader:
                 time.sleep(1.0)
 
     @classmethod
-    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sharding = None):
+    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str]):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio(
             str(dataset_dir),
             samples,
             AudioToMidiDatasetLoader.SAMPLE_RATE,
             MODEL_AUDIO_LENGTH,
             num_model_output_frames)
-        audio_samples = jnp.stack(audio_samples)
-
-        required_padding = 0
-        if sharding is not None:
-            # Make sure the audio_samples array is shardable
-            required_padding = (sharding.mesh.shape["batch"] - audio_samples.shape[0]) % sharding.mesh.shape["batch"]
-            if required_padding != 0:
-                audio_samples = jnp.repeat(audio_samples, repeats=required_padding, axis=0)
-            audio_samples = jax.device_put(audio_samples, sharding)
-
-        midi_events = jnp.stack(midi_events)
+        audio_samples = np.stack(audio_samples)
+        midi_events = np.stack(midi_events)
 
         return midi_events, audio_samples, sample_names
 
@@ -217,8 +208,8 @@ class AudioToMidiDatasetLoader:
 
         # TODO: Consider to do this nicer.
         #       Currently needed because load_samples can return more samples than request for longer audio files.
-        audio_batch = jnp.zeros((0, 2, int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)))
-        event_batch = jnp.zeros((0, self.num_model_output_frames, MIDI_EVENT_VOCCAB_SIZE))
+        audio_batch = np.zeros((0, 2, int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)))
+        event_batch = np.zeros((0, self.num_model_output_frames, MIDI_EVENT_VOCCAB_SIZE))
         sample_names_batch = []
         while True:
             if self._stop_event.is_set():
@@ -245,11 +236,11 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, self.sharding)
+            midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
             # audio = add_noise(audio, key=noise_key)
 
-            audio_batch = jnp.concatenate([ audio_batch, audio ])
-            event_batch = jnp.concatenate([ event_batch, midi_events ])
+            audio_batch = np.concatenate([ audio_batch, audio ])
+            event_batch = np.concatenate([ event_batch, midi_events ])
             sample_names_batch.extend(sample_names)
 
             # sample_keys = jax.random.split(batch_key, num=batch_size)

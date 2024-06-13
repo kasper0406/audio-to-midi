@@ -79,7 +79,7 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for sample_name in sample_names:
-        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], sharding=sharding)
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name])
         batches.append((sample_name, audio, midi_events))
     return batches
 
@@ -273,15 +273,6 @@ def main():
 
     audio_to_midi, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, model_init_key)
 
-    # Replicate the model on all JAX devices
-    device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
-
-    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-    model_params = jax.device_put(model_params, replicate_everywhere)
-    audio_to_midi = eqx.combine(model_params, static_model)
-
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=checkpoints_to_keep,
@@ -312,6 +303,15 @@ def main():
         state = restored_map["state"]
         
         audio_to_midi = eqx.combine(model_params, static_model)
+
+    # Replicate the model on all JAX devices
+    device_mesh = mesh_utils.create_device_mesh((num_devices,))
+    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
+    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+
+    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+    model_params = jax.device_put(model_params, replicate_everywhere)
+    audio_to_midi = eqx.combine(model_params, static_model)
 
     tx = optax.adamw(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(5.0), tx)

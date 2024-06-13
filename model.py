@@ -181,15 +181,15 @@ class ResidualConv(eqx.Module):
         out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
         out = self.activation_function(out)
 
+        if self.dropout:
+            out = self.dropout(out, inference=not enable_dropout, key=key)
+
         # Residual
         out = out + self.shortcut(x)
         out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
 
         if self.max_pool:
             out = self.max_pool(out)
-
-        if self.dropout:
-            out = self.dropout(out, inference=not enable_dropout, key=key)
         
         return out, state
 
