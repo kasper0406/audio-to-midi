@@ -86,7 +86,7 @@ def detailed_event_loss(
     predicted = modelutil.to_frame_events([predicted], output_probs.shape[0])[0]
     expected = expected[:predicted.shape[0]]
 
-    full_diff = jnp.sum(jnp.abs(predicted - expected))
+    full_diff = np.sum(np.abs(predicted - expected))
 
     played_predicted = predicted > 0
     played_expected = expected > 0
