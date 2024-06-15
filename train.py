@@ -176,11 +176,13 @@ def train(
         testset_hitrates[name] = sys.float_info.max
 
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
+        key, noise_key = jax.random.split(key, 2)
+
         (audio, events) = jax.device_put(
             (batch["audio"], batch["events"]),
             batch_sharding,
         )
-        audio = add_sample_noise(audio)
+        audio = add_sample_noise(audio, noise_key)
 
         # Keep the old model state in memory until we are sure the loss is not nan
         recovery_model = model
