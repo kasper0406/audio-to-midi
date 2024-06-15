@@ -124,6 +124,17 @@ def compute_testset_loss(model, state, testset_dir: Path, num_model_output_frame
 
     return (test_loss / count)[0], (hit_rate / count)[0], (eventized_diff / count)[0]
 
+@partial(jax.jit, donate_argnames=["samples"])
+def add_sample_noise(
+    samples, key: jax.random.PRNGKey
+) -> Float[Array, "channels samples"]:
+    """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
+    1. Add gausian noise
+    """
+    key1, key2 = jax.random.split(key, num=2)
+    sigma = jax.random.uniform(key1) / 10  # Randomize the level of noise
+    gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
+    return samples + gaussian_noise
 
 def train(
     model,
@@ -169,6 +180,7 @@ def train(
             (batch["audio"], batch["events"]),
             batch_sharding,
         )
+        audio = add_sample_noise(audio)
 
         # Keep the old model state in memory until we are sure the loss is not nan
         recovery_model = model

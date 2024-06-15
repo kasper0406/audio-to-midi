@@ -45,19 +45,6 @@ def get_data_prep_config():
         "num_velocity_categories": NUM_VELOCITY_CATEGORIES,
     }
 
-@partial(jax.jit, donate_argnames=["samples"])
-def add_noise(
-    samples, key: jax.random.PRNGKey
-) -> Float[Array, "channels samples"]:
-    """In order to make overfitting less likely this function perturbs the audio sampel in various ways:
-    1. Add gausian noise
-    """
-    key1, key2 = jax.random.split(key, num=2)
-    sigma = jax.random.uniform(key1) / 20  # Randomize the level of noise
-    gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
-    return samples + gaussian_noise
-
-
 def next_power_of_2(x):
     return 1 if x == 0 else 2 ** (x - 1).bit_length()
 
@@ -237,7 +224,6 @@ class AudioToMidiDatasetLoader:
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
             midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
-            # audio = add_noise(audio, key=noise_key)
 
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])
