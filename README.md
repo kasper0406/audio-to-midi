@@ -42,6 +42,15 @@ Hit rate: 0.7999402284622192
 Eventized diff: 66.33872985839844
 ```
 
+# Pre-trained model
+A pre-trained model has been released in three formats:
+* *Jax-checkpoints*: Unpack these in the directory of this repository, and run the inferrence CLI as per above.
+* *CoreML*: This is a model used for iOS. The [ModelManager class in the Piano Transcriber app](https://github.com/kasper0406/PianoTranscriberApp/blob/main/PianoTranscriber/ModelManager.swift) has an example of how to use it.
+* *Tensorflow*: This model can be run by using the `infer_tf.py` cli. Example:
+  ```bash
+  python infer_tf.py <audio file>
+  ```
+
 ## Training
 1. Setup the dataset, which can be done by generating a new one using [SwiftMidiBouncer](https://github.com/kasper0406/SwiftMidiBouncer)
 2. Adjust the parameters in the `model.py` file, and in `train.py` to point it to the desired dataset, as well as adjusting the batch size and learning rate.
