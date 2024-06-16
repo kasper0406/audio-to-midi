@@ -145,8 +145,9 @@ class ResidualConv(eqx.Module):
     dropout: eqx.nn.Dropout | None = None
     shortcut: eqx.nn.Conv # Residual connections
     max_pool: eqx.nn.MaxPool1d | None = None
+    avg_pool: eqx.nn.AvgPool1d | None = None
 
-    def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
+    def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
         conv_key, shortcut_key = _split_key(key, 2)
 
         self.activation_function = activation
@@ -174,7 +175,9 @@ class ResidualConv(eqx.Module):
         self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
 
         if max_pool:
-            self.max_pool = eqx.nn.MaxPool1d(kernel_size=2, stride=2)
+            self.max_pool = eqx.nn.MaxPool1d(kernel_size=3, stride=2)
+        if avg_pool:
+            self.avg_pool = eqx.nn.AvgPool1d(kernel_size=3, stride=2)
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
         out = self.conv(x)
@@ -190,6 +193,8 @@ class ResidualConv(eqx.Module):
 
         if self.max_pool:
             out = self.max_pool(out)
+        if self.avg_pool:
+            out = self.avg_pool(out)
         
         return out, state
 

@@ -326,6 +326,7 @@ def main():
     model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
     model_params = jax.device_put(model_params, replicate_everywhere)
     audio_to_midi = eqx.combine(model_params, static_model)
+    state = jax.device_put(state, replicate_everywhere)
 
     tx = optax.adamw(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(5.0), tx)
