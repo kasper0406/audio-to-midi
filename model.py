@@ -243,6 +243,7 @@ class FrameEmbedding(eqx.Module):
                     dilation=dilation,
                     activation=conv_settings["activation"],
                     max_pool=conv_settings["max_pool"] if "max_pool" in conv_settings else False,
+                    avg_pool=conv_settings["avg_pool"] if "avg_pool" in conv_settings else False,
                     dropout_rate=dropout_rate if "use_dropout" in conv_settings and conv_settings["use_dropout"] else None,
                     key=conv_key,
                 )
