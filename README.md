@@ -42,7 +42,7 @@ Hit rate: 0.7999402284622192
 Eventized diff: 66.33872985839844
 ```
 
-# Pre-trained model
+## Pre-trained model
 A pre-trained model has been released in three formats:
 * *Jax-checkpoints*: Unpack these in the directory of this repository, and run the inferrence CLI as per above.
 * *CoreML*: This is a model used for iOS. The [ModelManager class in the Piano Transcriber app](https://github.com/kasper0406/PianoTranscriberApp/blob/main/PianoTranscriber/ModelManager.swift) has an example of how to use it.
