@@ -48,9 +48,9 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
-    let reactivation_threshold = 0.7 as f32;
-    let activation_threshold = 0.6 as f32;
-    let deactivation_threshold = 0.1 as f32;
+    let reactivation_threshold = 0.4 as f32;
+    let activation_threshold = 0.60 as f32;
+    let deactivation_threshold = 0.05 as f32;
 
     let mut events: MidiEvents = vec![];
     let [num_frames, num_notes] = *probs.shape() else { todo!("Unsupported probs format") };
@@ -62,13 +62,6 @@ where
     let velocity = |activation_prob: f32| -> u32 {
         // TODO(knielsen): Implement this
         7
-    };
-    let decay_function = |activation_prob: f32, t: f32| -> f32 {
-        if t < 5.0 {
-            activation_prob
-        } else {
-            activation_prob * (-0.01 * t).exp()
-        }
     };
 
     let mut currently_playing: Vec<Option<(usize, f32)>> = vec![None; num_notes];
@@ -89,30 +82,54 @@ where
                 activation_prob
             };
 
-            // Handle case where a currently playing note stopped playing
             if let Some((started_at, activation_prob)) = currently_playing[key] {
                 if probs[(frame, key)].as_() < deactivation_threshold {
-                    // Emit the event and stop playing
+                    // Handle case where a currently playing note stopped playing
                     events.push((started_at as u32, key as u32, duration(frame, started_at), velocity(activation_prob)));
                     currently_playing[key] = None;
-                }
-            }
-
-            let mut key_modifier = 0.0;
-            if key <= 30 {
-                key_modifier += ((30.0 - key as f32) / 30.0) * 0.3;
-            }
-
-            if probs[(frame, key)].as_() > activation_threshold + key_modifier {
-                if let Some((started_at, activation_prob)) = currently_playing[key] {
-                    // Either the key is already playing, and we may have a re-activation
+                } else {
+                    // Handle the case where there may be a re-activation
                     let time_since_activation = frame as f32 - started_at as f32;
-                    if probs[(frame, key)].as_() > reactivation_threshold && probs[(frame, key)].as_() > decay_function(activation_prob, time_since_activation) {
+
+                    // The way note re-activation has been implemented during training is quite implicit
+                    // We expect the probability of a note to increase (instead of decrease) when a note is re-attacked
+                    // We try to figure this out by computing the average probability of the past frames and the next frames
+                    let mut should_reactivate = false;
+                    if time_since_activation > 5.0 {
+                        let samples = 5;
+                        let mut prev_average = 0.0;
+                        for i in (frame - samples)..frame {
+                            prev_average += probs[(i, key)].as_();
+                        }
+                        prev_average /= samples as f32;
+
+                        let mut next_average: f32 = 0.0;
+                        for i in frame..(frame + samples).min(num_frames) {
+                            next_average += probs[(i, key)].as_();
+                        }
+                        next_average /= samples as f32;
+
+                        should_reactivate = next_average - prev_average > 0.05;
+                    }
+
+                    if frame < num_frames - 1 && probs[(frame, key)].as_() < probs[(frame + 1, key)].as_() {
+                        // We handle the re-activation in the next frame where the probability is larger
+                        continue;
+                    }
+
+                    if probs[(frame, key)].as_() > reactivation_threshold && should_reactivate {
                         events.push((started_at as u32, key as u32, duration(frame - 1, started_at), velocity(activation_prob))); // Close the old event
                         currently_playing[key] = Some((frame, get_activation_prob()));
                     }
-                } else {
-                    // Otherwise it is not playing, and we should start playing
+                }
+            } else {
+                // The model output quite a bit of noise for bass notes. Only emit them if we are very confident
+                let mut dimish_bass_notes = 0.0;
+                if key < 30 {
+                    dimish_bass_notes += ((30.0 - key as f32) / 30.0) * 0.3;
+                }
+
+                if probs[(frame, key)].as_() > activation_threshold + dimish_bass_notes {
                     currently_playing[key] = Some((frame, get_activation_prob()));
                 }
             }

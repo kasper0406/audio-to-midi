@@ -25,14 +25,8 @@ from infer import detailed_event_loss
 
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
-    # Prioritize the initial attacks a lot more in the loss than the roll-off
-    only_attack_logits = jnp.select([expected_output > 0.95], [logits], -100.0)
-    only_attack_expected = jnp.select([expected_output > 0.95], [expected_output], 0.0)
-    attack_loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(only_attack_logits, only_attack_expected)
-
-    full_loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
-
-    return 2 * jnp.sum(attack_loss) + jnp.sum(full_loss)
+    loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+    return jnp.sum(loss)
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
