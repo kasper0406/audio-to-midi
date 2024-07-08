@@ -8,6 +8,7 @@ import jax
 import jax.lib
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer, PRNGKeyArray
+import einops
 
 import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
@@ -18,62 +19,11 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 512,
-    "num_heads": 6,
-    "num_layers": 18,
+    "attention_size": 32,
+    "intermediate_size": 32,
+    "num_heads": 4,
+    "num_layers": 3,
     "dropout_rate": 0.10,
-
-    "convolutions": [
-        {
-            "internal_channels": 16,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu,
-        },
-        {
-            "internal_channels": 32,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu,
-        },
-        {
-            "internal_channels": 64,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.leaky_relu,
-        },
-        {
-            "internal_channels": 128,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
-        },
-        {
-            "internal_channels": 256,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
-        },
-        {
-            "internal_channels": 512,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
-        },
-        {
-            "internal_channels": 512,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
-        },
-        {
-            "internal_channels": 512,
-            "kernel": 5,
-            "stride": 2,
-            "activation": jax.nn.relu,
-        },
-    ],
 }
 
 def serialize_function(obj):
@@ -100,18 +50,60 @@ def _split_key(key, num: int = 2):
     else:
         return jax.random.split(key, num)
 
+class ConvSelfAttention(eqx.Module):
+    to_kqv: eqx.nn.Conv
+    to_output: eqx.nn.Conv
+    num_heads: int
+    input_dim: int
+    norm: eqx.nn.BatchNorm
+
+    def __init__(self, input_dim: int, internal_dim: int, num_heads: int, key: PRNGKeyArray | None):
+        to_kqv_key, to_output_key = _split_key(key, 2)
+
+        hidden_size = internal_dim * num_heads
+        self.num_heads = num_heads
+        self.input_dim = input_dim
+        self.to_kqv = eqx.nn.Conv1d(input_dim, 3 * hidden_size, kernel_size=1, key=to_kqv_key)
+        self.to_output = eqx.nn.Conv1d(hidden_size, input_dim, kernel_size=1, key=to_output_key)
+        self.norm = eqx.nn.BatchNorm(input_dim, axis_name="batch")
+
+    def __call__(self, x, state, enable_dropout: bool = False):
+        qkv = self.to_kqv(x)
+        # print(f"qkv shape = {qkv.shape}")
+        q, k, v = einops.rearrange(qkv, "(qkv heads c) l -> qkv heads l c ", heads=self.num_heads, qkv=3)
+        # print(f"q shape = {q.shape}, k shape = {k.shape}, v shape  {v.shape}")
+
+        context = jnp.einsum("hld,hed -> hld",  q, k) / jnp.sqrt(k.shape[1])
+        context = jax.nn.softmax(context, axis=-1)
+        # print(f"Context shape = {context.shape}")
+
+        attention = jnp.einsum("hld,hed -> hld", context, v)
+        attention = einops.rearrange(attention, "heads l h -> (heads h) l")
+        # print(f"Attention shape = {attention.shape}")
+
+        out = self.to_output(attention)
+        out = out + x # residual
+        out, state = self.norm(out, state, inference=not enable_dropout)
+
+        return out, state
+
 class ResidualConv(eqx.Module):
+    scale_conv: eqx.nn.Conv
     conv: eqx.nn.Conv
     activation_function: types.FunctionType
     batch_norm_1: eqx.nn.BatchNorm
     batch_norm_2: eqx.nn.BatchNorm
+    batch_norm_3: eqx.nn.BatchNorm
     dropout: eqx.nn.Dropout | None = None
     shortcut: eqx.nn.Conv # Residual connections
     max_pool: eqx.nn.MaxPool1d | None = None
     avg_pool: eqx.nn.AvgPool1d | None = None
+    attention: ConvSelfAttention | None = None
+    position_encoding: jax.Array
+    position_transform: eqx.nn.Conv1d
 
-    def __init__(self, conv_inputs: int, channels: int, kernel: int, stride: int, dilation: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, dropout_rate: float | None, key: PRNGKeyArray | None):
-        conv_key, shortcut_key = _split_key(key, 2)
+    def __init__(self, conv_inputs: int, channels: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, use_attention: bool, position_encoding: jax.Array, dropout_rate: float | None, key: PRNGKeyArray | None):
+        scale_conv_key, conv_key, shortcut_key, attention_key, pos_key = _split_key(key, 5)
 
         self.activation_function = activation
         out_channels = channels
@@ -119,45 +111,74 @@ class ResidualConv(eqx.Module):
             out_channels = channels * 2
             self.activation_function = partial(jax.nn.glu, axis=0)
         
-        padding = ((kernel - 1) // 2) * dilation
-        self.conv = eqx.nn.Conv1d(
+        self.scale_conv = eqx.nn.Conv1d(
             in_channels=conv_inputs,
             out_channels=out_channels,
-            kernel_size=(kernel,),
-            stride=(stride,),
-            dilation=(dilation,),
-            padding=(padding,),
+            kernel_size=(4,),
+            stride=(2,),
+            key=scale_conv_key
+        )
+        self.conv = eqx.nn.Conv1d(
+            in_channels=out_channels,
+            out_channels=out_channels,
+            kernel_size=(4,),
+            padding=(2,),
             key=conv_key
         )
+
+        self.position_encoding = position_encoding
+        self.position_transform = eqx.nn.Conv1d(
+            in_channels=position_encoding.shape[1],
+            out_channels=channels,
+            kernel_size=1,
+            key=pos_key
+        )
+
         self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
+        self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+        self.batch_norm_3 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
 
         if dropout_rate is not None:
             self.dropout = eqx.nn.Dropout(dropout_rate)
         
-        self.shortcut = eqx.nn.Conv1d(in_channels=conv_inputs, out_channels=channels, kernel_size=1, stride=stride, key=shortcut_key)
-        self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+        self.shortcut = eqx.nn.Conv1d(in_channels=conv_inputs, out_channels=channels, kernel_size=2, stride=2, key=shortcut_key)
 
         if max_pool:
             self.max_pool = eqx.nn.MaxPool1d(kernel_size=3, stride=2)
         if avg_pool:
             self.avg_pool = eqx.nn.AvgPool1d(kernel_size=3, stride=2)
+        if use_attention:
+            self.attention = ConvSelfAttention(input_dim=channels, internal_dim=32, num_heads=4, key=attention_key)
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
-        out = self.conv(x)
+        out = self.scale_conv(x)
         out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+
+        if self.attention:
+            # Add positional encoding
+            # print(f"Position encoding shape: {self.position_encoding[:x.shape[1], ...].shape}")
+            pos_encoding = jnp.transpose(self.position_encoding[:out.shape[1], ...])
+            out = out + self.position_transform(pos_encoding)
+            out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+
         out = self.activation_function(out)
 
         if self.dropout:
             out = self.dropout(out, inference=not enable_dropout, key=key)
 
+        out = self.conv(out)
+
         # Residual
         out = out + self.shortcut(x)
-        out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+        out, state = self.batch_norm_3(out, state, inference=not enable_dropout)
 
         if self.max_pool:
             out = self.max_pool(out)
         if self.avg_pool:
             out = self.avg_pool(out)
+        
+        if self.attention:
+            out, state = self.attention(out, state, enable_dropout=enable_dropout)
         
         return out, state
 
@@ -178,43 +199,44 @@ class FrameEmbedding(eqx.Module):
         max_frame_sequence_length: int,  # The maximum number of input frames
         dropout_rate: float,
         key: PRNGKeyArray,
-        input_channels=2,
     ):
         pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
 
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
 
+        max_attention_length = 2_000 # TODO: Do not hardcode this
         self.position_embeddings = position_encoding.for_input_frame(
-            max_frame_sequence_length, output_shape
+            max_attention_length, output_shape
         )
         self.position_embedder = eqx.nn.Linear(in_features=output_shape, out_features=output_shape, key=pos_key)
 
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
         self.layers = []
-        conv_keys = jax.random.split(conv_key, num=len(model_config["convolutions"]))
-        conv_inputs = input_channels
-        for conv_settings, conv_key in zip(model_config["convolutions"], conv_keys):
-            dilation = 1 if "dilation" not in conv_settings else conv_settings["dilation"]
-            stride = 1 if "stride" not in conv_settings else conv_settings["stride"]
+        num_layers = 10
+        conv_keys = jax.random.split(conv_key, num=num_layers)
+
+        for i, conv_key in zip(range(num_layers), conv_keys):
+            out_channels = (2 ** (i + 2))
+            in_channels = (2 ** (i + 1))
+
             self.layers.append(
                 ResidualConv(
-                    conv_inputs=conv_inputs,
-                    channels=conv_settings["internal_channels"],
-                    kernel=conv_settings["kernel"],
-                    stride=stride,
-                    dilation=dilation,
-                    activation=conv_settings["activation"],
-                    max_pool=conv_settings["max_pool"] if "max_pool" in conv_settings else False,
-                    avg_pool=conv_settings["avg_pool"] if "avg_pool" in conv_settings else False,
-                    dropout_rate=dropout_rate if "use_dropout" in conv_settings and conv_settings["use_dropout"] else None,
+                    conv_inputs=in_channels,
+                    channels=out_channels,
+                    activation=jax.nn.silu,
+                    max_pool=False,
+                    avg_pool=False,
+                    use_attention=(i > 4),
+                    position_encoding=self.position_embeddings,
+                    dropout_rate=dropout_rate,
                     key=conv_key,
                 )
             )
-            conv_inputs = conv_settings["internal_channels"]
 
+        last_layer_features = 2 ** (num_layers + 1)
         self.final_pooling = eqx.nn.Conv1d(
-            in_channels=conv_inputs,
+            in_channels=last_layer_features,
             out_channels=output_shape,
             kernel_size=(1,),
             stride=(1,),
