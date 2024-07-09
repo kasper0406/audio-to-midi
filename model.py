@@ -51,7 +51,7 @@ def _split_key(key, num: int = 2):
         return jax.random.split(key, num)
 
 class ConvSelfAttention(eqx.Module):
-    to_kqv: eqx.nn.Conv
+    to_qkv: eqx.nn.Conv
     to_output: eqx.nn.Conv
     num_heads: int
     input_dim: int
@@ -63,21 +63,22 @@ class ConvSelfAttention(eqx.Module):
         hidden_size = internal_dim * num_heads
         self.num_heads = num_heads
         self.input_dim = input_dim
-        self.to_kqv = eqx.nn.Conv1d(input_dim, 3 * hidden_size, kernel_size=1, key=to_kqv_key)
+        self.to_qkv = eqx.nn.Conv1d(input_dim, 3 * hidden_size, kernel_size=1, key=to_kqv_key)
         self.to_output = eqx.nn.Conv1d(hidden_size, input_dim, kernel_size=1, key=to_output_key)
         self.norm = eqx.nn.BatchNorm(input_dim, axis_name="batch")
 
     def __call__(self, x, state, enable_dropout: bool = False):
-        qkv = self.to_kqv(x)
+        qkv = self.to_qkv(x)
         # print(f"qkv shape = {qkv.shape}")
-        q, k, v = einops.rearrange(qkv, "(qkv heads c) l -> qkv heads l c ", heads=self.num_heads, qkv=3)
+        q, k, v = einops.rearrange(qkv, "(qkv heads c) l -> qkv heads l c", heads=self.num_heads, qkv=3)
         # print(f"q shape = {q.shape}, k shape = {k.shape}, v shape  {v.shape}")
 
-        context = jnp.einsum("hld,hed -> hld",  q, k) / jnp.sqrt(k.shape[1])
-        context = jax.nn.softmax(context, axis=-1)
+        q = q / jnp.sqrt(q.shape[1])
+        context = jnp.einsum("had,hbd -> hab",  q, k)
+        context = jax.nn.softmax(context)
         # print(f"Context shape = {context.shape}")
 
-        attention = jnp.einsum("hld,hed -> hld", context, v)
+        attention = jnp.einsum("hca,hcb -> hab", context, v)
         attention = einops.rearrange(attention, "heads l h -> (heads h) l")
         # print(f"Attention shape = {attention.shape}")
 
@@ -102,7 +103,7 @@ class ResidualConv(eqx.Module):
     position_encoding: jax.Array
     position_transform: eqx.nn.Conv1d
 
-    def __init__(self, conv_inputs: int, channels: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, use_attention: bool, position_encoding: jax.Array, dropout_rate: float | None, key: PRNGKeyArray | None):
+    def __init__(self, conv_inputs: int, channels: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, attention_dim: Optional[int], position_encoding: jax.Array, dropout_rate: float | None, key: PRNGKeyArray | None):
         scale_conv_key, conv_key, shortcut_key, attention_key, pos_key = _split_key(key, 5)
 
         self.activation_function = activation
@@ -111,17 +112,19 @@ class ResidualConv(eqx.Module):
             out_channels = channels * 2
             self.activation_function = partial(jax.nn.glu, axis=0)
         
+        kernel_size = 4
         self.scale_conv = eqx.nn.Conv1d(
             in_channels=conv_inputs,
             out_channels=out_channels,
-            kernel_size=(4,),
+            kernel_size=(kernel_size,),
             stride=(2,),
+            padding=(1,),
             key=scale_conv_key
         )
         self.conv = eqx.nn.Conv1d(
             in_channels=out_channels,
             out_channels=out_channels,
-            kernel_size=(4,),
+            kernel_size=(kernel_size + 1,),
             padding=(2,),
             key=conv_key
         )
@@ -147,12 +150,16 @@ class ResidualConv(eqx.Module):
             self.max_pool = eqx.nn.MaxPool1d(kernel_size=3, stride=2)
         if avg_pool:
             self.avg_pool = eqx.nn.AvgPool1d(kernel_size=3, stride=2)
-        if use_attention:
-            self.attention = ConvSelfAttention(input_dim=channels, internal_dim=32, num_heads=4, key=attention_key)
+        if attention_dim:
+            self.attention = ConvSelfAttention(input_dim=channels, internal_dim=attention_dim, num_heads=4, key=attention_key)
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
         out = self.scale_conv(x)
         out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+        out = self.activation_function(out)
+
+        if self.dropout:
+            out = self.dropout(out, inference=not enable_dropout, key=key)
 
         if self.attention:
             # Add positional encoding
@@ -161,12 +168,8 @@ class ResidualConv(eqx.Module):
             out = out + self.position_transform(pos_encoding)
             out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
 
-        out = self.activation_function(out)
-
-        if self.dropout:
-            out = self.dropout(out, inference=not enable_dropout, key=key)
-
         out = self.conv(out)
+        out = self.activation_function(out)
 
         # Residual
         out = out + self.shortcut(x)
@@ -216,9 +219,16 @@ class FrameEmbedding(eqx.Module):
         num_layers = 10
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
+        max_num_features = 1024
         for i, conv_key in zip(range(num_layers), conv_keys):
-            out_channels = (2 ** (i + 2))
-            in_channels = (2 ** (i + 1))
+            out_channels = min(max_num_features, (2 ** (i + 4)))
+            in_channels = min(max_num_features, (2 ** (i + 3)))
+            if i == 0:
+                in_channels = 2
+
+            attention_dim = None
+            if i > 3:
+                attention_dim = out_channels
 
             self.layers.append(
                 ResidualConv(
@@ -227,14 +237,14 @@ class FrameEmbedding(eqx.Module):
                     activation=jax.nn.silu,
                     max_pool=False,
                     avg_pool=False,
-                    use_attention=(i > 4),
+                    attention_dim=attention_dim,
                     position_encoding=self.position_embeddings,
                     dropout_rate=dropout_rate,
                     key=conv_key,
                 )
             )
 
-        last_layer_features = 2 ** (num_layers + 1)
+        last_layer_features = min(max_num_features, 2 ** (num_layers + 3))
         self.final_pooling = eqx.nn.Conv1d(
             in_channels=last_layer_features,
             out_channels=output_shape,
