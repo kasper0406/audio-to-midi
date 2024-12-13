@@ -21,8 +21,8 @@ model_config = {
     "max_frame_sequence_length": 200,
     "attention_size": 128,
     "intermediate_size": 256,
-    "num_heads": 12,
-    "num_layers": 3,
+    "num_heads": 4,
+    "num_layers": 2,
     "dropout_rate": 0.15,
 }
 
@@ -247,8 +247,8 @@ class FrameEmbedding(eqx.Module):
 
         max_num_features = 128
         for i, conv_key in zip(range(num_layers), conv_keys):
-            out_channels = min(max_num_features, (4 ** (i + 3)))
-            in_channels = min(max_num_features, (4 ** (i + 2)))
+            out_channels = min(max_num_features, (2 ** (i + 3)))
+            in_channels = min(max_num_features, (2 ** (i + 2)))
             if i == 0:
                 in_channels = 2
 
@@ -271,7 +271,7 @@ class FrameEmbedding(eqx.Module):
                 )
             )
 
-        last_layer_features = min(max_num_features, 4 ** (num_layers + 2))
+        last_layer_features = min(max_num_features, 2 ** (num_layers + 2))
         self.final_pooling = eqx.nn.Conv1d(
             in_channels=last_layer_features,
             out_channels=output_shape,
