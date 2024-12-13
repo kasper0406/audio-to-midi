@@ -128,6 +128,7 @@ def add_sample_noise(
     key1, key2 = jax.random.split(key, num=2)
     sigma = jax.random.uniform(key1) / 10  # Randomize the level of noise
     gaussian_noise = sigma * jax.random.normal(key2, samples.shape)
+    
     return samples + gaussian_noise
 
 def train(
@@ -254,22 +255,22 @@ def score_by_checkpoint_metrics(metrics):
     return mean_score
 
 def main():
-    # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/true_harmonic")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
     testset_dirs = {
-        'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
-        'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
+        'validation_set': Path("/home/knielsen/ml/datasets/validation_set"),
+        'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/validation_set_only_yamaha"),
     }
 
     num_devices = len(jax.devices())
 
-    batch_size = 4 * num_devices
-    num_steps = 1000000
-    learning_rate_schedule = create_learning_rate_schedule(2.5 * 1e-4, 1000, num_steps)
+    batch_size = 64 * num_devices
+    num_steps = 250000
+    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
 
-    checkpoint_every = 10
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -362,7 +363,7 @@ def main():
                 num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
                 testset_dirs=testset_dirs,
                 num_steps=num_steps,
-                print_every=1,
+                print_every=25,
                 key=training_key,
                 testset_loss_every=checkpoint_every,
             )

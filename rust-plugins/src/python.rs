@@ -170,7 +170,7 @@ async fn read_samples_from_file(raw_file: &str, sample_rate: u32, maybe_max_dura
 
 async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     // TODO: Consider sending back all audio channels
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new("/home/knielsen/ffmpeg/bin/ffmpeg");
     if let Some(max_duration) = maybe_max_duration {
         command.arg("-t").arg(format!["{}", max_duration]);
     }
@@ -234,20 +234,33 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
     let max_value_left = left_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
     let max_value_right = right_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
     let mut total_max = max_value_left.max(max_value_right);
-    if total_max < 0.03 {
+    if total_max >= 0.05 {
         // If the audio is very quite, there is a good chance it is silent everywhere, or it is simply noise
         // We do not want to normalize this due to division by 0 concerns
-        total_max = 1.0
+        let left_samples: Vec<f16> = left_samples.iter()
+            .map(|sample| f16::from_f32(*sample))
+            .collect();
+        let right_samples: Vec<f16> = right_samples.iter()
+            .map(|sample| f16::from_f32(*sample))
+            .collect();
+
+        Ok((left_samples, right_samples))
+    } else {
+        let total_elements = (left_samples.len() + right_samples.len()) as f64;
+        let variance = left_samples.iter().zip(right_samples.iter())
+            .fold(0f64, |acc, (left, right)| acc + (*left as f64).powi(2) + (*right as f64).powi(2)) / total_elements;
+        let adjustment = (1.0 / variance).sqrt();
+
+        let normalized_left: Vec<f16> = left_samples.iter()
+            .map(|sample| f16::from_f64((*sample as f64) * adjustment))
+            .collect();
+        let normalized_right: Vec<f16> = right_samples.iter()
+            .map(|sample| f16::from_f64((*sample as f64) * adjustment))
+            .collect();
+
+        Ok((normalized_left, normalized_right))
     }
 
-    let normalized_left: Vec<f16> = left_samples.iter()
-        .map(|sample| f16::from_f32(sample / total_max))
-        .collect();
-    let normalized_right: Vec<f16> = right_samples.iter()
-        .map(|sample| f16::from_f32(sample / total_max))
-        .collect();
-
-    Ok((normalized_left, normalized_right))
 }
 
 async fn load_audio_sample_uncached(file_path: &str, sample_rate: u32) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
@@ -393,7 +406,7 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 
     for (attack_frame, key, frame_duration, velocity) in events {
         let decay_function = |t: f32| -> f32 {
-            (-0.05 * t).exp().max(0.2) // Do not drop below 0.2 while the note is actually playing
+            (-0.05 * t).exp().max(0.8) // Do not drop below 0.8 while the note is actually playing
         };
 
         let frame_start = (*attack_frame as i32) - start_frame;
