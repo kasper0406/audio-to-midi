@@ -288,6 +288,64 @@ def score_by_checkpoint_metrics(metrics):
     mean_score = float(np.mean(np.array(list(metrics.values()))))
     return mean_score
 
+def evolve_model_ensemble(model_ensemble, key: jax.random.PRNGKey):
+    """
+    Genetic algorithm to re-combine models into new models
+    """
+    def recombine(parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
+        recombination_rate = 0.00001  # 0,001% chance of recombining
+
+        recombination_steps = 0
+        current_parent_idx = 0  # Always start with parent_a weights
+
+        def recombine_leaf(leaf, *rest):
+            if not eqx.is_array(leaf):
+                # Do not modify non-numpy arrays
+                return leaf
+
+            # print(f"Should modify: {leaf}")
+
+            # Flatten the weights for easy copying
+            parent_a_weights = leaf[parent_a_idx, ...].flatten()
+            parent_b_weights = leaf[parent_b_idx, ...].flatten()
+
+            nonlocal key  # We abuse the key from the outer function as we can not pass it along easily
+            nonlocal recombination_steps
+            nonlocal current_parent_idx
+
+            counter = 0
+            recombined_weights = jnp.zeros_like(parent_a_weights).flatten()
+            while counter < parent_a_weights.shape[0]:
+                if recombination_steps <= 0:
+                    key, recombination_key = jax.random.split(key, 2)
+                    recombination_steps = int(jax.random.geometric(recombination_key, recombination_rate, shape=tuple()))
+                    print(f"Recombining after {recombination_steps} steps")
+
+                # Figure out which parent to copy from
+                current_parent = parent_a_weights
+                if current_parent_idx != 0:
+                    current_parent = parent_b_weights
+
+                # Copy the weights in the recombination slice
+                copy_end_idx = min(counter + recombination_steps, parent_a_weights.shape[0])
+                indexes = slice(counter, copy_end_idx)
+                recombined_weights = recombined_weights.at[indexes].set(current_parent[indexes])
+                current_parent_idx = (current_parent_idx + 1) % 2
+
+                num_copied_elements = indexes.stop - indexes.start
+                recombination_steps -= num_copied_elements
+                counter += num_copied_elements
+
+            # Update the leaf with the recombined weights
+            recombined_weights = jnp.reshape(recombined_weights, leaf[result_idx, ...].shape)
+            recombined_leaf = leaf.at[result_idx, ...].set(recombined_weights)
+            return recombined_leaf
+
+        return jax.tree.map(recombine_leaf, model_ensemble)
+
+    return recombine(0, 1, 2, key=key)
+
+
 def main():
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
@@ -310,7 +368,7 @@ def main():
     dataset_prefetch_count = 20
 
     main_key = jax.random.PRNGKey(1234)
-    model_init_key, training_key, dataset_loader_key = jax.random.split(main_key, num=3)
+    model_init_key, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=4)
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
 
@@ -321,6 +379,10 @@ def main():
     num_models = 4
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
+
+    audio_to_midi_ensemble = evolve_model_ensemble(audio_to_midi_ensemble, recombination_key)
+    print(f"Evolved ensemble: {audio_to_midi_ensemble}")
+    return
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
