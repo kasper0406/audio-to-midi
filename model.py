@@ -19,8 +19,8 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 128,
-    "intermediate_size": 256,
+    "attention_size": 64,
+    "intermediate_size": 128,
     "num_heads": 4,
     "num_layers": 2,
     "dropout_rate": 0.15,
@@ -245,10 +245,10 @@ class FrameEmbedding(eqx.Module):
         num_layers = 8
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        max_num_features = 128
+        max_num_features = 64
         for i, conv_key in zip(range(num_layers), conv_keys):
-            out_channels = min(max_num_features, (2 ** (i + 3)))
-            in_channels = min(max_num_features, (2 ** (i + 2)))
+            out_channels = min(max_num_features, (2 ** (i + 2)))
+            in_channels = min(max_num_features, (2 ** (i + 1)))
             if i == 0:
                 in_channels = 2
 
@@ -271,7 +271,7 @@ class FrameEmbedding(eqx.Module):
                 )
             )
 
-        last_layer_features = min(max_num_features, 2 ** (num_layers + 2))
+        last_layer_features = min(max_num_features, 2 ** (num_layers + 1))
         self.final_pooling = eqx.nn.Conv1d(
             in_channels=last_layer_features,
             out_channels=output_shape,

@@ -144,8 +144,6 @@ def compute_testset_loss(model_ensemble, state_ensemble, testset_dir: Path, num_
         eventized_diff += losses["eventized_diff"]
         count += 1
 
-    print(f"Test loss: {test_loss}, hit_rate: {hit_rate}, event_diff: {eventized_diff}")
-
     return (test_loss / count), (hit_rate / count), (eventized_diff / count)
 
 @partial(jax.jit, donate_argnames=["samples"])
@@ -234,16 +232,16 @@ def train(
             opt_state_ensemble = recovery_opt_state
             continue
 
-        # if checkpoint_manager.should_save(step):
-        #     filtered_model = eqx.filter(model_ensemble, eqx.is_array)
-        #     checkpoint_manager.save(
-        #         step,
-        #         args=ocp.args.Composite(
-        #             params=ocp.args.StandardSave(filtered_model),
-        #             state=ocp.args.StandardSave(state_ensemble),
-        #         ),
-        #         metrics=testset_hitrates,
-        #     )
+        if checkpoint_manager.should_save(step):
+            filtered_model = eqx.filter(model_ensemble, eqx.is_array)
+            checkpoint_manager.save(
+                step,
+                args=ocp.args.Composite(
+                    params=ocp.args.StandardSave(filtered_model),
+                    state=ocp.args.StandardSave(state_ensemble),
+                ),
+                # metrics=testset_hitrates,
+            )
 
         loss_sum = loss_sum + loss
 
@@ -260,6 +258,7 @@ def train(
 
         if step % testset_loss_every == 0:
             print("Evaluating test losses...")
+            testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
                 testset_loss, hit_rate, eventized_diff = compute_testset_loss(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, eval_key, batch_sharding)
@@ -267,6 +266,14 @@ def train(
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
+                testset_losses.append(testset_loss)
+
+            # Recombine
+            # TODO(knielsen): Refactor this! 
+            # TODO: Consider sum of testset losses
+            # TODO: Reset optimizer state?
+            recombination_key, key = jax.random.split(key, num=2)
+            model_ensemble = evolve_model_ensemble(model_ensemble, testset_losses[0], recombination_key)
 
     return model_ensemble, state_ensemble, opt_state_ensemble
 
@@ -288,11 +295,11 @@ def score_by_checkpoint_metrics(metrics):
     mean_score = float(np.mean(np.array(list(metrics.values()))))
     return mean_score
 
-def evolve_model_ensemble(model_ensemble, key: jax.random.PRNGKey):
+def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGKey):
     """
     Genetic algorithm to re-combine models into new models
     """
-    def recombine(parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
+    def recombine(model_ensemble, parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
         recombination_rate = 0.00001  # 0,001% chance of recombining
 
         recombination_steps = 0
@@ -343,7 +350,30 @@ def evolve_model_ensemble(model_ensemble, key: jax.random.PRNGKey):
 
         return jax.tree.map(recombine_leaf, model_ensemble)
 
-    return recombine(0, 1, 2, key=key)
+    recombined_ensemble = model_ensemble
+
+    # print(f"Ensemble scores: {ensemble_scores}")
+    # print(f"Sorted: {np.argsort(ensemble_scores)}")
+    sorted_indices = list(np.argsort(ensemble_scores))
+    # Keep the half best scoring models, and kill off the bottom half by recombination
+    winner_indices = sorted_indices[0:(len(sorted_indices) // 2)]
+    result_indices = sorted_indices[(len(sorted_indices) // 2):]
+    for result_idx in result_indices:
+        key, winner_key, recombine_key = jax.random.split(key, 3)
+
+        random_integers = jax.random.randint(winner_key, shape=(100,), minval=0, maxval=len(winner_indices))
+        parent_a_idx = winner_indices[int(random_integers[0])]
+        # TODO(knielsen): Make this nicer...
+        #                 Pick the first random winner that is not the same as parent_a
+        i = 1
+        while int(random_integers[0]) == int(random_integers[i]):
+            i += 1
+        parent_b_idx = int(winner_indices[random_integers[i]])
+        print(f"Recombining {parent_a_idx} + {parent_b_idx} -> {result_idx}")
+
+        recombined_ensemble = recombine(model_ensemble, parent_a_idx=parent_a_idx, parent_b_idx=parent_b_idx, result_idx=result_idx, key=recombine_key)
+
+    return recombined_ensemble
 
 
 def main():
@@ -358,11 +388,11 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 64 * num_devices
+    batch_size = 16 * num_devices
     num_steps = 250000
     learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
 
-    checkpoint_every = 1000
+    checkpoint_every = 100
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -376,13 +406,10 @@ def main():
     def make_ensemble(key):
         return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
 
-    num_models = 4
+    num_models = 6
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
-
-    audio_to_midi_ensemble = evolve_model_ensemble(audio_to_midi_ensemble, recombination_key)
-    print(f"Evolved ensemble: {audio_to_midi_ensemble}")
-    return
+    print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
