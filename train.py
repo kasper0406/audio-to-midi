@@ -309,14 +309,28 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
     """
     Genetic algorithm to re-combine models into new models
     """
+    def mutate_leaf(leaf: jax.Array, index_to_mutate: int, key: jax.random.PRNGKey, mutation_rate = 0.005):
+        if not eqx.is_array(leaf) or leaf.dtype not in (jnp.float16, jnp.float32):
+            # Do not modify non-numpy arrays
+            return leaf
+
+        weights_to_mutate = leaf[index_to_mutate, ...]
+
+        mutation_probs_key, normal_weights_key = jax.random.split(key, 2)
+        mutation_probs = jax.random.uniform(mutation_probs_key, weights_to_mutate.shape)
+        normal_weights = jax.random.normal(normal_weights_key, weights_to_mutate.shape, dtype=leaf.dtype)
+        updated_weights = jax.lax.select(mutation_probs < mutation_rate, normal_weights, weights_to_mutate)
+
+        return leaf.at[index_to_mutate, ...].set(updated_weights)
+
     def recombine(model_ensemble, parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
         recombination_rate = 0.00001  # 0,001% chance of recombining
 
         recombination_steps = 0
-        current_parent_idx = 0  # Always start with parent_a weights
+        current_parent_idx = 1  # Always start with parent_a weights (inversed in first recombination_steps sampling)
 
         def recombine_leaf(leaf, *rest):
-            if not eqx.is_array(leaf):
+            if not eqx.is_array(leaf) or leaf.dtype not in (jnp.float16, jnp.float32):
                 # Do not modify non-numpy arrays
                 return leaf
 
@@ -336,6 +350,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
                 if recombination_steps <= 0:
                     key, recombination_key = jax.random.split(key, 2)
                     recombination_steps = int(jax.random.geometric(recombination_key, recombination_rate, shape=tuple()))
+                    current_parent_idx = (current_parent_idx + 1) % 2
                     print(f"Recombining after {recombination_steps} steps")
 
                 # Figure out which parent to copy from
@@ -347,7 +362,6 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
                 copy_end_idx = min(counter + recombination_steps, parent_a_weights.shape[0])
                 indexes = slice(counter, copy_end_idx)
                 recombined_weights = recombined_weights.at[indexes].set(current_parent[indexes])
-                current_parent_idx = (current_parent_idx + 1) % 2
 
                 num_copied_elements = indexes.stop - indexes.start
                 recombination_steps -= num_copied_elements
@@ -356,9 +370,15 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
             # Update the leaf with the recombined weights
             recombined_weights = jnp.reshape(recombined_weights, leaf[result_idx, ...].shape)
             recombined_leaf = leaf.at[result_idx, ...].set(recombined_weights)
-            return recombined_leaf
+
+            key, mutation_key = jax.random.split(key, 2)
+            return mutate_leaf(recombined_leaf, result_idx, mutation_key)
 
         return jax.tree.map(recombine_leaf, model_ensemble)
+
+    if ensemble_scores.shape[0] <= 2:
+        print("Not recombining due to low population")
+        return model_ensemble
 
     recombined_ensemble = model_ensemble
 
@@ -387,10 +407,11 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 
 
 def main():
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
+    # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
     testset_dirs = {
         'validation_set': Path("/home/knielsen/ml/datasets/validation_set"),
         'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/validation_set_only_yamaha"),
@@ -399,10 +420,11 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 16 * num_devices
-    num_steps = 250000
+    num_steps = 100_000
     learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
+    num_models = 6
 
-    checkpoint_every = 5000
+    checkpoint_every = 500
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -416,7 +438,6 @@ def main():
     def make_ensemble(key):
         return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
 
-    num_models = 6
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
     print(audio_to_midi_ensemble)
