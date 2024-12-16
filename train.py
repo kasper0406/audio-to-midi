@@ -24,6 +24,8 @@ from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MO
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
 
+from rope import precompute_frequencies
+
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
     loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
@@ -31,12 +33,12 @@ def compute_loss_from_output(logits, expected_output):
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, audio, expected_outputs, key):
+def compute_loss(model, state, cos_freq, sin_freq, audio, expected_outputs, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     (logits, probs), state = jax.vmap(
-        model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
-    )(audio, state, batched_keys, True)
+        model, in_axes=(0, None, None, None, 0, None), out_axes=(0, None), axis_name="batch",
+    )(audio, state, cos_freq, sin_freq, batched_keys, True)
 
     loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
     return jnp.mean(loss), state
@@ -44,16 +46,18 @@ def compute_loss(model, state, audio, expected_outputs, key):
 @eqx.filter_jit
 @eqx.filter_vmap(
     # TODO: Handle vmap'ed keys
-    in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, eqx.if_array(0), None, None),
+    in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None, eqx.if_array(0), None, None),
     out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None),
 )
 def compute_training_step(
-    model_ensemble, state, audio, expected_outputs, opt_state, key, tx,
+    model_ensemble, state, cos_freq, sin_freq, audio, expected_outputs, opt_state, key, tx,
 ):
     key, new_key = jax.random.split(key)
     (loss, state), grads = compute_loss(
         model_ensemble,
         state,
+        cos_freq=cos_freq,
+        sin_freq=sin_freq,
         audio=audio,
         expected_outputs=expected_outputs,
         key=key,
@@ -64,12 +68,14 @@ def compute_training_step(
 
     return loss, update_model, state, update_opt_state, new_key
 
-@eqx.filter_vmap
-def compute_model_output_frames(model, state):
+@eqx.filter_vmap(in_axes=(eqx.if_array(0), eqx.if_array(0), None, None))
+def compute_model_output_frames(model, state, cos_freq: jax.Array, sin_freq: jax.Array):
     # TODO(knielsen): Find a better way of doing this
     (find_shape_output_logits, _), _ = model(
-        jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
-        state
+        samples=jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
+        state=state,
+        cos_freq=cos_freq,
+        sin_freq=sin_freq,
     )
     num_model_output_frames = find_shape_output_logits.shape[0]
     return num_model_output_frames
@@ -84,24 +90,24 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
         batches.append((sample_name, audio, midi_events))
     return batches
 
-def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
     @eqx.filter_vmap(
-        in_axes=(eqx.if_array(0), eqx.if_array(0), None),
+        in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None),
         out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0)),
     )
-    def run_inference_single_model(model, state, midi_events):
+    def run_inference_single_model(model, state, cos_freq, sin_freq, audio, midi_events):
         inference_model = eqx.nn.inference_mode(model)
-        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, 0), out_axes=(0, None))(audio, state, test_loss_keys)
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None, 0), out_axes=(0, None))(audio, state, cos_freq, sin_freq, test_loss_keys)
         test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
         return logits, probs, test_losses
 
     loss_map = {}
     for sample_name, audio, midi_events in batches:
         test_loss_keys = jax.random.split(key, num=audio.shape[0])
-        logits_all, probs_all, test_losses_all = run_inference_single_model(model_ensemble, state_ensemble, midi_events)
+        logits_all, probs_all, test_losses_all = run_inference_single_model(model_ensemble, state_ensemble, cos_freq, sin_freq, audio, midi_events)
 
         test_losses = []
         hit_rates = []
@@ -130,8 +136,8 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, key, sharding, batch_size)
+def compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, key, sharding, batch_size)
 
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
@@ -163,6 +169,8 @@ def train(
     model_ensemble,
     state_ensemble,
     tx,
+    cos_freq: jax.Array,
+    sin_freq: jax.Array,
     data_loader,
     opt_state_ensemble: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
@@ -218,6 +226,8 @@ def train(
         loss, model_ensemble, state_ensemble, opt_state_ensemble, key = compute_training_step(
             model_ensemble,
             state_ensemble,
+            cos_freq,
+            sin_freq,
             audio,
             events,
             opt_state_ensemble,
@@ -261,7 +271,7 @@ def train(
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff = compute_testset_loss(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff = compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, eval_key, batch_sharding)
                 if testloss_csv is not None:
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 # testset_hitrates[name] = float(hit_rate)
@@ -392,7 +402,7 @@ def main():
     num_steps = 250000
     learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
 
-    checkpoint_every = 100
+    checkpoint_every = 5000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -444,7 +454,9 @@ def main():
         return tx.init(eqx.filter(model, eqx.is_inexact_array))
     opt_state_ensemble = make_opt_states(audio_to_midi_ensemble)
 
-    num_model_output_frames = compute_model_output_frames(audio_to_midi_ensemble, model_states)
+    cos_freq, sin_freq = precompute_frequencies(model_config["attention_size"], 200)  # TODO: Fix hardcoded number
+
+    num_model_output_frames = compute_model_output_frames(audio_to_midi_ensemble, model_states, cos_freq, sin_freq)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -469,6 +481,8 @@ def main():
                 audio_to_midi_ensemble,
                 model_states,
                 tx,
+                cos_freq,
+                sin_freq,
                 dataset_loader_iter,
                 opt_state_ensemble,
                 checkpoint_manager,

@@ -10,8 +10,9 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Integer, PRNGKeyArray
 import einops
 
-import position_encoding
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
+
+from rope import calculate_rope
 
 @jax.jit
 def identity(arg):
@@ -103,10 +104,9 @@ class ResidualConv(eqx.Module):
     max_pool: eqx.nn.MaxPool1d | None = None
     avg_pool: eqx.nn.AvgPool1d | None = None
     attention: ConvSelfAttention | None = None
-    position_encoding: jax.Array
-    position_transform: eqx.nn.Conv1d
+    position_transform: eqx.nn.Conv1d | None = None
 
-    def __init__(self, conv_inputs: int, channels: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, attention_dim: Optional[int], position_encoding: jax.Array, dropout_rate: float | None, key: PRNGKeyArray | None):
+    def __init__(self, conv_inputs: int, channels: int, activation: types.FunctionType, max_pool: bool, avg_pool: bool, attention_dim: Optional[int], dropout_rate: float | None, key: PRNGKeyArray | None):
         scale_conv_key, conv_key, init_conv_key, shortcut_key, attention_key, pos_key = _split_key(key, 6)
 
         self.activation_function = activation
@@ -139,14 +139,6 @@ class ResidualConv(eqx.Module):
             key=conv_key
         )
 
-        self.position_encoding = position_encoding
-        self.position_transform = eqx.nn.Conv1d(
-            in_channels=position_encoding.shape[1],
-            out_channels=channels,
-            kernel_size=1,
-            key=pos_key
-        )
-
         self.batch_norm_0 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
         self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
         self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
@@ -168,15 +160,20 @@ class ResidualConv(eqx.Module):
             self.max_pool = eqx.nn.MaxPool1d(kernel_size=3, stride=2)
         if avg_pool:
             self.avg_pool = eqx.nn.AvgPool1d(kernel_size=3, stride=2)
-        if attention_dim:
-            self.attention = ConvSelfAttention(input_dim=channels, internal_dim=attention_dim, num_heads=4, key=attention_key)
+        # if attention_dim:
+        #     self.attention = ConvSelfAttention(input_dim=channels, internal_dim=attention_dim, num_heads=4, key=attention_key)
+        #     self.position_transform = eqx.nn.Conv1d(
+        #         in_channels=position_encoding.shape[1],
+        #         out_channels=channels,
+        #         kernel_size=1,
+        #         key=pos_key
+        #     )
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
         x, state = self.batch_norm_0(x, state, inference=not enable_dropout)
 
         out = self.conv_first(x)
         out = self.activation_function(out)
-        # out, state = self.batch_norm_0(out, state, inference=not enable_dropout)
 
         out = self.scale_conv(out)
         out = self.activation_function(out)
@@ -185,12 +182,12 @@ class ResidualConv(eqx.Module):
         # if self.dropout_1:
         #     out = self.dropout_1(out, inference=not enable_dropout, key=key)
 
-        if self.attention:
-            # Add positional encoding
-            # print(f"Position encoding shape: {self.position_encoding[:x.shape[1], ...].shape}")
-            pos_encoding = jnp.transpose(self.position_encoding[:out.shape[1], ...])
-            out = out + self.position_transform(pos_encoding)
-            # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
+        # if self.attention:
+        #     # Add positional encoding
+        #     # print(f"Position encoding shape: {self.position_encoding[:x.shape[1], ...].shape}")
+        #     pos_encoding = jnp.transpose(self.position_encoding[:out.shape[1], ...])
+        #     out = out + self.position_transform(pos_encoding)
+        #     # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
 
         conv2 = self.conv(out)
         conv2 = self.activation_function(out)
@@ -206,8 +203,8 @@ class ResidualConv(eqx.Module):
         if self.avg_pool:
             out = self.avg_pool(out)
         
-        if self.attention:
-            out, state = self.attention(out, state, enable_dropout=enable_dropout)
+        # if self.attention:
+        #     out, state = self.attention(out, state, enable_dropout=enable_dropout)
         
         return out, state
 
@@ -215,9 +212,7 @@ class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
     layernorm: eqx.nn.LayerNorm
-    position_embeddings: Float[Array, "seq_len output_shape"]
     dropout: eqx.nn.Dropout
-    position_embedder: eqx.nn.Linear
     layers: [eqx.Module]
     final_pooling: eqx.nn.Conv1d
     final_batch_norm: eqx.nn.BatchNorm
@@ -232,13 +227,6 @@ class FrameEmbedding(eqx.Module):
         pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
 
         self.layernorm = eqx.nn.LayerNorm(shape=output_shape)
-
-        max_attention_length = 2_000 # TODO: Do not hardcode this
-        self.position_embeddings = position_encoding.for_input_frame(
-            max_attention_length, output_shape
-        )
-        self.position_embedder = eqx.nn.Linear(in_features=output_shape, out_features=output_shape, key=pos_key)
-
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
         self.layers = []
@@ -264,9 +252,7 @@ class FrameEmbedding(eqx.Module):
                     max_pool=False,
                     avg_pool=False,
                     attention_dim=None,
-                    position_encoding=self.position_embeddings,
                     dropout_rate=dropout_rate,
-                    # dropout_rate=0.0,
                     key=conv_key,
                 )
             )
@@ -303,13 +289,8 @@ class FrameEmbedding(eqx.Module):
         frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))
         # print(f"Frame embeddings shape: {frame_embeddings.shape}")
 
-        # position_embeddings = jax.vmap(self.position_embedder)(self.position_embeddings[0 : frame_embeddings.shape[0]])
-        # position_embeddings = jax.vmap(self.layernorm)(position_embeddings)
-        position_embeddings = self.position_embeddings[0 : frame_embeddings.shape[0]]
-
         # combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
-        combined = frame_embeddings + position_embeddings
-        out = self.dropout(combined, inference=not enable_dropout, key=key), state
+        out = self.dropout(frame_embeddings, inference=not enable_dropout, key=key), state
         return out
 
 class FeedForwardBlock(eqx.Module):
@@ -405,6 +386,8 @@ class AttentionBlock(eqx.Module):
 
     def __call__(
         self,
+        cos_freq: jax.Array,
+        sin_freq: jax.Array,
         inputs: Float[Array, "seq_len attention_size"],
         kv_context: Optional[Float[Array, "seq_len attention_size"]] = None,
         input_mask: Optional[Integer[Array, "seq_len"]] = None,
@@ -418,10 +401,15 @@ class AttentionBlock(eqx.Module):
         mask = self.make_attention_mask(inputs.shape[0], kv_seq_len, input_mask, kv_mask)
         attention_key, dropout_key = _split_key(key)
 
+        kv_context = kv_context if kv_context is not None else inputs
+
+        roped_inputs = calculate_rope(inputs, cos_freq, sin_freq)
+        kv_context = calculate_rope(kv_context, cos_freq, sin_freq)
+
         result = self.attention(
-            query=inputs,
-            key_=kv_context if kv_context is not None else inputs,
-            value=kv_context if kv_context is not None else inputs,
+            query=roped_inputs,
+            key_=kv_context,
+            value=kv_context,
             mask=mask,
             inference=not enable_dropout,
             key=attention_key,
@@ -492,6 +480,8 @@ class TransformerLayer(eqx.Module):
 
     def __call__(
         self,
+        cos_freq: jax.Array,
+        sin_freq: jax.Array,
         inputs: Float[Array, "seq_len attention_size"],
         input_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
@@ -500,7 +490,8 @@ class TransformerLayer(eqx.Module):
         self_attention_key, encoder_attention_key, feed_forward_key = _split_key(key, num=3)
 
         output = self.attention_block(
-            inputs, input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
+            cos_freq=cos_freq, sin_freq=sin_freq,
+            inputs=inputs, input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
 
         feed_forward_keys = _split_key(feed_forward_key, num=inputs.shape[0])
@@ -511,7 +502,7 @@ class TransformerLayer(eqx.Module):
 
 class TransformerStack(eqx.Module):
 
-    layers: list[(TransformerLayer, TransformerLayer)]
+    layers: list[TransformerLayer]
     num_layers: int = eqx.field(static=True)
 
     def __init__(
@@ -539,6 +530,8 @@ class TransformerStack(eqx.Module):
 
     def __call__(
         self,
+        cos_freq: jax.Array,
+        sin_freq: jax.Array,
         inputs: Float[Array, "frames attention_size"],
         inputs_mask: Optional[Integer[Array, "seq_len"]] = None,
         enable_dropout: bool = False,
@@ -554,6 +547,8 @@ class TransformerStack(eqx.Module):
             transformer_layer = eqx.combine(current_layer, static_layers)
 
             transformer_output = transformer_layer(
+                cos_freq=cos_freq,
+                sin_freq=sin_freq,
                 inputs=transformer_state,
                 input_mask=inputs_mask,
                 enable_dropout=enable_dropout,
@@ -645,6 +640,8 @@ class OutputSequenceGenerator(eqx.Module):
         self,
         samples: Float[Array, "frame_seq_len frame_size"],
         state,
+        cos_freq: jax.Array,
+        sin_freq: jax.Array,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
@@ -653,12 +650,13 @@ class OutputSequenceGenerator(eqx.Module):
         print(f"Sample shape: {samples.shape}")
 
         frame_embeddings, state = self.frame_embedding(
-            # OutputSequenceGenerator.__compress_samples(samples), state, enable_dropout=enable_dropout, key=frame_embedding_key
             samples, state, enable_dropout=enable_dropout, key=frame_embedding_key
         )
         mask = jnp.ones(frame_embeddings.shape[0], dtype=jnp.int32)
 
         output = self.event_processor(
+            cos_freq=cos_freq,
+            sin_freq=sin_freq,
             inputs=frame_embeddings,
             inputs_mask=mask,
             enable_dropout=enable_dropout,
@@ -668,16 +666,8 @@ class OutputSequenceGenerator(eqx.Module):
         # output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
         logits, probs = self.decoder(output, decoder_key), state
-        # logits, probs = self.decoder(frame_embeddings, decoder_key), state
         return logits, probs
 
     def predict(self, state, samples):
         (logits, probs), _state = self(samples, state, None)
         return logits, probs
-
-    @eqx.filter_jit
-    def __compress_samples(samples):
-        def compress_samples(samples):
-            mu = jnp.array(255.0, dtype=jnp.float16)
-            return jnp.sign(samples) * jnp.log1p(mu * jnp.abs(samples)) / jnp.log1p(mu)
-        return compress_samples(samples)
