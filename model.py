@@ -23,8 +23,8 @@ model_config = {
     "attention_size": 64,
     "intermediate_size": 128,
     "num_heads": 4,
-    "num_layers": 2,
-    "dropout_rate": 0.15,
+    "num_layers": 10,
+    "dropout_rate": 0.05,
 }
 
 def serialize_function(obj):
@@ -233,7 +233,7 @@ class FrameEmbedding(eqx.Module):
         num_layers = 8
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        max_num_features = 64
+        max_num_features = 256
         for i, conv_key in zip(range(num_layers), conv_keys):
             out_channels = min(max_num_features, (2 ** (i + 2)))
             in_channels = min(max_num_features, (2 ** (i + 1)))
@@ -281,7 +281,7 @@ class FrameEmbedding(eqx.Module):
             frame_embeddings, state = layer(frame_embeddings, state, enable_dropout, layer_key)
         frame_embeddings = jnp.flip(frame_embeddings, axis=1)
 
-        # frame_embeddings = self.final_pooling(frame_embeddings)
+        frame_embeddings = self.final_pooling(frame_embeddings)
         # frame_embeddings, state = self.final_batch_norm(frame_embeddings, state, inference=not enable_dropout)
         # frame_embeddings = jax.nn.tanh(frame_embeddings)
 

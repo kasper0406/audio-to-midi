@@ -334,7 +334,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
                 # Do not modify non-numpy arrays
                 return leaf
 
-            # print(f"Should modify: {leaf}")
+            # print(f"Should modify leaf with shape: {leaf.shape}")
 
             # Flatten the weights for easy copying
             parent_a_weights = leaf[parent_a_idx, ...].flatten()
@@ -401,7 +401,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
         parent_b_idx = int(winner_indices[random_integers[i]])
         print(f"Recombining {parent_a_idx} + {parent_b_idx} -> {result_idx}")
 
-        recombined_ensemble = recombine(model_ensemble, parent_a_idx=parent_a_idx, parent_b_idx=parent_b_idx, result_idx=result_idx, key=recombine_key)
+        recombined_ensemble = recombine(recombined_ensemble, parent_a_idx=parent_a_idx, parent_b_idx=parent_b_idx, result_idx=result_idx, key=recombine_key)
 
     return recombined_ensemble
 
@@ -410,8 +410,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
-    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
     testset_dirs = {
         'validation_set': Path("/home/knielsen/ml/datasets/validation_set"),
         'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/validation_set_only_yamaha"),
@@ -424,7 +424,7 @@ def main():
     learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
     num_models = 6
 
-    checkpoint_every = 500
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
