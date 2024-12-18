@@ -22,8 +22,8 @@ model_config = {
     "max_frame_sequence_length": 200,
     "attention_size": 512,
     "intermediate_size": 1024,
-    "num_heads": 2,
-    "num_layers": 4,
+    "num_heads": 4,
+    "num_layers": 6,
     "dropout_rate": 0.05,
 }
 
@@ -180,8 +180,8 @@ class ResidualConv(eqx.Module):
 
         out, state = self.batch_norm_0(x, state, inference=not enable_dropout)
         out = self.scale_conv(out)
-        out = self.activation_function(out)
-        out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+        # out = self.activation_function(out)
+        # out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
         # if self.dropout_1:
         #     out = self.dropout_1(out, inference=not enable_dropout, key=key)
 
@@ -192,14 +192,11 @@ class ResidualConv(eqx.Module):
         #     out = out + self.position_transform(pos_encoding)
         #     # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
 
-        res = out
-        out = self.conv(out)
-        out = self.activation_function(out)
-        out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+        out = self.conv(out) * self.activation_function(out) + out
+        # out = self.activation_function(out)
+        # out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
         if self.dropout_2:
             out = self.dropout_2(out, inference=not enable_dropout, key=key)
-        
-        out = out + res
 
         # Residual
         out = out + self.shortcut(x)
@@ -254,7 +251,7 @@ class FrameEmbedding(eqx.Module):
                 ResidualConv(
                     conv_inputs=in_channels,
                     channels=out_channels,
-                    activation=jax.nn.relu,
+                    activation=jax.nn.silu,
                     max_pool=False,
                     avg_pool=False,
                     attention_dim=None,
