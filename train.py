@@ -430,7 +430,7 @@ def main():
     batch_size = 128 * num_devices
     num_steps = 10_000
     warmup_steps = 1000
-    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, warmup_steps, num_steps)
+    learning_rate_schedule = create_learning_rate_schedule(7 * 1e-4, warmup_steps, num_steps)
     num_models = 1
 
     checkpoint_every = 1000

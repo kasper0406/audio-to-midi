@@ -22,8 +22,8 @@ model_config = {
     "max_frame_sequence_length": 200,
     "attention_size": 512,
     "intermediate_size": 1024,
-    "num_heads": 1,
-    "num_layers": 2,
+    "num_heads": 2,
+    "num_layers": 4,
     "dropout_rate": 0.05,
 }
 
@@ -97,7 +97,8 @@ class ResidualConv(eqx.Module):
     batch_norm_0: eqx.nn.BatchNorm
     batch_norm_1: eqx.nn.BatchNorm
     batch_norm_2: eqx.nn.BatchNorm
-    batch_norm_3: eqx.nn.BatchNorm
+    # batch_norm_3: eqx.nn.BatchNorm
+    # norm: eqx.nn.LayerNorm
     dropout_1: eqx.nn.Dropout | None = None
     dropout_2: eqx.nn.Dropout | None = None
     shortcut: eqx.nn.Conv # Residual connections
@@ -143,7 +144,8 @@ class ResidualConv(eqx.Module):
         self.batch_norm_0 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
         self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
         self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
-        self.batch_norm_3 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
+        # self.batch_norm_3 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
+        # self.norm = eqx.nn.LayerNorm(out_channels)
 
         if dropout_rate is not None:
             self.dropout_1 = eqx.nn.Dropout(dropout_rate)
@@ -172,18 +174,16 @@ class ResidualConv(eqx.Module):
         #     )
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
-        x, state = self.batch_norm_0(x, state, inference=not enable_dropout)
-
         # out = self.conv_first(x)
         # out = self.activation_function(out)
         # out, state = self.batch_norm_3(out, state, inference=not enable_dropout)
-        out = x
 
+        out, state = self.batch_norm_0(x, state, inference=not enable_dropout)
         out = self.scale_conv(out)
         out = self.activation_function(out)
         out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
-        if self.dropout_1:
-            out = self.dropout_1(out, inference=not enable_dropout, key=key)
+        # if self.dropout_1:
+        #     out = self.dropout_1(out, inference=not enable_dropout, key=key)
 
         # if self.attention:
         #     # Add positional encoding
@@ -192,11 +192,14 @@ class ResidualConv(eqx.Module):
         #     out = out + self.position_transform(pos_encoding)
         #     # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
 
-        # out = self.conv(out)
-        # out = self.activation_function(out)
-        # out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
-        # if self.dropout_2:
-        #     out = self.dropout_2(out, inference=not enable_dropout, key=key)
+        res = out
+        out = self.conv(out)
+        out = self.activation_function(out)
+        out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+        if self.dropout_2:
+            out = self.dropout_2(out, inference=not enable_dropout, key=key)
+        
+        out = out + res
 
         # Residual
         out = out + self.shortcut(x)
@@ -205,7 +208,7 @@ class ResidualConv(eqx.Module):
             out = self.max_pool(out)
         if self.avg_pool:
             out = self.avg_pool(out)
-        
+ 
         # if self.attention:
         #     out, state = self.attention(out, state, enable_dropout=enable_dropout)
         
@@ -292,8 +295,8 @@ class FrameEmbedding(eqx.Module):
         # print(f"Frame embeddings shape: {frame_embeddings.shape}")
 
         # frame_embeddings = jax.nn.tanh(frame_embeddings)
-        frame_embeddings = jax.vmap(self.layernorm)(frame_embeddings)
-        frame_embeddings = self.dropout(frame_embeddings, inference=not enable_dropout, key=key)
+        # frame_embeddings = jax.vmap(self.layernorm)(frame_embeddings)
+        # frame_embeddings = self.dropout(frame_embeddings, inference=not enable_dropout, key=key)
 
         return frame_embeddings, state
 
@@ -309,8 +312,9 @@ class FeedForwardBlock(eqx.Module):
     """
 
     attention_to_intermediate_proj: eqx.nn.Linear
+    attention_to_intermediate_proj_2: eqx.nn.Linear
     intermediate_to_attention_proj: eqx.nn.Linear
-    layernorm: eqx.nn.LayerNorm
+    # layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
     def __init__(
@@ -320,13 +324,18 @@ class FeedForwardBlock(eqx.Module):
         dropout_rate: float,
         key: jax.random.PRNGKey,
     ):
-        attention_to_intermediate_key, intermediate_to_attention_key = jax.random.split(
-            key
+        attention_to_intermediate_key, attention_to_intermediate_key_2, intermediate_to_attention_key = jax.random.split(
+            key, 3
         )
         self.attention_to_intermediate_proj = eqx.nn.Linear(
             in_features=attention_size,
             out_features=intermediate_size,
             key=attention_to_intermediate_key,
+        )
+        self.attention_to_intermediate_proj_2 = eqx.nn.Linear(
+            in_features=attention_size,
+            out_features=intermediate_size,
+            key=attention_to_intermediate_key_2,
         )
         self.intermediate_to_attention_proj = eqx.nn.Linear(
             in_features=intermediate_size,
@@ -334,8 +343,7 @@ class FeedForwardBlock(eqx.Module):
             key=intermediate_to_attention_key,
         )
 
-        self.layernorm = eqx.nn.LayerNorm(shape=attention_size)
-        # self.layernorm = eqx.nn.LayerNorm(shape=intermediate_size)
+        # self.layernorm = eqx.nn.LayerNorm(shape=attention_size)
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(
@@ -346,11 +354,10 @@ class FeedForwardBlock(eqx.Module):
     ) -> Float[Array, "attention_size"]:
         # Feed forward
         intermediate = self.attention_to_intermediate_proj(inputs)
-        intermediate = jax.nn.relu(intermediate)
+        intermediate = jax.nn.silu(intermediate)
 
         # Project back to attention space
-        output = self.intermediate_to_attention_proj(intermediate)
-        output = self.layernorm(output)
+        output = self.intermediate_to_attention_proj(intermediate * self.attention_to_intermediate_proj_2(inputs))
         output = self.dropout(output, inference=not enable_dropout, key=key)
 
         # Add residual and normalize the layers
@@ -363,8 +370,8 @@ class AttentionBlock(eqx.Module):
     """A single attention transformer block"""
 
     attention: eqx.nn.MultiheadAttention
-    layernorm: eqx.nn.LayerNorm
-    dropout: eqx.nn.Dropout
+    # layernorm: eqx.nn.LayerNorm
+    # dropout: eqx.nn.Dropout
     num_heads: int = eqx.field(static=True)
 
     def __init__(
@@ -385,8 +392,8 @@ class AttentionBlock(eqx.Module):
             dropout_p=dropout_rate,
             key=key,
         )
-        self.layernorm = eqx.nn.LayerNorm(shape=attention_size)
-        self.dropout = eqx.nn.Dropout(dropout_rate)
+        # self.layernorm = eqx.nn.LayerNorm(shape=attention_size)
+        # self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(
         self,
@@ -419,8 +426,8 @@ class AttentionBlock(eqx.Module):
             key=attention_key,
         )
 
-        result = jax.vmap(self.layernorm)(result)
-        result = self.dropout(result, inference=not enable_dropout, key=dropout_key)
+        # result = jax.vmap(self.layernorm)(result)
+        # result = self.dropout(result, inference=not enable_dropout, key=dropout_key)
 
         result = result + inputs  # residual
 
@@ -453,7 +460,9 @@ class TransformerLayer(eqx.Module):
     2. Feed-Forward NN to process the attention output in a non-linear fashion
     """
 
+    attention_norm: eqx.nn.RMSNorm
     attention_block: AttentionBlock
+    feed_forward_norm: eqx.nn.RMSNorm
     feed_forward_block: FeedForwardBlock
 
     def __init__(
@@ -474,6 +483,7 @@ class TransformerLayer(eqx.Module):
             dropout_rate=dropout_rate,
             key=self_attention_key,
         )
+        self.attention_norm = eqx.nn.LayerNorm(attention_size)
 
         self.feed_forward_block = FeedForwardBlock(
             attention_size=attention_size,
@@ -481,6 +491,7 @@ class TransformerLayer(eqx.Module):
             dropout_rate=dropout_rate,
             key=feed_forward_key,
         )
+        self.feed_forward_norm = eqx.nn.LayerNorm(attention_size)
 
     def __call__(
         self,
@@ -495,12 +506,13 @@ class TransformerLayer(eqx.Module):
 
         output = self.attention_block(
             cos_freq=cos_freq, sin_freq=sin_freq,
-            inputs=inputs, input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
+            inputs=jax.vmap(self.attention_norm)(inputs),
+            input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
 
         feed_forward_keys = _split_key(feed_forward_key, num=inputs.shape[0])
         output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-            output, enable_dropout, feed_forward_keys
+            jax.vmap(self.feed_forward_norm)(output), enable_dropout, feed_forward_keys
         )
         return output
 
