@@ -20,10 +20,10 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 64,
-    "intermediate_size": 128,
-    "num_heads": 4,
-    "num_layers": 10,
+    "attention_size": 512,
+    "intermediate_size": 1024,
+    "num_heads": 1,
+    "num_layers": 2,
     "dropout_rate": 0.05,
 }
 
@@ -114,35 +114,36 @@ class ResidualConv(eqx.Module):
         if activation == jax.nn.glu:
             out_channels = channels * 2
             self.activation_function = partial(jax.nn.glu, axis=0)
-        
+
         kernel_size = 3
+        stride = 2
         self.conv_first = eqx.nn.Conv1d(
             in_channels=conv_inputs,
             out_channels=conv_inputs,
             kernel_size=kernel_size,
-            padding=1,
+            padding="SAME",
             key=init_conv_key,
         )
         self.scale_conv = eqx.nn.Conv1d(
             in_channels=conv_inputs,
             out_channels=out_channels,
-            kernel_size=(kernel_size + 1,),
-            stride=(2,),
-            padding=(1,),
+            kernel_size=(kernel_size,),
+            stride=(stride,),
+            padding="SAME",
             key=scale_conv_key
         )
         self.conv = eqx.nn.Conv1d(
             in_channels=out_channels,
             out_channels=out_channels,
             kernel_size=(kernel_size,),
-            padding=(2,),
+            padding="SAME",
             key=conv_key
         )
 
         self.batch_norm_0 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
         self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
         self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
-        self.batch_norm_3 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+        self.batch_norm_3 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
 
         if dropout_rate is not None:
             self.dropout_1 = eqx.nn.Dropout(dropout_rate)
@@ -151,8 +152,9 @@ class ResidualConv(eqx.Module):
         self.shortcut = eqx.nn.Conv1d(
             in_channels=conv_inputs,
             out_channels=channels,
-            kernel_size=2,
-            stride=2,
+            kernel_size=stride,
+            stride=stride,
+            padding="SAME",
             key=shortcut_key
         )
 
@@ -172,15 +174,16 @@ class ResidualConv(eqx.Module):
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
         x, state = self.batch_norm_0(x, state, inference=not enable_dropout)
 
-        out = self.conv_first(x)
-        out = self.activation_function(out)
+        # out = self.conv_first(x)
+        # out = self.activation_function(out)
+        # out, state = self.batch_norm_3(out, state, inference=not enable_dropout)
+        out = x
 
         out = self.scale_conv(out)
         out = self.activation_function(out)
-        # out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
-
-        # if self.dropout_1:
-        #     out = self.dropout_1(out, inference=not enable_dropout, key=key)
+        out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
+        if self.dropout_1:
+            out = self.dropout_1(out, inference=not enable_dropout, key=key)
 
         # if self.attention:
         #     # Add positional encoding
@@ -189,14 +192,14 @@ class ResidualConv(eqx.Module):
         #     out = out + self.position_transform(pos_encoding)
         #     # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
 
-        conv2 = self.conv(out)
-        conv2 = self.activation_function(out)
-        # conv2, state = self.batch_norm_2(conv2, state, inference=not enable_dropout)
-        if self.dropout_2:
-            conv2 = self.dropout_2(conv2, inference=not enable_dropout, key=key)
+        # out = self.conv(out)
+        # out = self.activation_function(out)
+        # out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
+        # if self.dropout_2:
+        #     out = self.dropout_2(out, inference=not enable_dropout, key=key)
 
         # Residual
-        out = out + conv2 + self.shortcut(x)
+        out = out + self.shortcut(x)
 
         if self.max_pool:
             out = self.max_pool(out)
@@ -214,8 +217,8 @@ class FrameEmbedding(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
     layers: [eqx.Module]
-    final_pooling: eqx.nn.Conv1d
-    final_batch_norm: eqx.nn.BatchNorm
+    # final_pooling: eqx.nn.Conv1d
+    # final_batch_norm: eqx.nn.BatchNorm
 
     def __init__(
         self,
@@ -233,7 +236,7 @@ class FrameEmbedding(eqx.Module):
         num_layers = 8
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        max_num_features = 256
+        max_num_features = 512
         for i, conv_key in zip(range(num_layers), conv_keys):
             out_channels = min(max_num_features, (2 ** (i + 2)))
             in_channels = min(max_num_features, (2 ** (i + 1)))
@@ -257,15 +260,15 @@ class FrameEmbedding(eqx.Module):
                 )
             )
 
-        last_layer_features = min(max_num_features, 2 ** (num_layers + 1))
-        self.final_pooling = eqx.nn.Conv1d(
-            in_channels=last_layer_features,
-            out_channels=output_shape,
-            kernel_size=(3,),
-            stride=(1,),
-            key=output_conv_key
-        )
-        self.final_batch_norm = eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch")
+        last_layer_features = min(max_num_features, 2 ** (num_layers + 2))
+        # self.final_pooling = eqx.nn.Conv1d(
+        #     in_channels=last_layer_features,
+        #     out_channels=output_shape,
+        #     kernel_size=(3,),
+        #     stride=(1,),
+        #     key=output_conv_key
+        # )
+        # self.final_batch_norm = eqx.nn.BatchNorm(input_size=output_shape, axis_name="batch")
 
     def __call__(
         self,
@@ -281,17 +284,18 @@ class FrameEmbedding(eqx.Module):
             frame_embeddings, state = layer(frame_embeddings, state, enable_dropout, layer_key)
         frame_embeddings = jnp.flip(frame_embeddings, axis=1)
 
-        frame_embeddings = self.final_pooling(frame_embeddings)
+        # frame_embeddings = self.final_pooling(frame_embeddings)
         # frame_embeddings, state = self.final_batch_norm(frame_embeddings, state, inference=not enable_dropout)
-        # frame_embeddings = jax.nn.tanh(frame_embeddings)
 
         # Make the last layer fit what we need for the transformer
         frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))
         # print(f"Frame embeddings shape: {frame_embeddings.shape}")
 
-        # combined = jax.vmap(self.layernorm)(frame_embeddings + position_embeddings)
-        out = self.dropout(frame_embeddings, inference=not enable_dropout, key=key), state
-        return out
+        # frame_embeddings = jax.nn.tanh(frame_embeddings)
+        frame_embeddings = jax.vmap(self.layernorm)(frame_embeddings)
+        frame_embeddings = self.dropout(frame_embeddings, inference=not enable_dropout, key=key)
+
+        return frame_embeddings, state
 
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
@@ -415,10 +419,10 @@ class AttentionBlock(eqx.Module):
             key=attention_key,
         )
 
-        result = result + inputs  # residual
         result = jax.vmap(self.layernorm)(result)
-
         result = self.dropout(result, inference=not enable_dropout, key=dropout_key)
+
+        result = result + inputs  # residual
 
         return result
 

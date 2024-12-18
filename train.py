@@ -25,6 +25,8 @@ from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
 
 from rope import precompute_frequencies
+from metrics import configure_tensorboard
+from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
@@ -166,6 +168,7 @@ def add_sample_noise(
     return samples + gaussian_noise
 
 def train(
+    summary_writer: SummaryWriter,
     model_ensemble,
     state_ensemble,
     tx,
@@ -263,6 +266,9 @@ def train(
             if trainloss_csv is not None:
                 trainloss_csv.writerow([step, averaged_loss, step_end_time - start_time, step * audio.shape[0], learning_rate])
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
+            
+            summary_writer.add_scalar("train/loss", averaged_loss[0], step)
+            summary_writer.add_scalar("train/learning_rate", learning_rate, step)
 
             loss_sum = make_loss_sum(model_ensemble) 
 
@@ -277,6 +283,8 @@ def train(
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
                 testset_losses.append(testset_loss)
+
+                summary_writer.add_scalar(f"train/test-loss-{name}", testset_loss[0], step)
 
             # Recombine
             # TODO(knielsen): Refactor this! 
@@ -309,7 +317,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
     """
     Genetic algorithm to re-combine models into new models
     """
-    def mutate_leaf(leaf: jax.Array, index_to_mutate: int, key: jax.random.PRNGKey, mutation_rate = 0.005):
+    def mutate_leaf(leaf: jax.Array, index_to_mutate: int, key: jax.random.PRNGKey, mutation_rate = 0.0005):
         if not eqx.is_array(leaf) or leaf.dtype not in (jnp.float16, jnp.float32):
             # Do not modify non-numpy arrays
             return leaf
@@ -324,7 +332,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
         return leaf.at[index_to_mutate, ...].set(updated_weights)
 
     def recombine(model_ensemble, parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
-        recombination_rate = 0.00001  # 0,001% chance of recombining
+        recombination_rate = 0.000001  # 0,0001% chance of recombining
 
         recombination_steps = 0
         current_parent_idx = 1  # Always start with parent_a weights (inversed in first recombination_steps sampling)
@@ -419,10 +427,11 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 16 * num_devices
-    num_steps = 100_000
-    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, 1000, num_steps)
-    num_models = 6
+    batch_size = 128 * num_devices
+    num_steps = 10_000
+    warmup_steps = 1000
+    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, warmup_steps, num_steps)
+    num_models = 1
 
     checkpoint_every = 1000
     checkpoints_to_keep = 3
@@ -433,6 +442,13 @@ def main():
     model_init_key, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=4)
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
+    
+    summary_writer = configure_tensorboard()
+    h_params = model_config
+    h_params["train/batch_size"] = batch_size
+    h_params["train/total_steps"] = num_steps
+    h_params["train/warmup_steps"] = warmup_steps
+    summary_writer.add_hparams(h_params, {})
 
     @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
     def make_ensemble(key):
@@ -447,7 +463,7 @@ def main():
         max_to_keep=checkpoints_to_keep,
         save_interval_steps=checkpoint_every,
         best_mode='max',
-        best_fn=score_by_checkpoint_metrics,
+        # best_fn=score_by_checkpoint_metrics,
     )
     checkpoint_manager = ocp.CheckpointManager(
         checkpoint_path,
@@ -499,6 +515,7 @@ def main():
             testloss_csv = csv.writer(testloss_file)
 
             audio_to_midi_ensemble, model_states, opt_state = train(
+                summary_writer,
                 audio_to_midi_ensemble,
                 model_states,
                 tx,
