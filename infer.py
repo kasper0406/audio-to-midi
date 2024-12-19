@@ -5,6 +5,7 @@ import equinox as eqx
 import jax
 import jax.experimental.mesh_utils as mesh_utils
 import jax.numpy as jnp
+import matplotlib.figure
 import matplotlib.pyplot as plt
 import orbax.checkpoint as ocp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -15,8 +16,9 @@ from mido import MidiFile, MidiTrack, Message, MetaMessage
 from dataclasses import dataclass
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, plot_output_probs
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs
 import modelutil
+import matplotlib
 
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     return modelutil.stitch_probs(np.stack(all_probs), overlap, duration_per_frame)
@@ -73,10 +75,13 @@ class DetailedEventLoss:
     missed_notes_diff: float
     notes_hit: int
     hit_rate: float
+    visualization: matplotlib.figure.Figure | None = None
 
 def detailed_event_loss(
     output_probs: Float[Array, "seq_len midi_voccab_size"],
-    expected: Float[Array, "seq_len midi_voccab_size"]) -> DetailedEventLoss:
+    expected: Float[Array, "seq_len midi_voccab_size"],
+    generate_visualization: bool = False
+) -> DetailedEventLoss:
     """
     Given predicted and expected fram events, compute a more detailed loss,
     to help evaluate how good a prediction is in a more detailed and "closer
@@ -109,12 +114,33 @@ def detailed_event_loss(
     if notes_hit + phantom_notes_diff + missed_notes_diff > 0:
         hit_rate = (notes_hit / (notes_hit + phantom_notes_diff + missed_notes_diff))
 
+    visualization = None
+    if generate_visualization:
+        cmap = 'viridis'
+        norm = plt.Normalize(vmin=0.0, vmax=1.0)
+        fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1)
+
+        X = jnp.linspace(0.0, predicted.shape[0], predicted.shape[0])
+        Y = jnp.arange(MIDI_EVENT_VOCCAB_SIZE)
+        c = ax1.pcolor(X, Y, jnp.transpose(predicted), cmap=cmap, norm=norm)
+        ax1.set(
+            ylabel="Inferred events",
+        )
+
+        ax2.pcolor(X, Y, jnp.transpose(expected), cmap=cmap, norm=norm)
+        ax2.set(
+            xlabel="Time [frame]",
+            ylabel="Expected events",
+        )
+        visualization = fig
+
     return DetailedEventLoss(
         full_diff=full_diff,
         phantom_notes_diff=phantom_notes_diff,
         missed_notes_diff=missed_notes_diff,
         notes_hit=notes_hit,
         hit_rate=hit_rate,
+        visualization=visualization,
     )
 
 def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):

@@ -406,7 +406,7 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 
     for (attack_frame, key, frame_duration, velocity) in events {
         let decay_function = |t: f32| -> f32 {
-            (-0.05 * t).exp().max(0.8) // Do not drop below 0.8 while the note is actually playing
+            (-0.1 * t).exp().max(0.3) // Do not drop below 0.3 while the note is actually playing
         };
 
         let frame_start = (*attack_frame as i32) - start_frame;

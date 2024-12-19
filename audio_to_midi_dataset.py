@@ -406,6 +406,8 @@ def plot_output_probs(sample_name: str, duration_per_frame: float, events: Float
     ax1_twin.set_xlim(0, events.shape[0])
     ax1_twin.set_xlabel("Frame count")
 
+    return fig
+
 def plot_embedding(
     sample_name: str, embeddings: Float[Array, "frame_count embedding_size"]
 ):

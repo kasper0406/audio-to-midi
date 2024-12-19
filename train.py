@@ -29,9 +29,10 @@ from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
-def compute_loss_from_output(logits, expected_output):
-    loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
-    return jnp.sum(loss)
+def compute_loss_from_output(probs, expected_output):
+    # loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+    boosted_errors = (probs - expected_output) * (1 + 6 * expected_output)
+    return jnp.sum(boosted_errors ** 2)
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
@@ -42,7 +43,7 @@ def compute_loss(model, state, cos_freq, sin_freq, audio, expected_outputs, key)
         model, in_axes=(0, None, None, None, 0, None), out_axes=(0, None), axis_name="batch",
     )(audio, state, cos_freq, sin_freq, batched_keys, True)
 
-    loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
+    loss = jax.vmap(compute_loss_from_output)(probs, expected_outputs)
     return jnp.mean(loss), state
 
 @eqx.filter_jit
@@ -103,7 +104,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     def run_inference_single_model(model, state, cos_freq, sin_freq, audio, midi_events):
         inference_model = eqx.nn.inference_mode(model)
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None, 0), out_axes=(0, None))(audio, state, cos_freq, sin_freq, test_loss_keys)
-        test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
+        test_losses = jax.vmap(compute_loss_from_output)(probs, midi_events)
         return logits, probs, test_losses
 
     loss_map = {}
@@ -116,16 +117,18 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
         eventized_diffs = []
         phantom_note_diffs = []
         missed_note_diffs = []
+        visualizations = []
         for _logits, probs, np_test_losses in zip(logits_all, probs_all, test_losses_all):
             stitched_probs = np.concatenate(probs, axis=0)
             stitched_events = np.concatenate(midi_events, axis=0)
 
-            detailed_loss = detailed_event_loss(stitched_probs, stitched_events)
+            detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=True)
             test_losses.append(np.mean(np_test_losses))
             hit_rates.append(detailed_loss.hit_rate)
             eventized_diffs.append(detailed_loss.full_diff)
             phantom_note_diffs.append(detailed_loss.phantom_notes_diff)
             missed_note_diffs.append(detailed_loss.missed_notes_diff)
+            visualizations.append(detailed_loss.visualization)
 
         loss_map[sample_name] = {
             "loss": np.array(test_losses),
@@ -133,6 +136,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
             "eventized_diff": np.array(eventized_diffs),
             "phantom_note_diff": np.array(phantom_note_diffs),
             "missed_note_diff": np.array(missed_note_diffs),
+            "visualizations": visualizations,
         }
 
     print("Finished evaluating test loss")
@@ -144,15 +148,17 @@ def compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, tes
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
     eventized_diff = np.zeros_like(list(per_sample_map.values())[0]["eventized_diff"])
+    visualizations = []
 
     count = 0
     for losses in per_sample_map.values():
         test_loss += losses["loss"]
         hit_rate += losses["hit_rate"]
         eventized_diff += losses["eventized_diff"]
+        visualizations += losses["visualizations"]
         count += 1
 
-    return (test_loss / count), (hit_rate / count), (eventized_diff / count)
+    return (test_loss / count), (hit_rate / count), (eventized_diff / count), visualizations
 
 @partial(jax.jit, donate_argnames=["samples"])
 def add_sample_noise(
@@ -278,7 +284,7 @@ def train(
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff = compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, eval_key, batch_sharding)
                 if testloss_csv is not None:
                     testloss_csv.writerow([name, step, testset_loss, step_end_time - start_time, step * audio.shape[0]])
                 # testset_hitrates[name] = float(hit_rate)
@@ -286,6 +292,8 @@ def train(
                 testset_losses.append(testset_loss)
 
                 summary_writer.add_scalar(f"train/test-loss-{name}", testset_loss[0], step)
+                for i, visualization in enumerate(visualizations):
+                    summary_writer.add_figure(f"train/test-loss-{name}-{i}", visualization, step)
             summary_writer.flush()
 
             # Recombine
@@ -422,6 +430,7 @@ def main():
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/validation_set")
     testset_dirs = {
         'validation_set': Path("/home/knielsen/ml/datasets/validation_set"),
         'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/validation_set_only_yamaha"),
@@ -430,9 +439,9 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 128 * num_devices
-    num_steps = 200_000
+    num_steps = 1_000_000
     warmup_steps = 1000
-    learning_rate_schedule = create_learning_rate_schedule(7 * 1e-4, warmup_steps, num_steps)
+    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, warmup_steps, num_steps)
     num_models = 1
 
     checkpoint_every = 1000
@@ -471,8 +480,28 @@ def main():
         checkpoint_path,
         options=checkpoint_options,
         item_names=('params', 'state'),
-        metadata=get_model_metadata()
+        metadata=get_model_metadata(),
     )
+
+    # Load latest model
+    step_to_restore = checkpoint_manager.latest_step()
+    if step_to_restore is not None:
+        current_metadata = get_model_metadata()
+        if current_metadata != checkpoint_manager.metadata():
+            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}")
+            print(f"Current configuration is {current_metadata}")
+
+        print(f"Restoring saved model at step {step_to_restore}")
+        filtered_model, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_array)
+        restored_map = checkpoint_manager.restore(
+            step_to_restore,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(filtered_model),
+                state=ocp.args.StandardRestore(model_states),
+            ),
+        )
+        audio_to_midi_ensemble = eqx.combine(restored_map["params"], static_model)
+        model_states = restored_map["state"]
 
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
@@ -485,7 +514,7 @@ def main():
     # state = jax.device_put(state, replicate_everywhere)
 
     tx = optax.adamw(learning_rate=learning_rate_schedule)
-    tx = optax.chain(optax.clip_by_global_norm(5.0), tx)
+    tx = optax.chain(optax.clip_by_global_norm(3.0), tx)
     # The filtering is necessary to have the opt-state flattening working
 
     @eqx.filter_vmap

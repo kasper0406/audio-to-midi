@@ -24,7 +24,7 @@ model_config = {
     "intermediate_size": 1024,
     "num_heads": 4,
     "num_layers": 6,
-    "dropout_rate": 0.05,
+    "dropout_rate": 0.15,
 }
 
 def serialize_function(obj):
@@ -43,7 +43,8 @@ def get_model_metadata():
         'model': model_config,
         'data_prep': get_data_prep_config(),
     }
-    return json.dumps(metadata, default=serialize_function)
+    # return json.dumps(metadata, default=serialize_function)
+    return metadata
 
 def _split_key(key, num: int = 2):
     if key is None:
@@ -91,14 +92,15 @@ class ConvSelfAttention(eqx.Module):
 
 class ResidualConv(eqx.Module):
     scale_conv: eqx.nn.Conv
+    scale_conv_2: eqx.nn.Conv
     conv: eqx.nn.Conv
     conv_first: eqx.nn.Conv
     activation_function: types.FunctionType
     batch_norm_0: eqx.nn.BatchNorm
-    batch_norm_1: eqx.nn.BatchNorm
-    batch_norm_2: eqx.nn.BatchNorm
+    # batch_norm_1: eqx.nn.BatchNorm
+    # batch_norm_2: eqx.nn.BatchNorm
     # batch_norm_3: eqx.nn.BatchNorm
-    # norm: eqx.nn.LayerNorm
+    # layer_norm: eqx.nn.LayerNorm
     dropout_1: eqx.nn.Dropout | None = None
     dropout_2: eqx.nn.Dropout | None = None
     shortcut: eqx.nn.Conv # Residual connections
@@ -112,9 +114,6 @@ class ResidualConv(eqx.Module):
 
         self.activation_function = activation
         out_channels = channels
-        if activation == jax.nn.glu:
-            out_channels = channels * 2
-            self.activation_function = partial(jax.nn.glu, axis=0)
 
         kernel_size = 3
         stride = 2
@@ -133,6 +132,14 @@ class ResidualConv(eqx.Module):
             padding="SAME",
             key=scale_conv_key
         )
+        self.scale_conv_2 = eqx.nn.Conv1d(
+            in_channels=conv_inputs,
+            out_channels=out_channels,
+            kernel_size=(kernel_size,),
+            stride=(stride,),
+            padding="SAME",
+            key=scale_conv_key
+        )
         self.conv = eqx.nn.Conv1d(
             in_channels=out_channels,
             out_channels=out_channels,
@@ -142,10 +149,9 @@ class ResidualConv(eqx.Module):
         )
 
         self.batch_norm_0 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
-        self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
-        self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
-        # self.batch_norm_3 = eqx.nn.BatchNorm(input_size=conv_inputs, axis_name="batch")
-        # self.norm = eqx.nn.LayerNorm(out_channels)
+        # self.batch_norm_1 = eqx.nn.BatchNorm(input_size=out_channels, axis_name="batch")
+        # self.batch_norm_2 = eqx.nn.BatchNorm(input_size=channels, axis_name="batch")
+        # self.layer_norm = eqx.nn.LayerNorm(conv_inputs)
 
         if dropout_rate is not None:
             self.dropout_1 = eqx.nn.Dropout(dropout_rate)
@@ -159,56 +165,32 @@ class ResidualConv(eqx.Module):
             padding="SAME",
             key=shortcut_key
         )
-
-        if max_pool:
-            self.max_pool = eqx.nn.MaxPool1d(kernel_size=3, stride=2)
-        if avg_pool:
-            self.avg_pool = eqx.nn.AvgPool1d(kernel_size=3, stride=2)
-        # if attention_dim:
-        #     self.attention = ConvSelfAttention(input_dim=channels, internal_dim=attention_dim, num_heads=4, key=attention_key)
-        #     self.position_transform = eqx.nn.Conv1d(
-        #         in_channels=position_encoding.shape[1],
-        #         out_channels=channels,
-        #         kernel_size=1,
-        #         key=pos_key
-        #     )
     
     def __call__(self, x, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
-        # out = self.conv_first(x)
-        # out = self.activation_function(out)
+        out, state = self.batch_norm_0(x, state, inference=not enable_dropout)
+        # out = jax.vmap(self.layer_norm, in_axes=1, out_axes=1)(x)
+        
+        # out = self.activation_function(self.conv_first(x)) + x
+        # out = self.activation_function(out) + x
         # out, state = self.batch_norm_3(out, state, inference=not enable_dropout)
 
-        out, state = self.batch_norm_0(x, state, inference=not enable_dropout)
-        out = self.scale_conv(out)
+        scaled = self.scale_conv(out)
         # out = self.activation_function(out)
         # out, state = self.batch_norm_1(out, state, inference=not enable_dropout)
         # if self.dropout_1:
         #     out = self.dropout_1(out, inference=not enable_dropout, key=key)
 
-        # if self.attention:
-        #     # Add positional encoding
-        #     # print(f"Position encoding shape: {self.position_encoding[:x.shape[1], ...].shape}")
-        #     pos_encoding = jnp.transpose(self.position_encoding[:out.shape[1], ...])
-        #     out = out + self.position_transform(pos_encoding)
-        #     # out = out + self.position_encoding[:out.shape[0], :out.shape[1]]
-
-        out = self.conv(out) * self.activation_function(out) + out
+        # out = self.conv(out) * self.activation_function(out) + out
+        # out = self.activation_function(self.conv(out)) + out
+        out = self.activation_function(self.conv(scaled)) * self.scale_conv_2(out) + scaled
         # out = self.activation_function(out)
         # out, state = self.batch_norm_2(out, state, inference=not enable_dropout)
         if self.dropout_2:
             out = self.dropout_2(out, inference=not enable_dropout, key=key)
-
+        
         # Residual
         out = out + self.shortcut(x)
 
-        if self.max_pool:
-            out = self.max_pool(out)
-        if self.avg_pool:
-            out = self.avg_pool(out)
- 
-        # if self.attention:
-        #     out, state = self.attention(out, state, enable_dropout=enable_dropout)
-        
         return out, state
 
 class FrameEmbedding(eqx.Module):
@@ -242,10 +224,6 @@ class FrameEmbedding(eqx.Module):
             in_channels = min(max_num_features, (2 ** (i + 1)))
             if i == 0:
                 in_channels = 2
-
-            attention_dim = None
-            if i > 3:
-                attention_dim = out_channels
 
             self.layers.append(
                 ResidualConv(
@@ -676,7 +654,7 @@ class OutputSequenceGenerator(eqx.Module):
             key=event_processor_key,
         )
         # output = jnp.tanh(output)
-        # output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
+        output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
         logits, probs = self.decoder(output, decoder_key), state
         return logits, probs
