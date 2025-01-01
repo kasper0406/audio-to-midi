@@ -30,8 +30,12 @@ from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
 def compute_loss_from_output(probs, expected_output):
-    # loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
-    boosted_errors = (probs - expected_output) * (1 + 6 * expected_output)
+    # boost_split = 55
+    # boost_split1 = 1 + 4 * expected_output[..., 0:boost_split]
+    # boost_split2 = 1 + 4 * expected_output[..., boost_split:] 
+    # boosted_errors = (probs - expected_output) * jnp.concatenate([boost_split1, boost_split2], axis=-1)
+    boosts = 1 + 4 * expected_output
+    boosted_errors = (probs - expected_output) * boosts
     return jnp.sum(boosted_errors ** 2)
 
 @eqx.filter_jit
@@ -428,7 +432,8 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random")
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
     # dataset_dir = Path("/home/knielsen/ml/datasets/validation_set")
     testset_dirs = {
@@ -438,7 +443,7 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 128 * num_devices
+    batch_size = 64 * num_devices
     num_steps = 1_000_000
     warmup_steps = 1000
     learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, warmup_steps, num_steps)
