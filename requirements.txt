@@ -1,0 +1,10 @@
+# jax
+pydub
+equinox
+matplotlib
+orbax-checkpoint
+optax
+more-itertools
+einops
+mido
+tensorboardx
