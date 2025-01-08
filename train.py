@@ -29,14 +29,10 @@ from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
-def compute_loss_from_output(probs, expected_output):
-    # boost_split = 55
-    # boost_split1 = 1 + 4 * expected_output[..., 0:boost_split]
-    # boost_split2 = 1 + 4 * expected_output[..., boost_split:] 
-    # boosted_errors = (probs - expected_output) * jnp.concatenate([boost_split1, boost_split2], axis=-1)
-    boosts = 1 + 4 * expected_output
-    boosted_errors = (probs - expected_output) * boosts
-    return jnp.sum(boosted_errors ** 2)
+def compute_loss_from_output(logits, expected_output):
+    # loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+    loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=3.0))(logits, expected_output)
+    return jnp.sum(loss)
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
@@ -47,7 +43,7 @@ def compute_loss(model, state, cos_freq, sin_freq, audio, expected_outputs, key)
         model, in_axes=(0, None, None, None, 0, None), out_axes=(0, None), axis_name="batch",
     )(audio, state, cos_freq, sin_freq, batched_keys, True)
 
-    loss = jax.vmap(compute_loss_from_output)(probs, expected_outputs)
+    loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
     return jnp.mean(loss), state
 
 @eqx.filter_jit
@@ -87,13 +83,13 @@ def compute_model_output_frames(model, state, cos_freq: jax.Array, sin_freq: jax
     num_model_output_frames = find_shape_output_logits.shape[0]
     return num_model_output_frames
 
-@lru_cache(maxsize=1)
+@lru_cache
 def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, batch_size: int):
     sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
 
     batches = []
     for sample_name in sample_names:
-        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name])
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], skip_cache=True)
         batches.append((sample_name, audio, midi_events))
     return batches
 
@@ -108,7 +104,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     def run_inference_single_model(model, state, cos_freq, sin_freq, audio, midi_events):
         inference_model = eqx.nn.inference_mode(model)
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None, 0), out_axes=(0, None))(audio, state, cos_freq, sin_freq, test_loss_keys)
-        test_losses = jax.vmap(compute_loss_from_output)(probs, midi_events)
+        test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
         return logits, probs, test_losses
 
     loss_map = {}
@@ -433,7 +429,8 @@ def main():
 
     current_directory = Path(__file__).resolve().parent
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
-    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6")
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
     # dataset_dir = Path("/home/knielsen/ml/datasets/validation_set")
     testset_dirs = {
@@ -444,12 +441,12 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 64 * num_devices
-    num_steps = 1_000_000
+    num_steps = 1_500_000
     warmup_steps = 1000
-    learning_rate_schedule = create_learning_rate_schedule(5 * 1e-4, warmup_steps, num_steps)
+    learning_rate_schedule = create_learning_rate_schedule(2 * 1e-5, warmup_steps, num_steps)
     num_models = 1
 
-    checkpoint_every = 1000
+    checkpoint_every = 2500
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20

@@ -167,13 +167,14 @@ class AudioToMidiDatasetLoader:
                 time.sleep(1.0)
 
     @classmethod
-    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str]):
+    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], skip_cache: bool = False):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio(
             str(dataset_dir),
             samples,
             AudioToMidiDatasetLoader.SAMPLE_RATE,
             MODEL_AUDIO_LENGTH,
-            num_model_output_frames)
+            num_model_output_frames,
+            skip_cache)
         audio_samples = np.stack(audio_samples)
         midi_events = np.stack(midi_events)
 

@@ -234,7 +234,7 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
     let max_value_left = left_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
     let max_value_right = right_samples.iter().map(|sample| sample.abs()).reduce(f32::max).unwrap();
     let mut total_max = max_value_left.max(max_value_right);
-    if total_max >= 0.05 {
+    if total_max <= 0.05 {
         // If the audio is very quite, there is a good chance it is silent everywhere, or it is simply noise
         // We do not want to normalize this due to division by 0 concerns
         let left_samples: Vec<f16> = left_samples.iter()
@@ -295,7 +295,7 @@ fn path_to_string_lossy<P: AsRef<Path>>(path: P) -> String {
     path.as_ref().to_string_lossy().into_owned()
 }
 
-async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
+async fn load_audio_sample(file_path: &str, sample_rate: u32, skip_cache: bool) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
     let (left_samples, right_samples) = match env::var("SAMPLE_CACHE_DIR") {
         Ok(cache_dir) => {
             let cache_filename = generate_cache_filename(file_path, sample_rate);
@@ -307,7 +307,7 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32
             tokio::fs::create_dir_all(right_cache_file.parent().unwrap()).await
                 .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?;
 
-            if left_cache_file.exists() && right_cache_file.exists() {
+            if left_cache_file.exists() && right_cache_file.exists() && !skip_cache {
                 debug!["Reading samples from cache {} {}", file_path, sample_rate];
 
                 // Read the cached files
@@ -355,7 +355,7 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32) -> Result<(Vec<f32
 fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<PyArray2<f32>>> {
     let (left_samples, right_samples) = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
-            let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate).await });
+            let future = TOKIO_RUNTIME.spawn(async move { load_audio_sample(&file, sample_rate, true).await });
             match future.await {
                 Ok(Ok(samples)) => {
                     Ok(samples)
@@ -428,7 +428,7 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 }
 
 #[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
     let duration_per_frame = model_duration as f64 / num_model_outputs as f64;
 
@@ -442,7 +442,7 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
                 let audio_future = TOKIO_RUNTIME.spawn(async move {
                     let audio_filename = resolve_audio_samples(&sampel_file_clone).await;
-                    load_audio_sample(&audio_filename, sample_rate).await
+                    load_audio_sample(&audio_filename, sample_rate, skip_cache).await
                 });
                 audio_futures.push(audio_future);
 

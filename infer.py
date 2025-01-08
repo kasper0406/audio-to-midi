@@ -122,7 +122,7 @@ def detailed_event_loss(
 
         X = jnp.linspace(0.0, predicted.shape[0], predicted.shape[0])
         Y = jnp.arange(MIDI_EVENT_VOCCAB_SIZE)
-        c = ax1.pcolor(X, Y, jnp.transpose(predicted), cmap=cmap, norm=norm)
+        c = ax1.pcolor(X, Y, jnp.transpose(output_probs), cmap=cmap, norm=norm)
         ax1.set(
             ylabel="Inferred events",
         )

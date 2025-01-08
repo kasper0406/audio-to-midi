@@ -20,8 +20,8 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 256,
-    "intermediate_size": 512,
+    "attention_size": 512,
+    "intermediate_size": 1024,
     "num_heads": 4,
     "num_layers": 6,
     "dropout_rate": 0.20,
@@ -185,7 +185,7 @@ class ResidualConv(eqx.Module):
         kernel_size = 3
         stride = 2
 
-        num_conv_first_layers = 2
+        num_conv_first_layers = 1
         self.conv_first_layers = []
         for i in range(num_conv_first_layers):
             conv_layer_keys, first1_key, first2_key, attention_key, ff_key = _split_key(conv_layer_keys, 5)
@@ -294,7 +294,7 @@ class FrameEmbedding(eqx.Module):
         num_layers = 8
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        max_num_features = 256
+        max_num_features = 512
         for i, conv_key in zip(range(num_layers), conv_keys):
             out_channels = min(max_num_features, (2 ** (i + 3)))
             in_channels = min(max_num_features, (2 ** (i + 2)))
