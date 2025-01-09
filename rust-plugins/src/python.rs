@@ -170,7 +170,7 @@ async fn read_samples_from_file(raw_file: &str, sample_rate: u32, maybe_max_dura
 
 async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &str, right_output_file: &str, sample_rate: u32, maybe_max_duration: Option<f32>) -> Result<(Vec<f16>, Vec<f16>), AudioLoadingError> {
     // TODO: Consider sending back all audio channels
-    let mut command = Command::new("/home/knielsen/ffmpeg/bin/ffmpeg");
+    let mut command = Command::new("ffmpeg");
     if let Some(max_duration) = maybe_max_duration {
         command.arg("-t").arg(format!["{}", max_duration]);
     }

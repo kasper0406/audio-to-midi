@@ -46,41 +46,16 @@ def compute_loss(model, state, cos_freq, sin_freq, audio, expected_outputs, key)
     loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
     return jnp.mean(loss), state
 
-@eqx.filter_jit
-@eqx.filter_vmap(
-    # TODO: Handle vmap'ed keys
-    in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None, eqx.if_array(0), None, None),
-    out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None),
-)
-def compute_training_step(
-    model_ensemble, state, cos_freq, sin_freq, audio, expected_outputs, opt_state, key, tx,
-):
-    key, new_key = jax.random.split(key)
-    (loss, state), grads = compute_loss(
-        model_ensemble,
-        state,
-        cos_freq=cos_freq,
-        sin_freq=sin_freq,
-        audio=audio,
-        expected_outputs=expected_outputs,
-        key=key,
-    )
-
-    updates, update_opt_state = tx.update(grads, opt_state, model_ensemble)
-    update_model = eqx.apply_updates(model_ensemble, updates)
-
-    return loss, update_model, state, update_opt_state, new_key
-
-@eqx.filter_vmap(in_axes=(eqx.if_array(0), eqx.if_array(0), None, None))
-def compute_model_output_frames(model, state, cos_freq: jax.Array, sin_freq: jax.Array):
+@eqx.filter_vmap(in_axes=(None, eqx.if_array(0), eqx.if_array(0), None, None))
+def compute_model_output_frames(batch_size, model, state, cos_freq: jax.Array, sin_freq: jax.Array):
     # TODO(knielsen): Find a better way of doing this
-    (find_shape_output_logits, _), _ = model(
-        samples=jnp.zeros((2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
-        state=state,
-        cos_freq=cos_freq,
-        sin_freq=sin_freq,
+    (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(
+        jnp.zeros((batch_size, 2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
+        state,
+        cos_freq,
+        sin_freq,
     )
-    num_model_output_frames = find_shape_output_logits.shape[0]
+    num_model_output_frames = find_shape_output_logits.shape[1]  # Output 0 is the batch size
     return num_model_output_frames
 
 @lru_cache
@@ -97,20 +72,42 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
+    @eqx.filter_jit
     @eqx.filter_vmap(
         in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None),
-        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0)),
+        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0))
     )
-    def run_inference_single_model(model, state, cos_freq, sin_freq, audio, midi_events):
-        inference_model = eqx.nn.inference_mode(model)
-        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None, 0), out_axes=(0, None))(audio, state, cos_freq, sin_freq, test_loss_keys)
-        test_losses = jax.vmap(compute_loss_from_output)(logits, midi_events)
-        return logits, probs, test_losses
+    def run_inference_single_model(inference_model, state, cos_freq, sin_freq, audio, midi_events):
+        # Compute the full batched model, even though we only compute one audio sample
+        pretend_batch_audio = jnp.zeros((batch_size, *audio.shape))
+        pretend_batch_audio.at[0, ...].set(audio)
 
+        pretend_batch_midi_events = jnp.zeros((batch_size, *midi_events.shape))
+        pretend_batch_midi_events.at[0, ...].set(midi_events)
+
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, cos_freq, sin_freq)
+        test_losses = jax.vmap(compute_loss_from_output)(logits, pretend_batch_midi_events)
+        return logits[0, ...], probs[0, ...], test_losses[0, ...]
+
+    inference_model = eqx.nn.inference_mode(model_ensemble)
     loss_map = {}
-    for sample_name, audio, midi_events in batches:
-        test_loss_keys = jax.random.split(key, num=audio.shape[0])
-        logits_all, probs_all, test_losses_all = run_inference_single_model(model_ensemble, state_ensemble, cos_freq, sin_freq, audio, midi_events)
+    for sample_name, audios, midi_events in batches:
+        logits_all = []
+        probs_all = []
+        test_losses_all = []
+        for audio, midi_event in zip(audios, midi_events):
+            logits, probs, test_losses = run_inference_single_model(inference_model, state_ensemble, cos_freq, sin_freq, audio, midi_event)
+
+            if len(logits_all) == 0:
+                # TODO: Nicer way to initialize?
+                logits_all = [ [] for _i in range(logits.shape[0])]
+                probs_all = [ [] for _i in range(logits.shape[0])]
+                test_losses_all = [ [] for _i in range(logits.shape[0])]
+
+            for i in range(logits.shape[0]):
+                logits_all[i].append(logits[i, ...])
+                probs_all[i].append(probs[i, ...])
+                test_losses_all[i].append(test_losses[i, ...])
 
         test_losses = []
         hit_rates = []
@@ -177,7 +174,7 @@ def train(
     summary_writer: SummaryWriter,
     model_ensemble,
     state_ensemble,
-    tx,
+    tx: optax.GradientTransformation,
     cos_freq: jax.Array,
     sin_freq: jax.Array,
     data_loader,
@@ -219,6 +216,43 @@ def train(
     for name in testset_dirs.keys():
         testset_hitrates[name] = sys.float_info.max
 
+    flat_model, treedef_model = jax.tree_util.tree_flatten(model_ensemble)
+    flat_state, treedef_state = jax.tree_util.tree_flatten(state_ensemble)
+    flat_opt_state, treedef_opt_state = jax.tree_util.tree_flatten(opt_state_ensemble)
+
+    @eqx.filter_jit
+    @eqx.filter_vmap(
+        # TODO: Handle vmap'ed keys
+        in_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None, None, None),
+        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None),
+    )
+    def compute_training_step(
+        flat_model, flat_state, flat_opt_state, cos_freq, sin_freq, audio, expected_outputs, key, tx: optax.GradientTransformation,
+    ):
+        model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
+        state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
+        opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
+
+        key, new_key = jax.random.split(key)
+        (loss, update_state), grads = compute_loss(
+            model,
+            state,
+            cos_freq=cos_freq,
+            sin_freq=sin_freq,
+            audio=audio,
+            expected_outputs=expected_outputs,
+            key=key,
+        )
+
+        updates, update_opt_state = tx.update(grads, opt_state, model)
+        update_model = eqx.apply_updates(model, updates)
+
+        flat_update_model = jax.tree_util.tree_leaves(update_model)
+        flat_update_state = jax.tree_util.tree_leaves(update_state)
+        flat_update_opt_state = jax.tree_util.tree_leaves(update_opt_state)
+
+        return loss, flat_update_model, flat_update_state, flat_update_opt_state, new_key
+
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
 
@@ -229,17 +263,18 @@ def train(
         audio = add_sample_noise(audio, noise_key)
 
         # Keep the old model state in memory until we are sure the loss is not nan
-        recovery_model = model_ensemble
-        recovery_opt_state = opt_state_ensemble
+        recovery_model = flat_model
+        recovery_state = flat_state
+        recovery_opt_state = flat_opt_state
 
-        loss, model_ensemble, state_ensemble, opt_state_ensemble, key = compute_training_step(
-            model_ensemble,
-            state_ensemble,
+        loss, flat_model, flat_state, flat_opt_state, key = compute_training_step(
+            flat_model, 
+            flat_state,
+            flat_opt_state,
             cos_freq,
             sin_freq,
             audio,
             events,
-            opt_state_ensemble,
             key,
             tx,
         )
@@ -247,11 +282,14 @@ def train(
 
         if jnp.any(jnp.isnan(loss)):
             print(f"Encountered NAN loss at step {step}. Trying to recover!")
-            model_ensemble = recovery_model
-            opt_state_ensemble = recovery_opt_state
+            flat_model = recovery_model
+            flat_state = recovery_state
+            flat_opt_state = recovery_opt_state
             continue
 
         if checkpoint_manager.should_save(step):
+            model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
+            state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
             filtered_model = eqx.filter(model_ensemble, eqx.is_array)
             checkpoint_manager.save(
                 step,
@@ -277,9 +315,13 @@ def train(
             summary_writer.add_scalar("train/learning_rate", learning_rate, step)
             summary_writer.flush()
 
+            model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
             loss_sum = make_loss_sum(model_ensemble) 
 
         if step % testset_loss_every == 0:
+            model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
+            state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
+
             print("Evaluating test losses...")
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
@@ -300,8 +342,13 @@ def train(
             # TODO(knielsen): Refactor this! 
             # TODO: Consider sum of testset losses
             # TODO: Reset optimizer state?
-            recombination_key, key = jax.random.split(key, num=2)
-            model_ensemble = evolve_model_ensemble(model_ensemble, testset_losses[0], recombination_key)
+            # TODO(knielsen): Consider re-enabling recombination?
+            # recombination_key, key = jax.random.split(key, num=2)
+            # model_ensemble = evolve_model_ensemble(model_ensemble, testset_losses[0], recombination_key)
+
+    model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
+    state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
+    opt_state_ensemble = jax.tree.unflatten(treedef_opt_state, flat_opt_state)
 
     return model_ensemble, state_ensemble, opt_state_ensemble
 
@@ -428,25 +475,21 @@ def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
     current_directory = Path(__file__).resolve().parent
-    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
-    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random")
-    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6")
-    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/true_melodic")
-    # dataset_dir = Path("/home/knielsen/ml/datasets/validation_set")
+    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/test/")
     testset_dirs = {
-        'validation_set': Path("/home/knielsen/ml/datasets/validation_set"),
-        'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/validation_set_only_yamaha"),
+        'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
+        'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
     }
 
     num_devices = len(jax.devices())
 
-    batch_size = 64 * num_devices
-    num_steps = 1_500_000
+    batch_size = 2 * num_devices
+    num_steps = 10000
     warmup_steps = 1000
     learning_rate_schedule = create_learning_rate_schedule(2 * 1e-5, warmup_steps, num_steps)
     num_models = 1
 
-    checkpoint_every = 2500
+    checkpoint_every = 100
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -507,13 +550,14 @@ def main():
 
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    # mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    # replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
+    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
 
-    # model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
-    # model_params = jax.device_put(model_params, replicate_everywhere)
-    # audio_to_midi = eqx.combine(model_params, static_model)
-    # state = jax.device_put(state, replicate_everywhere)
+    # TODO(knielsen): Refactor to a function?
+    model_params, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_array)
+    model_params = jax.device_put(model_params, replicate_everywhere)
+    audio_to_midi_ensemble = eqx.combine(model_params, static_model)
+    model_states = jax.device_put(model_states, replicate_everywhere)
 
     tx = optax.adamw(learning_rate=learning_rate_schedule)
     tx = optax.chain(optax.clip_by_global_norm(3.0), tx)
@@ -526,7 +570,7 @@ def main():
 
     cos_freq, sin_freq = precompute_frequencies(model_config["attention_size"], 200)  # TODO: Fix hardcoded number
 
-    num_model_output_frames = compute_model_output_frames(audio_to_midi_ensemble, model_states, cos_freq, sin_freq)
+    num_model_output_frames = compute_model_output_frames(batch_size, audio_to_midi_ensemble, model_states, cos_freq, sin_freq)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -573,7 +617,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
+    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.config.update("jax_threefry_partitionable", True)
 
     # with jax.profiler.trace("/tmp/jax-trace"):
