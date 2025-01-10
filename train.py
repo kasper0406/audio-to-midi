@@ -30,8 +30,7 @@ from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
-    # loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
-    loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=3.0))(logits, expected_output)
+    loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=1.0))(logits, expected_output)
     return jnp.sum(loss)
 
 @eqx.filter_jit
@@ -73,6 +72,11 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     print("Loaded test set")
 
     @eqx.filter_jit
+    def testset_loss_function(logits, expected_output):
+        loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+        return jnp.sum(loss)
+
+    @eqx.filter_jit
     @eqx.filter_vmap(
         in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None),
         out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0))
@@ -86,7 +90,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
         pretend_batch_midi_events.at[0, ...].set(midi_events)
 
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, cos_freq, sin_freq)
-        test_losses = jax.vmap(compute_loss_from_output)(logits, pretend_batch_midi_events)
+        test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
         return logits[0, ...], probs[0, ...], test_losses[0, ...]
 
     inference_model = eqx.nn.inference_mode(model_ensemble)
@@ -196,7 +200,7 @@ def train(
     start_step = (
         checkpoint_manager.latest_step() + 1
         if checkpoint_manager.latest_step() is not None
-        else 0
+        else 1
     )
 
     batch_mesh = Mesh(device_mesh, ("batch",))
