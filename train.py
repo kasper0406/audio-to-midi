@@ -84,10 +84,10 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     def run_inference_single_model(inference_model, state, cos_freq, sin_freq, audio, midi_events):
         # Compute the full batched model, even though we only compute one audio sample
         pretend_batch_audio = jnp.zeros((batch_size, *audio.shape))
-        pretend_batch_audio.at[0, ...].set(audio)
+        pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio)
 
         pretend_batch_midi_events = jnp.zeros((batch_size, *midi_events.shape))
-        pretend_batch_midi_events.at[0, ...].set(midi_events)
+        pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
 
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, cos_freq, sin_freq)
         test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
