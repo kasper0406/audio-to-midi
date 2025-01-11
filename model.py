@@ -164,7 +164,7 @@ class ScaleConv(eqx.Module):
         )
         self.downsample = eqx.nn.AvgPool1d(kernel_size=2, stride=2)
         self.sequeeze_excite = SqueezeExcite(out_channels, key=squeeze_excite_key)
-        if in_channels > 2:
+        if in_channels > 4:
             self.norm = eqx.nn.RMSNorm(in_channels)
     
     def __call__(self, x, residual, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
@@ -172,8 +172,7 @@ class ScaleConv(eqx.Module):
         if self.norm:
             out = jax.vmap(self.norm, in_axes=1, out_axes=1)(out)
 
-        # out = self.sequeeze_excite(self.downsample(self.conv(out))) + self.downsample(self.shortcut_conv(residual))
-        out = self.downsample(self.conv(out)) + self.downsample(self.shortcut_conv(residual))
+        out = self.sequeeze_excite(self.downsample(self.conv(out))) + self.downsample(self.shortcut_conv(residual))
         return out, out, state
 
 class ResidualConv(eqx.Module):
@@ -184,7 +183,7 @@ class ResidualConv(eqx.Module):
     alpha: float = eqx.field(static=True)
     norm: eqx.nn.RMSNorm | None = None
 
-    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout_rate: float | None, key: PRNGKeyArray | None, alpha: float = 0.5):
+    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout_rate: float | None, key: PRNGKeyArray | None, alpha: float = 1.0):
         self.alpha = alpha
 
         depth_conv_1_key, depthwise_conv_2_key, pointwise_conv_key = _split_key(key, 3)
@@ -216,7 +215,7 @@ class ResidualConv(eqx.Module):
         )
 
         self.sequeeze_excite = SqueezeExcite(channels, key=key)
-        if channels > 2:
+        if channels > 4:
             self.norm = eqx.nn.RMSNorm(channels)
     
     def __call__(self, x, residual, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
@@ -255,18 +254,20 @@ class FrameEmbedding(eqx.Module):
 
         max_num_features = 64
         kernels_for_leyers = [
-            [2],
-            [2, 2],
             [2, 2, 2],
+            [2, 2, 2, 2],
+            [2, 2, 2, 2, 2],
             [2, 2, 2, 2],
             [2, 2, 2],
             [2, 2, 2],
             [2, 2],
-            [2],
+            [2, 2],
         ]
         for i, conv_key, kernel_sizes in zip(range(num_layers), conv_keys, kernels_for_leyers):
-            in_channels = min(max_num_features, (2 ** (i + 1)))
-            out_channels = min(max_num_features, (2 ** (i + 2)))
+            in_channels = min(max_num_features, (2 ** (i + 3)))
+            if i == 0:
+                in_channels = 2
+            out_channels = min(max_num_features, (2 ** (i + 4)))
 
             main_res_conv_key, scale_conv_key = _split_key(conv_key, 2)
             res_conv_keys = _split_key(main_res_conv_key, len(kernel_sizes))
