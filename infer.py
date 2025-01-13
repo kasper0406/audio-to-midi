@@ -14,9 +14,11 @@ import numpy as np
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
 from dataclasses import dataclass
+import sys
+import argparse
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader
 import modelutil
 import matplotlib
 
@@ -200,6 +202,26 @@ def load_newest_checkpoint(checkpoint_path: Path, model_replication=True):
     return audio_to_midi, state
 
 def main():
+    # Create an argument parser
+    parser = argparse.ArgumentParser(description="Process audio file to generate MIDI data.")
+
+    # Add an argument for the input file
+    parser.add_argument("input_file", help="Path to the input audio file.")
+
+    # Parse the command-line arguments
+    args = parser.parse_args()
+
+    # Access the input file path from the parsed arguments
+    input_file = args.input_file
+
+    model, state = load_newest_checkpoint("./audio_to_midi_checkpoints")  # Assuming this function exists
+
+    overlap = 0.25
+    windowed_samples, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(input_file, overlap=overlap)  # Assuming this function exists
+    _probs, stitched_probs, duration_per_frame = predict_and_stitch(model, state, windowed_samples, window_duration, overlap=overlap) # Assuming this function exists
+
+    print(f"Stitched probs: {stitched_probs}")
+
     return
 
 if __name__ == "__main__":

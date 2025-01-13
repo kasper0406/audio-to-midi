@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple, Optional
 import types
 import json
 
@@ -20,10 +20,10 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 64,
-    "intermediate_size": 128,
+    "attention_size": 512,
+    "intermediate_size": 1024,
     "num_heads": 2,
-    "num_layers": 3,
+    "num_layers": 4,
     "dropout_rate": 0.20,
 }
 
@@ -106,11 +106,10 @@ class FeedForwardBlock(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "attention_size"]:
         # Feed forward
-        intermediate = self.attention_to_intermediate_proj(inputs)
-        intermediate = jax.nn.silu(intermediate)
+        intermediate = jax.nn.sigmoid(self.attention_to_intermediate_proj(inputs)) * self.attention_to_intermediate_proj_2(inputs)
 
         # Project back to attention space
-        output = self.intermediate_to_attention_proj(intermediate * self.attention_to_intermediate_proj_2(inputs))
+        output = self.intermediate_to_attention_proj(intermediate)
         output = self.dropout(output, inference=not enable_dropout, key=key)
 
         # Add residual and normalize the layers
@@ -121,17 +120,19 @@ class FeedForwardBlock(eqx.Module):
 class SqueezeExcite(eqx.Module):
     fc1: eqx.nn.Linear
     fc2: eqx.nn.Linear
+    prelu: eqx.nn.PReLU
 
     def __init__(self, channels, reduction=4, key=None):
         c1_key, c2_key = jax.random.split(key)
-        hidden_dim = max(2, channels // reduction)
+        hidden_dim = max(8, channels // reduction)
         self.fc1 = eqx.nn.Linear(channels, hidden_dim, key=c1_key)
         self.fc2 = eqx.nn.Linear(hidden_dim, channels, key=c2_key)
+        self.prelu = eqx.nn.PReLU()
 
     def __call__(self, x):
         # x shape: (batch, channels, time)
         s = x.mean(axis=-1)  # global avg pool over time
-        s = jax.nn.relu(self.fc1(s))
+        s = self.prelu(self.fc1(s))
         s = jax.nn.sigmoid(self.fc2(s))
         s = s[:, None]  # broadcast back over time dimension
         return x * s
@@ -139,7 +140,7 @@ class SqueezeExcite(eqx.Module):
 class ScaleConv(eqx.Module):
     conv: eqx.nn.Conv
     shortcut_conv: eqx.nn.Conv
-    downsample: eqx.nn.AvgPool1d
+    downsample: eqx.nn.MaxPool1d
     norm: eqx.nn.RMSNorm | None = None
     sequeeze_excite: SqueezeExcite
 
@@ -162,9 +163,9 @@ class ScaleConv(eqx.Module):
             padding="SAME",
             key=shortcut_conv_key,
         )
-        self.downsample = eqx.nn.AvgPool1d(kernel_size=2, stride=2)
+        self.downsample = eqx.nn.MaxPool1d(kernel_size=2, stride=2)
         self.sequeeze_excite = SqueezeExcite(out_channels, key=squeeze_excite_key)
-        if in_channels > 4:
+        if in_channels > 8:
             self.norm = eqx.nn.RMSNorm(in_channels)
     
     def __call__(self, x, residual, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
@@ -178,7 +179,8 @@ class ScaleConv(eqx.Module):
 class ResidualConv(eqx.Module):
     depthwise_conv_1: eqx.nn.Conv1d
     depthwise_conv_2: eqx.nn.Conv1d
-    pointwise_conv: eqx.nn.Conv1d
+    pointwise_conv_1: eqx.nn.Conv1d
+    pointwise_conv_2: eqx.nn.Conv1d
     sequeeze_excite: SqueezeExcite
     alpha: float = eqx.field(static=True)
     norm: eqx.nn.RMSNorm | None = None
@@ -186,7 +188,7 @@ class ResidualConv(eqx.Module):
     def __init__(self, channels: int, kernel_size: int, dilation: int, dropout_rate: float | None, key: PRNGKeyArray | None, alpha: float = 1.0):
         self.alpha = alpha
 
-        depth_conv_1_key, depthwise_conv_2_key, pointwise_conv_key = _split_key(key, 3)
+        depth_conv_1_key, depthwise_conv_2_key, pointwise_conv_1_key, pointwise_conv_2_key = _split_key(key, 4)
         self.depthwise_conv_1 = eqx.nn.Conv1d(
             in_channels=channels,
             out_channels=channels,
@@ -206,16 +208,23 @@ class ResidualConv(eqx.Module):
             key=depthwise_conv_2_key
         )
 
-        self.pointwise_conv = eqx.nn.Conv1d(
+        self.pointwise_conv_1 = eqx.nn.Conv1d(
             in_channels=channels,
             out_channels=channels,
             kernel_size=(1,),
             padding="SAME",
-            key=pointwise_conv_key
+            key=pointwise_conv_1_key
+        )
+        self.pointwise_conv_2 = eqx.nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=(1,),
+            padding="SAME",
+            key=pointwise_conv_2_key
         )
 
         self.sequeeze_excite = SqueezeExcite(channels, key=key)
-        if channels > 4:
+        if channels > 8:
             self.norm = eqx.nn.RMSNorm(channels)
     
     def __call__(self, x, residual, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
@@ -223,18 +232,37 @@ class ResidualConv(eqx.Module):
         if self.norm:
             out = jax.vmap(self.norm, in_axes=1, out_axes=1)(out)
 
-        out = self.depthwise_conv_1(out) * jax.nn.sigmoid(self.depthwise_conv_2(out))
-        out = self.pointwise_conv(out)
+        # out = self.pointwise_conv_1(out)
+        # out = self.depthwise_conv_1(out) * jax.nn.sigmoid(self.depthwise_conv_2(out))
+        out = jax.nn.relu(self.depthwise_conv_1(out))
+        out = self.pointwise_conv_2(out)
         out = self.sequeeze_excite(out)
 
         return self.alpha * out + x, residual, state
+
+class ResidualConnection(eqx.Module):
+    conv: eqx.nn.Conv1d
+    pooling: eqx.nn.MaxPool1d
+
+    def __init__(self, channels: int, residual_size: int, stride: int, key: PRNGKeyArray):
+        self.conv = eqx.nn.Conv1d(
+            in_channels=channels,
+            out_channels=residual_size,
+            kernel_size=(1,),
+            padding="SAME",
+            key=key,
+        )
+        self.pooling = eqx.nn.MaxPool1d(kernel_size=stride, stride=stride)
+
+    def __call__(self, x, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
+        return self.pooling(self.conv(x))
 
 class FrameEmbedding(eqx.Module):
     """Takes frames from the audio samples and creates embeddings"""
 
     layernorm: eqx.nn.RMSNorm
     dropout: eqx.nn.Dropout
-    layers: List[eqx.Module]
+    layers: List[Tuple[List[eqx.Module], ResidualConnection]]
 
     def __init__(
         self,
@@ -249,41 +277,47 @@ class FrameEmbedding(eqx.Module):
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
         self.layers = []
-        num_layers = 8
+        num_layers = 10
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        max_num_features = 64
+        attention_size = 512
+        max_num_features = 132
+        residual_size = (attention_size - max_num_features) // num_layers
         kernels_for_leyers = [
-            [2, 2, 2],
-            [2, 2, 2, 2],
-            [2, 2, 2, 2, 2],
-            [2, 2, 2, 2],
-            [2, 2, 2],
-            [2, 2, 2],
-            [2, 2],
-            [2, 2],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
+            [2, 3, 3, 5],
         ]
+        upscale_factor = 0
         for i, conv_key, kernel_sizes in zip(range(num_layers), conv_keys, kernels_for_leyers):
-            in_channels = min(max_num_features, (2 ** (i + 3)))
+            in_channels = min(max_num_features, (2 ** (i + 1 + upscale_factor)))
             if i == 0:
                 in_channels = 2
-            out_channels = min(max_num_features, (2 ** (i + 4)))
+            out_channels = min(max_num_features, (2 ** (i + 2 + upscale_factor)))
 
-            main_res_conv_key, scale_conv_key = _split_key(conv_key, 2)
+            block_layers = []
+            main_res_conv_key, scale_conv_key, residual_conv_key = _split_key(conv_key, 3)
             res_conv_keys = _split_key(main_res_conv_key, len(kernel_sizes))
             for dilation, (kernel_size, res_conv_key) in enumerate(zip(kernel_sizes, res_conv_keys)):
-                self.layers.append(
+                block_layers.append(
                     ResidualConv(
                         channels=in_channels,
                         kernel_size=kernel_size,
-                        dilation=2 ** dilation,
-                        # dilation=1,
+                        # dilation=2 ** dilation,
+                        dilation=1,
                         dropout_rate=dropout_rate,
                         key=res_conv_key,
                     )
                 )
 
-            self.layers.append(
+            block_layers.append(
                 ScaleConv(
                     in_channels=in_channels,
                     out_channels=out_channels,
@@ -292,6 +326,16 @@ class FrameEmbedding(eqx.Module):
                 )
             )
 
+            residual_stride = 2 ** (num_layers - (i + 1))
+            residual_connection = ResidualConnection(
+                channels=out_channels,
+                residual_size=residual_size,
+                stride=residual_stride,
+                key=residual_conv_key,
+            )
+
+            self.layers.append((block_layers, residual_connection))
+
     def __call__(
         self,
         input_frames: Float[Array, "channels seq_len frame_size"],
@@ -299,13 +343,22 @@ class FrameEmbedding(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        frame_embeddings = jnp.flip(input_frames, axis=1)
-        layer_keys = _split_key(key, len(self.layers))
+        frame_embeddings = input_frames
+        block_keys = _split_key(key, len(self.layers))
         residual = frame_embeddings
-        for layer, layer_key in zip(self.layers, layer_keys):
-            # print(f"Frame embedding shape: {frame_embeddings.shape}")
-            frame_embeddings, residual, state = layer(frame_embeddings, residual, state, enable_dropout, layer_key)
-        frame_embeddings = jnp.flip(frame_embeddings, axis=1)
+        residuals = []
+        for (layers, residual_block), block_key in zip(self.layers, block_keys):
+            layer_keys = _split_key(key, len(layers))
+            for layer, layer_key in zip(layers, layer_keys):
+                # print(f"Frame embedding shape: {frame_embeddings.shape}")
+                frame_embeddings, residual, state = layer(frame_embeddings, residual, state, enable_dropout, layer_key)
+            residuals.append(residual_block(frame_embeddings))
+            # print(f"Residual shape: {residuals[-1].shape}")
+
+        # Add in the residuals to the frame embeddings
+        residuals = [ residual[..., :frame_embeddings.shape[-1]] for residual in residuals ]
+        frame_embeddings = jnp.concat([frame_embeddings] + residuals, axis=0)
+        # print(f"Frame embeddings shape: {frame_embeddings.shape}")
 
         # Make the last layer fit what we need for the transformer
         frame_embeddings = jnp.transpose(jnp.squeeze((frame_embeddings)))
@@ -530,6 +583,7 @@ class Decoder(eqx.Module):
     """
 
     decoder_pooling: eqx.nn.Linear
+    norm: eqx.nn.RMSNorm
 
     def __init__(
         self,
@@ -541,12 +595,14 @@ class Decoder(eqx.Module):
             out_features=MIDI_EVENT_VOCCAB_SIZE,
             key=key,
         )
+        self.norm = eqx.nn.RMSNorm(attention_size)
 
     def __call__(
         self,
         output: Float[Array, "attention_size"],
         key: Optional[jax.random.PRNGKey] = None,
     ):  # Probability distribution over the midi events
+        output = jax.vmap(self.norm)(output)
 
         logits = jax.vmap(self.decoder_pooling)(output)
         probs = jax.nn.sigmoid(logits)

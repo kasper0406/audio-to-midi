@@ -487,13 +487,13 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 2 * num_devices
+    batch_size = 4 * num_devices
     num_steps = 10000
     warmup_steps = 1000
     learning_rate_schedule = create_learning_rate_schedule(2 * 1e-5, warmup_steps, num_steps)
     num_models = 1
 
-    checkpoint_every = 100
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
