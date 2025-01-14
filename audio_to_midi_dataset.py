@@ -106,6 +106,122 @@ def fft_audio(
 
     return absolute_values
 
+class Transformation:
+    def __call__(self, midi_events, audio):
+        pass
+
+class MixUpTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        mix_probability = 0.3
+        
+        size = midi_events.shape[0]
+        for i in range(int(mix_probability * size)):
+            # Pick to indices to mix
+            a = random.randint(0, size - 1)
+            b = random.randint(0, size - 1)
+
+            lambda_1 = random.betavariate(2.0, 2.0)
+            lambda_2 = random.betavariate(2.0, 2.0)
+
+            tmp = midi_events[a, ...]
+            midi_events[a, ...] = lambda_1 * midi_events[a, ...] + (1 - lambda_1) * midi_events[b, ...]
+            midi_events[b, ...] = lambda_2 * tmp + (1 - lambda_2) * midi_events[b, ...]
+
+            tmp = audio[a, ...]
+            audio[a, ...] = lambda_1 * audio[a, ...] + (1 - lambda_1) * audio[b, ...]
+            audio[b, ...] = lambda_2 * tmp + (1 - lambda_2) * audio[b, ...]
+
+        return midi_events, audio
+
+class CutMixTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        cut_probability = 0.1
+        
+        size = midi_events.shape[0]
+        midi_events_length = midi_events.shape[1]
+        audio_length = audio.shape[2]
+
+        for i in range(int(cut_probability * size)):
+            # Pick to indices to mix
+            a = random.randint(0, size - 1)
+            b = random.randint(0, size - 1)
+
+            min_cut = 0.01
+            cut_start = random.uniform(0.0, 1.0 - min_cut)
+            cut_length = random.uniform(min_cut, 1.0 - cut_start)
+
+            midi_events_cut_range = range(int(cut_start * midi_events_length), int((cut_start + cut_length) * midi_events_length))
+            midi_events[a, midi_events_cut_range, ...] = midi_events[b, midi_events_cut_range, ...]
+
+            audio_cut_range = range(int(cut_start * audio_length), int((cut_start + cut_length) * audio_length))
+            audio[a, :, audio_cut_range] = audio[b, :, audio_cut_range]
+
+        return midi_events, audio
+
+class RandomErasingTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        erase_probability = 0.1
+
+        size = midi_events.shape[0]
+        audio_length = audio.shape[2]
+
+        for i in range(int(erase_probability * size)):
+            # Pick to indices to mix
+            idx = random.randint(0, size - 1)
+
+            min_erase = 0.01
+            max_erase = 0.10
+            cut_start = random.uniform(0.0, 1.0 - min_erase)
+            cut_length = random.uniform(min_erase, min(max_erase, 1.0 - cut_start))
+
+            audio_cut_range = range(int(cut_start * audio_length), int((cut_start + cut_length) * audio_length))
+            audio[idx, :, audio_cut_range] = 0.0
+
+        return midi_events, audio
+
+class LabelSmoothingTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        alpha = 0.005
+        midi_events = midi_events - alpha
+        small_probs = alpha * np.ones_like(midi_events)
+        midi_events = np.where(midi_events < 0, small_probs, midi_events)
+        return midi_events, audio
+
+class RotateTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        rotate_prob = 0.2
+        
+        size = midi_events.shape[0]
+        midi_events_length = midi_events.shape[1]
+        audio_length = audio.shape[2]
+
+        for i in range(int(rotate_prob * size)):
+            idx = random.randint(0, size - 1)
+            roll_distance = random.uniform(0.0, 1.0)
+            midi_events[idx, ...] = np.roll(midi_events[idx, ...], int(roll_distance * midi_events_length), axis=0)
+            audio[idx, ...] = np.roll(audio[idx, ...], int(roll_distance * audio_length), axis=1)
+
+        return midi_events, audio
+
+class GainTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        size = audio.shape[0]
+        gains = np.clip(np.random.normal(loc=1.0, scale=0.25, size=size), 0.5, 2.0)
+        audio = gains[:, None, None] * audio
+
+        return midi_events, audio
+
+class NoiseTransformation(Transformation):
+    def __call__(self, midi_events, audio):
+        size = audio.shape[0]
+        sigmas = np.random.uniform(0.0, 0.25, size=size)[:, None, None]  # Randomize the level of noise
+        zeros = np.zeros_like(audio)
+        gaussian_noise = np.random.normal(loc=zeros, scale=sigmas, size=audio.shape)
+        audio = audio + gaussian_noise
+
+        return midi_events, audio
+
+
 class AudioToMidiDatasetLoader:
     SAMPLE_RATE = 2 * FREQUENCY_CUTOFF
 
@@ -226,6 +342,9 @@ class AudioToMidiDatasetLoader:
             # print(f"Actual samplpes: {samples_to_load}")
             midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
 
+            # Notice the sample_names can become out of sync in this step
+            midi_events, audio = self.__apply_training_transformations(midi_events, audio)
+
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])
             sample_names_batch.extend(sample_names)
@@ -250,6 +369,22 @@ class AudioToMidiDatasetLoader:
                     "events": next_events,
                     "sample_names": next_sample_names,
                 })
+
+    def __apply_training_transformations(self, midi_events, audio):
+        transformations = [
+            CutMixTransformation(),
+            RotateTransformation(),
+            RandomErasingTransformation(),
+            GainTransformation(),
+            MixUpTransformation(),
+            NoiseTransformation(),
+            LabelSmoothingTransformation(),
+        ]
+
+        for transformation in transformations:
+            midi_events, audio = transformation(midi_events, audio)
+
+        return midi_events, audio
 
     @classmethod
     def load_and_slice_full_audio(cls, filename: Path, overlap = 0.25):
@@ -367,7 +502,7 @@ def plot_frequency_domain_audio(
         title=f"Audio signal\n{sample_name}",
     )
     ax1.legend(loc='upper right')
-    ax1.set_ylim(-1, 1)
+    ax1.set_ylim(-5, 5)
     ax1.set_xlim(0, left_samples.shape[0])
     
     x_time_formatter = ticker.FuncFormatter(lambda x, pos: MODEL_AUDIO_LENGTH *  (x / left_samples.shape[0]))
@@ -495,8 +630,8 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
-        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
