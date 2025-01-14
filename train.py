@@ -10,6 +10,7 @@ from typing import Dict
 import equinox as eqx
 import jax
 import jax.experimental.mesh_utils as mesh_utils
+import jax.flatten_util
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
@@ -235,7 +236,7 @@ def train(
             key=key,
         )
 
-        updates, update_opt_state = tx.update(grads, opt_state, model)
+        updates, update_opt_state = tx.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
         update_model = eqx.apply_updates(model, updates)
 
         flat_update_model = jax.tree_util.tree_leaves(update_model)
@@ -476,7 +477,9 @@ def main():
     batch_size = 4 * num_devices
     num_steps = 10000
     warmup_steps = 1000
-    learning_rate_schedule = create_learning_rate_schedule(2 * 1e-5, warmup_steps, num_steps)
+    base_learning_rate = 5 * 1e-5
+    layer_lr_decay = 0.9
+    weight_decay = 1e-8
     num_models = 1
 
     checkpoint_every = 1000
@@ -549,12 +552,32 @@ def main():
     audio_to_midi_ensemble = eqx.combine(model_params, static_model)
     model_states = jax.device_put(model_states, replicate_everywhere)
 
-    tx = optax.adamw(learning_rate=learning_rate_schedule)
-    tx = optax.chain(optax.clip_by_global_norm(3.0), tx)
-    # The filtering is necessary to have the opt-state flattening working
+    # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth
+    def depth_extracting_label_fn(tree):
+        def map_fn(path, value):
+            first_seq = None
+            for part in path:
+                if isinstance(part, jax.tree_util.SequenceKey):
+                    first_seq = part
+                    break
+            
+            if first_seq:
+                # print(f"Path {path} at depth {first_seq.idx}")
+                return first_seq.idx
+            return 0  # Default is depth 0 with standard learning rate
+
+        return jax.tree_util.tree_map_with_path(map_fn, tree)
+
+    learning_rates_by_depth = { depth: create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** depth), warmup_steps, num_steps) for depth in range(0, 10) }
+    tx = optax.multi_transform({
+        depth: optax.adamw(lr_schedule, weight_decay=weight_decay) for depth, lr_schedule in learning_rates_by_depth.items()
+    }, depth_extracting_label_fn)
+    
+    # tx = optax.chain(optax.clip_by_global_norm(3.0), tx)
 
     @eqx.filter_vmap
     def make_opt_states(model):
+        # The filtering is necessary to have the opt-state flattening working
         return tx.init(eqx.filter(model, eqx.is_inexact_array))
     opt_state_ensemble = make_opt_states(audio_to_midi_ensemble)
 
@@ -593,7 +616,7 @@ def main():
                 checkpoint_manager,
                 trainloss_csv=trainloss_csv,
                 testloss_csv=testloss_csv,
-                learning_rate_schedule=learning_rate_schedule,
+                learning_rate_schedule=learning_rates_by_depth[0],
                 device_mesh=device_mesh,
                 num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
                 testset_dirs=testset_dirs,

@@ -20,8 +20,8 @@ def identity(arg):
 
 model_config = {
     "max_frame_sequence_length": 200,
-    "attention_size": 512,
-    "intermediate_size": 1024,
+    "attention_size": 64,
+    "intermediate_size": 128,
     "num_heads": 2,
     "num_layers": 4,
     "dropout_rate": 0.20,
@@ -280,8 +280,8 @@ class FrameEmbedding(eqx.Module):
         num_layers = 10
         conv_keys = jax.random.split(conv_key, num=num_layers)
 
-        attention_size = 512
-        max_num_features = 132
+        attention_size = 64
+        max_num_features = 34
         residual_size = (attention_size - max_num_features) // num_layers
         kernels_for_leyers = [
             [2, 3, 3, 5],
@@ -542,7 +542,10 @@ class TransformerStack(eqx.Module):
             )
 
         layer_keys = jax.random.split(key, num_layers)
-        self.layers = jax.vmap(make_transformer)(layer_keys)
+        self.layers = []
+        for layer_key in layer_keys:
+            self.layers.append(make_transformer(layer_key))
+        # self.layers = jax.vmap(make_transformer)(layer_keys)
 
     def __call__(
         self,
@@ -555,25 +558,30 @@ class TransformerStack(eqx.Module):
     ) -> Float[Array, "seq_len attention_size"]:
         layer_keys = _split_key(key, num=self.num_layers)
 
-        dynamic_layers, static_layers = eqx.partition(self.layers, eqx.is_array)
+        # dynamic_layers, static_layers = eqx.partition(self.layers, eqx.is_array)
 
-        def compute_layer(current_state, current_layer):
-            idx, transformer_state = current_state
-            leyer_key = layer_keys[idx] if key is not None else None
-            transformer_layer = eqx.combine(current_layer, static_layers)
+        # def compute_layer(current_state, current_layer):
+            # idx, transformer_state = current_state
+            # leyer_key = layer_keys[idx] if key is not None else None
+            # transformer_layer = eqx.combine(current_layer, static_layers)
 
+        def compute_layer(current_state, transformer_layer, layer_key):
             transformer_output = transformer_layer(
                 cos_freq=cos_freq,
                 sin_freq=sin_freq,
-                inputs=transformer_state,
+                inputs=current_state,
                 input_mask=inputs_mask,
                 enable_dropout=enable_dropout,
-                key=leyer_key,
+                key=layer_key,
             )
 
-            return (idx + 1, transformer_output), None
+            # return (idx + 1, transformer_output), None
+            return transformer_output
 
-        (_, output), _ = jax.lax.scan(compute_layer, (0, inputs), dynamic_layers)
+        # (_, output), _ = jax.lax.scan(compute_layer, (0, inputs), dynamic_layers)
+        output = inputs
+        for layer, layer_key in zip(self.layers, layer_keys):
+            output = compute_layer(output, layer, layer_key)
 
         return output
 
