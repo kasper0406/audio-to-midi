@@ -462,6 +462,70 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
     return recombined_ensemble
 
 
+def init_model(model, key: jax.random.PRNGKey):
+    head_weight_std = 0.001
+    cnn_weight_std = 0.02
+
+    def flatten(lst):
+        return [item for sublist in lst for item in sublist]
+    
+    head_weight_key, head_bias_key, cnn_weight_key, cnn_bias_key = jax.random.split(key, num=4)
+
+    # Initialize head weights
+    def is_multihead_attention(node):
+        return isinstance(node, eqx.nn.MultiheadAttention)
+    get_head_weights = lambda m: flatten([
+        [x.query_proj.weight, x.key_proj.weight, x.value_proj.weight, x.output_proj.weight]
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_multihead_attention) if is_multihead_attention(x)
+    ])
+    head_weights = get_head_weights(model)
+    new_head_weights = [
+        jax.random.normal(subkey, weight.shape) * head_weight_std
+        for weight, subkey in zip(head_weights, jax.random.split(head_weight_key, len(head_weights)))
+    ]
+    model = eqx.tree_at(get_head_weights, model, new_head_weights)
+
+    # Initialize head biases
+    get_head_biases = lambda m: flatten([
+        [x.query_proj.bias, x.key_proj.bias, x.value_proj.bias, x.output_proj.bias]
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_multihead_attention) if is_multihead_attention(x)
+    ])
+    head_biases = get_head_biases(model)
+    new_head_biases = [
+        jnp.zeros_like(weight)
+        for weight, subkey in zip(head_weights, jax.random.split(head_bias_key, len(head_biases)))
+    ]
+    model = eqx.tree_at(get_head_biases, model, new_head_biases)
+
+    # Initialize CNN weights
+    def is_conv_1d(node):
+        return isinstance(node, eqx.nn.Conv1d)
+    get_cnn_weights = lambda m: flatten([
+        [x.weight]
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_conv_1d) if is_conv_1d(x)
+    ])
+    cnn_weights  = get_cnn_weights(model)
+    new_cnn_weights = [
+        jax.random.normal(subkey, weight.shape) * cnn_weight_std
+        for weight, subkey in zip(cnn_weights, jax.random.split(cnn_weight_key, len(cnn_weights)))
+    ]
+    model = eqx.tree_at(get_cnn_weights, model, new_cnn_weights)
+
+    # Initialize CNN biases
+    get_cnn_biases = lambda m: flatten([
+        [x.bias]
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_conv_1d) if is_conv_1d(x)
+    ])
+    cnn_biases  = get_cnn_biases(model)
+    new_cnn_biases = [
+        jnp.zeros_like(weight)
+        for weight, subkey in zip(cnn_weights, jax.random.split(cnn_bias_key, len(cnn_biases)))
+    ]
+    model = eqx.tree_at(get_cnn_biases, model, new_cnn_biases)
+
+    return model
+
+
 def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
@@ -488,7 +552,7 @@ def main():
     dataset_prefetch_count = 20
 
     main_key = jax.random.PRNGKey(1234)
-    model_init_key, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=4)
+    model_init_key, model_init_key_2, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=5)
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
     
@@ -505,6 +569,7 @@ def main():
 
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
+    init_model(audio_to_midi_ensemble, key=model_init_key_2)
     print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
