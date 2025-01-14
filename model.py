@@ -25,6 +25,7 @@ model_config = {
     "num_heads": 2,
     "num_layers": 4,
     "dropout_rate": 0.20,
+    "stochastic_depth_dropout_rate": 0.2,
 }
 
 def serialize_function(obj):
@@ -53,6 +54,41 @@ def _split_key(key, num: int = 2):
         return jax.random.split(key, num)
 
 
+class StochasticDepthDropout(eqx.Module, strict=True):
+    p: float
+    inference: bool
+
+    def __init__(
+        self,
+        p: float = 0.2,
+        inference: bool = False,
+    ):
+        self.p = p
+        self.inference = inference
+
+    @jax.named_scope("kapper.StochasticDepthDropout")
+    def __call__(
+        self,
+        x: Array,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+        inference: Optional[bool] = None,
+    ) -> Array:
+        if inference is None:
+            inference = self.inference
+        if isinstance(self.p, (int, float)) and self.p == 0:
+            inference = True
+        if inference:
+            return x
+        elif key is None:
+            raise RuntimeError(
+                "Dropout requires a key when running in non-deterministic mode."
+            )
+        else:
+            rand = jax.random.uniform(key, shape=(1,))
+            return jnp.select([rand < self.p], [jnp.zeros_like(x)], x)
+
+
 class FeedForwardBlock(eqx.Module):
     """A signel feed forward transformer block.
     This applies to every output (count of them are attention_size) of the attention mechanism
@@ -69,12 +105,14 @@ class FeedForwardBlock(eqx.Module):
     intermediate_to_attention_proj: eqx.nn.Linear
     # layernorm: eqx.nn.RMSNorm
     dropout: eqx.nn.Dropout
+    stochastic_depth_dropout: StochasticDepthDropout
 
     def __init__(
         self,
         attention_size: int,
         intermediate_size: int,
         dropout_rate: float,
+        stochastic_depth_dropout_rate: float,
         key: jax.random.PRNGKey,
     ):
         attention_to_intermediate_key, attention_to_intermediate_key_2, intermediate_to_attention_key = jax.random.split(
@@ -99,6 +137,8 @@ class FeedForwardBlock(eqx.Module):
         # self.layernorm = eqx.nn.RMSNorm(shape=attention_size)
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
+        self.stochastic_depth_dropout = StochasticDepthDropout(stochastic_depth_dropout_rate)
+
     def __call__(
         self,
         inputs: Float[Array, "attention_size"],
@@ -108,14 +148,13 @@ class FeedForwardBlock(eqx.Module):
         # Feed forward
         intermediate = jax.nn.sigmoid(self.attention_to_intermediate_proj(inputs)) * self.attention_to_intermediate_proj_2(inputs)
 
+        dropout_key, sdd_key = _split_key(key, 2)
+
         # Project back to attention space
         output = self.intermediate_to_attention_proj(intermediate)
-        output = self.dropout(output, inference=not enable_dropout, key=key)
+        output = self.dropout(output, inference=not enable_dropout, key=dropout_key)
 
-        # Add residual and normalize the layers
-        output += inputs
-
-        return output
+        return self.stochastic_depth_dropout(output, inference=not enable_dropout, key=sdd_key) + inputs
 
 class SqueezeExcite(eqx.Module):
     fc1: eqx.nn.Linear
@@ -184,8 +223,9 @@ class ResidualConv(eqx.Module):
     sequeeze_excite: SqueezeExcite
     alpha: float = eqx.field(static=True)
     norm: eqx.nn.RMSNorm | None = None
+    stochastic_depth_dropout: StochasticDepthDropout
 
-    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout_rate: float | None, key: PRNGKeyArray | None, alpha: float = 1.0):
+    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout_rate: float | None, stochastic_depth_dropout_rate: float | None, key: PRNGKeyArray | None, alpha: float = 1.0):
         self.alpha = alpha
 
         depth_conv_1_key, depthwise_conv_2_key, pointwise_conv_1_key, pointwise_conv_2_key = _split_key(key, 4)
@@ -226,6 +266,8 @@ class ResidualConv(eqx.Module):
         self.sequeeze_excite = SqueezeExcite(channels, key=key)
         if channels > 8:
             self.norm = eqx.nn.RMSNorm(channels)
+        
+        self.stochastic_depth_dropout = StochasticDepthDropout(stochastic_depth_dropout_rate)
     
     def __call__(self, x, residual, state, enable_dropout: bool = False, key: PRNGKeyArray | None = None):
         out = x
@@ -238,7 +280,7 @@ class ResidualConv(eqx.Module):
         out = self.pointwise_conv_2(out)
         out = self.sequeeze_excite(out)
 
-        return self.alpha * out + x, residual, state
+        return self.stochastic_depth_dropout(self.alpha * out, inference=not enable_dropout, key=key) + x, residual, state
 
 class ResidualConnection(eqx.Module):
     conv: eqx.nn.Conv1d
@@ -269,6 +311,7 @@ class FrameEmbedding(eqx.Module):
         output_shape: int,
         max_frame_sequence_length: int,  # The maximum number of input frames
         dropout_rate: float,
+        stochastic_depth_dropout_rate: float,
         key: PRNGKeyArray,
     ):
         pos_key, conv_key, output_conv_key = jax.random.split(key, num=3)
@@ -313,6 +356,7 @@ class FrameEmbedding(eqx.Module):
                         # dilation=2 ** dilation,
                         dilation=1,
                         dropout_rate=dropout_rate,
+                        stochastic_depth_dropout_rate=stochastic_depth_dropout_rate,
                         key=res_conv_key,
                     )
                 )
@@ -373,12 +417,14 @@ class AttentionBlock(eqx.Module):
     # layernorm: eqx.nn.RMSNorm
     # dropout: eqx.nn.Dropout
     num_heads: int = eqx.field(static=True)
+    stochastic_depth_dropout: StochasticDepthDropout
 
     def __init__(
         self,
         attention_size: int,  # The attention size
         num_heads: int,
         dropout_rate: float,
+        stochastic_depth_dropout_rate: float,
         key: jax.random.PRNGKey,
     ):
         self.num_heads = num_heads
@@ -395,6 +441,8 @@ class AttentionBlock(eqx.Module):
         # self.layernorm = eqx.nn.RMSNorm(shape=attention_size)
         # self.dropout = eqx.nn.Dropout(dropout_rate)
 
+        self.stochastic_depth_dropout = StochasticDepthDropout(stochastic_depth_dropout_rate)
+
     def __call__(
         self,
         cos_freq: jax.Array,
@@ -410,7 +458,7 @@ class AttentionBlock(eqx.Module):
             kv_mask = input_mask
         kv_seq_len = kv_context.shape[0] if kv_context is not None else inputs.shape[0]
         mask = self.make_attention_mask(inputs.shape[0], kv_seq_len, input_mask, kv_mask)
-        attention_key, dropout_key = _split_key(key)
+        attention_key, dropout_key, sdd_key = _split_key(key, 3)
 
         kv_context = kv_context if kv_context is not None else inputs
 
@@ -429,9 +477,7 @@ class AttentionBlock(eqx.Module):
         # result = jax.vmap(self.layernorm)(result)
         # result = self.dropout(result, inference=not enable_dropout, key=dropout_key)
 
-        result = result + inputs  # residual
-
-        return result
+        return self.stochastic_depth_dropout(result, inference=not enable_dropout, key=sdd_key) + inputs  # residual
 
     def make_attention_mask(
         self,
@@ -471,6 +517,7 @@ class TransformerLayer(eqx.Module):
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
+        stochastic_depth_dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         self_attention_key, encoder_attention_key, feed_forward_key = jax.random.split(
@@ -481,6 +528,7 @@ class TransformerLayer(eqx.Module):
             attention_size=attention_size,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
+            stochastic_depth_dropout_rate=stochastic_depth_dropout_rate,
             key=self_attention_key,
         )
         self.attention_norm = eqx.nn.RMSNorm(attention_size)
@@ -489,6 +537,7 @@ class TransformerLayer(eqx.Module):
             attention_size=attention_size,
             intermediate_size=intermediate_size,
             dropout_rate=dropout_rate,
+            stochastic_depth_dropout_rate=stochastic_depth_dropout_rate,
             key=feed_forward_key,
         )
         self.feed_forward_norm = eqx.nn.RMSNorm(attention_size)
@@ -510,10 +559,15 @@ class TransformerLayer(eqx.Module):
             input_mask=input_mask, enable_dropout=enable_dropout, key=encoder_attention_key
         )
 
-        feed_forward_keys = _split_key(feed_forward_key, num=inputs.shape[0])
-        output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-            jax.vmap(self.feed_forward_norm)(output), enable_dropout, feed_forward_keys
-        )
+        feed_forward_keys = _split_key(feed_forward_key, num=output.shape[0])
+        if enable_dropout:
+            output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
+                jax.vmap(self.feed_forward_norm)(output), enable_dropout, feed_forward_keys,
+            )
+        else:
+            output = jax.vmap(self.feed_forward_block, in_axes=(0, None))(
+                jax.vmap(self.feed_forward_norm)(output), enable_dropout,
+            )
         return output
 
 class TransformerStack(eqx.Module):
@@ -528,6 +582,7 @@ class TransformerStack(eqx.Module):
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
+        stochastic_depth_dropout_rate: float,
         key: Optional[jax.random.PRNGKey] = None,
     ):
         self.num_layers = num_layers
@@ -538,6 +593,7 @@ class TransformerStack(eqx.Module):
                 intermediate_size=intermediate_size,
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
+                stochastic_depth_dropout_rate=stochastic_depth_dropout_rate,
                 key=layer_key,
             )
 
@@ -646,6 +702,7 @@ class OutputSequenceGenerator(eqx.Module):
             intermediate_size=conf["intermediate_size"],
             num_heads=conf["num_heads"],
             dropout_rate=conf["dropout_rate"],
+            stochastic_depth_dropout_rate=conf["stochastic_depth_dropout_rate"],
             key=event_processor_key,
         )
 
@@ -654,6 +711,7 @@ class OutputSequenceGenerator(eqx.Module):
             max_frame_sequence_length=conf["max_frame_sequence_length"],
             key=frame_embedding_key,
             dropout_rate=conf["dropout_rate"],
+            stochastic_depth_dropout_rate=conf["stochastic_depth_dropout_rate"],
         )
 
         self.decoder = Decoder(
