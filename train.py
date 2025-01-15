@@ -77,7 +77,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
 
     @eqx.filter_jit
     @eqx.filter_vmap(
-        in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None),
+        in_axes=(eqx.if_array(0), eqx.if_array(0), None, None),
         out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0))
     )
     def run_inference_single_model(inference_model, state, audio, midi_events):

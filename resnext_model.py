@@ -19,11 +19,10 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [96, 192, 384, 768],
-    "hidden_dims": [384, 768, 1536, 3072],
-    "depths": [3, 3, 9, 3],
+    "dims": [12, 16, 20, 24, 48, 96, 192, 384],
+    "depths": [3, 3, 3, 3, 3, 3, 9, 3],
 
-    "sdd_rate": 0.2,
+    "sdd_rate": 0.1,
 }
 
 def get_model_metadata():
@@ -78,7 +77,7 @@ class Stem(eqx.Module):
     conv: eqx.nn.Conv1d
     norm: eqx.nn.LayerNorm
 
-    def __init__(self, channels: int, kernel_size: int = 16, key: jax.random.PRNGKey = None):
+    def __init__(self, channels: int, kernel_size: int = 6, key: jax.random.PRNGKey = None):
         self.conv = eqx.nn.Conv1d(
             in_channels=2,
             out_channels=channels,
@@ -116,6 +115,7 @@ class Block(eqx.Module):
     point_conv_2: eqx.nn.Conv1d
     stochastic_depth_dropout: StochasticDepthDropout
     norm: eqx.nn.LayerNorm
+    gamma: Array
 
     def __init__(self, channels: int, hidden_dim: int, sdd_rate: float, kernel_size: int = 7, key: jax.random.PRNGKey = None):
         depth_conv_key, point_conv_1_key, point_conv_2_key = _split_key(key, 3)
@@ -145,6 +145,9 @@ class Block(eqx.Module):
         )
 
         self.stochastic_depth_dropout = StochasticDepthDropout(sdd_rate)
+
+        layer_scale_value = 1e-6
+        self.gamma = jnp.ones(channels) * layer_scale_value
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
         out = self.depth_conv(x)
@@ -152,6 +155,7 @@ class Block(eqx.Module):
         out = self.point_conv_1(out)
         out = jax.nn.gelu(out)
         out = self.point_conv_2(out)
+        out = self.gamma[:, None] * out  # Layer scale
         return self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key) + x
 
 class Decoder(eqx.Module):
@@ -198,12 +202,14 @@ class OutputSequenceGenerator(eqx.Module):
         layers_key, decoder_key = _split_key(key, 2)
 
         dims = conf["dims"]
-        hidden_dims = conf["hidden_dims"]
+        hidden_dims = [d * 4 for d in dims]
         depths = conf["depths"]
 
         self.layers = []
 
         layer_keys = _split_key(layers_key, len(dims))
+        sdd_rates = jnp.linspace(0.0, conf["sdd_rate"], sum(depths))
+        depth_count = 0
         for i, layer_key in zip(range(len(dims)), layer_keys):
             downsample_key, blocks_key = _split_key(layer_key, 2)
 
@@ -218,10 +224,11 @@ class OutputSequenceGenerator(eqx.Module):
             self.layers.append(eqx.nn.Sequential([
                 downsample_layer,
                 *[
-                    Block(dims[i], hidden_dims[i], sdd_rate=conf["sdd_rate"], key=block_key)
-                    for block_key in block_keys
+                    Block(dims[i], hidden_dims[i], sdd_rate=sdd_rates[depth_count + j], key=block_key)
+                    for j, block_key in enumerate(block_keys)
                 ],
             ]))
+            depth_count += depths[i]
         
         self.decoder = Decoder(dims[-1], key=decoder_key)
 
