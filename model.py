@@ -86,7 +86,7 @@ class StochasticDepthDropout(eqx.Module, strict=True):
             )
         else:
             rand = jax.random.uniform(key, shape=(1,))
-            return jnp.select([rand < self.p], [jnp.zeros_like(x)], x)
+            return jnp.where(rand < self.p, jnp.zeros_like(x), x)
 
 
 class FeedForwardBlock(eqx.Module):

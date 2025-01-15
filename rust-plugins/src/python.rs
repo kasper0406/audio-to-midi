@@ -296,7 +296,7 @@ fn path_to_string_lossy<P: AsRef<Path>>(path: P) -> String {
 }
 
 async fn load_audio_sample(file_path: &str, sample_rate: u32, skip_cache: bool) -> Result<(Vec<f32>, Vec<f32>), AudioLoadingError> {
-    let (left_samples, right_samples) = match env::var("SAMPLE_CACHE_DIR") {
+    match env::var("SAMPLE_CACHE_DIR") {
         Ok(cache_dir) => {
             let cache_filename = generate_cache_filename(file_path, sample_rate);
             let left_cache_file = Path::new(&cache_dir).join(&cache_filename[..4]).join(format!["{}_left.raw", cache_filename]);
@@ -316,16 +316,29 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32, skip_cache: bool) 
                     .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?
                     .read_to_end(&mut encoded_left).await
                     .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
-                let left_samples: Vec<f16> = bincode::deserialize(&encoded_left[..]).unwrap();
+                let maybe_left_samples: Result<Vec<f16>, _> = bincode::deserialize(&encoded_left[..]);
 
                 let mut encoded_right = Vec::new();
                 File::open(&right_cache_file).await
                     .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?
                     .read_to_end(&mut encoded_right).await
-                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
-                let right_samples: Vec<f16> = bincode::deserialize(&encoded_right[..]).unwrap();
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&right_cache_file)))?;
+                let maybe_right_samples: Result<Vec<f16>, _> = bincode::deserialize(&encoded_right[..]);
 
-                Ok((left_samples, right_samples))
+                if let Ok(left_samples) = maybe_left_samples {
+                    if let Ok(right_samples) = maybe_right_samples {
+                        return Ok((
+                            left_samples.iter().map(|sample| sample.to_f32()).collect(),
+                            right_samples.iter().map(|sample| sample.to_f32()).collect()
+                        ))
+                    }
+                }
+
+                tokio::fs::remove_file(left_cache_file.clone()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                tokio::fs::remove_file(right_cache_file.clone()).await
+                    .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
+                return Box::pin(load_audio_sample(file_path, sample_rate, true)).await
             } else {
                 let (left_samples, right_samples) = load_audio_sample_uncached(file_path, sample_rate).await?;
 
@@ -339,16 +352,20 @@ async fn load_audio_sample(file_path: &str, sample_rate: u32, skip_cache: bool) 
                     .write_all(&bincode::serialize(&right_samples).unwrap()).await
                     .map_err(|err| AudioLoadingError::IoError(err, path_to_string_lossy(&left_cache_file)))?;
 
-                Ok((left_samples, right_samples))
+                Ok((
+                    left_samples.iter().map(|sample| sample.to_f32()).collect(),
+                    right_samples.iter().map(|sample| sample.to_f32()).collect()
+                ))
             }
         },
-        Err(e) => Ok(load_audio_sample_uncached(file_path, sample_rate).await?)
-    }?;
-
-    Ok((
-        left_samples.iter().map(|sample| sample.to_f32()).collect(),
-        right_samples.iter().map(|sample| sample.to_f32()).collect()
-    ))
+        Err(e) => {
+            let (left_samples, right_samples) = load_audio_sample_uncached(file_path, sample_rate).await?;
+            Ok((
+                left_samples.iter().map(|sample| sample.to_f32()).collect(),
+                right_samples.iter().map(|sample| sample.to_f32()).collect()
+            ))
+        }
+    }
 }
 
 #[pyfunction]
