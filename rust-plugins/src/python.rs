@@ -444,96 +444,102 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
     frames
 }
 
-#[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
-    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+struct EventsAndAudio {
+    samples: Vec<(Vec<f32>, Vec<f32>)>,
+    events: Vec<Vec<Vec<f32>>>,
+    sample_names: Vec<String>,
+}
+
+async fn load_events_and_audio_rust(sample_files: &[String], sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> EventsAndAudio {
     let duration_per_frame = model_duration as f64 / num_model_outputs as f64;
 
-    let all_samples = py.allow_threads(move || {
-        TOKIO_RUNTIME.block_on(async {
-            let mut audio_futures = vec![];
-            let mut event_futures = vec![];
+    let mut audio_futures = vec![];
+    let mut event_futures = vec![];
 
-            for sample_file in &sample_files {
-                let sampel_file_clone = sample_file.clone();
+    for sample_file in sample_files {
+        let sampel_file_clone = sample_file.clone();
 
-                let audio_future = TOKIO_RUNTIME.spawn(async move {
-                    let audio_filename = resolve_audio_samples(&sampel_file_clone).await;
-                    load_audio_sample(&audio_filename, sample_rate, skip_cache).await
-                });
-                audio_futures.push(audio_future);
+        let audio_future = TOKIO_RUNTIME.spawn(async move {
+            let audio_filename = resolve_audio_samples(&sampel_file_clone).await;
+            load_audio_sample(&audio_filename, sample_rate, skip_cache).await
+        });
+        audio_futures.push(audio_future);
 
-                let event_filename = format!["{}.csv", sample_file.clone()];
-                let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, duration_per_frame as f32).await });
-                event_futures.push(event_future);
+        let event_filename = format!["{}.csv", sample_file.clone()];
+        let event_future = TOKIO_RUNTIME.spawn(async move { get_events_from_file(&event_filename, duration_per_frame as f32).await });
+        event_futures.push(event_future);
+    }
+
+    let audio_samples: Vec<(Vec<f32>, Vec<f32>)> = join_all(audio_futures).await
+        .into_iter()
+        .map(|result| result.unwrap())
+        .map(|result| result.unwrap())
+        .collect();
+    let events: Vec<MidiEvents> = join_all(event_futures).await
+        .into_iter()
+        .map(|result| result.unwrap())
+        .map(|result| result.unwrap())
+        .collect();
+
+    debug!("Event frame count {}, max_duration = {}, dpf = {}", num_model_outputs, model_duration, duration_per_frame);
+    // TODO: Try to make this nicer...
+    let (audio_samples, events_by_frame, sample_names) = events.iter()
+            .zip(audio_samples.iter())
+            .zip(sample_files.iter())
+        .map(|((events, samples), sample_file_name)| {
+            // events and samples may be too big for the model to handle. We will split them out
+            let (left_samples, right_samples) = samples;
+            let samples_per_model_call = (sample_rate as f32 * model_duration) as usize;
+            let num_splits = ((left_samples.len() as f32) / samples_per_model_call as f32).ceil() as i32;
+
+            let mut sample_splits = vec![];
+            let mut event_splits = vec![];
+            let mut sample_name_split = vec![];
+            for split in 0..num_splits {
+                let start_frame = split * num_model_outputs as i32;
+                let start_sample = (split * samples_per_model_call as i32) as usize;
+                let samples_to_copy = samples_per_model_call.min(left_samples.len() - start_sample);
+                let num_frames_with_backing_samples = ((samples_to_copy as f32 / samples_per_model_call as f32) * (num_model_outputs as f32)).ceil() as i32;
+                debug!["Copying {} samples starting at {} for split {}", samples_to_copy, start_sample, split];
+
+                let frame_events = convert_to_frame_events(&events, num_model_outputs, start_frame, num_frames_with_backing_samples);
+                let mut split_samples_left = vec![0.0; samples_per_model_call as usize];
+                let mut split_samples_right = vec![0.0; samples_per_model_call as usize];
+
+                for i in 0..samples_to_copy {
+                    split_samples_left[i] = left_samples[start_sample + i];
+                    split_samples_right[i] = right_samples[start_sample + i];
+                }
+
+                // Only include it if we have more than half of the samples so we do not train on too much silence
+                if samples_to_copy > samples_per_model_call / 2 {
+                    sample_splits.push((split_samples_left, split_samples_right));
+                    event_splits.push(frame_events);
+                    sample_name_split.push(format!["{}+{}", sample_file_name, split]);
+                }
             }
 
-            let audio_samples: Vec<(Vec<f32>, Vec<f32>)> = join_all(audio_futures).await
-                .into_iter()
-                .map(|result| result.unwrap())
-                .map(|result| result.unwrap())
-                .collect();
-            let events: Vec<MidiEvents> = join_all(event_futures).await
-                .into_iter()
-                .map(|result| result.unwrap())
-                .map(|result| result.unwrap())
-                .collect();
-
-            debug!("Event frame count {}, max_duration = {}, dpf = {}", num_model_outputs, model_duration, duration_per_frame);
-            // TODO: Try to make this nicer...
-            let (audio_samples, events_by_frame, sample_names): (Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<Vec<f32>>>, Vec<String>) = events.iter()
-                    .zip(audio_samples.iter())
-                    .zip(sample_files.iter())
-                .map(|((events, samples), sample_file_name)| {
-                    // events and samples may be too big for the model to handle. We will split them out
-                    let (left_samples, right_samples) = samples;
-                    let samples_per_model_call = (sample_rate as f32 * model_duration) as usize;
-                    let num_splits = ((left_samples.len() as f32) / samples_per_model_call as f32).ceil() as i32;
-
-                    let mut sample_splits = vec![];
-                    let mut event_splits = vec![];
-                    let mut sample_name_split = vec![];
-                    for split in 0..num_splits {
-                        let start_frame = split * num_model_outputs as i32;
-                        let start_sample = (split * samples_per_model_call as i32) as usize;
-                        let samples_to_copy = samples_per_model_call.min(left_samples.len() - start_sample);
-                        let num_frames_with_backing_samples = ((samples_to_copy as f32 / samples_per_model_call as f32) * (num_model_outputs as f32)).ceil() as i32;
-                        debug!["Copying {} samples starting at {} for split {}", samples_to_copy, start_sample, split];
-
-                        let frame_events = convert_to_frame_events(&events, num_model_outputs, start_frame, num_frames_with_backing_samples);
-                        let mut split_samples_left = vec![0.0; samples_per_model_call as usize];
-                        let mut split_samples_right = vec![0.0; samples_per_model_call as usize];
-
-                        for i in 0..samples_to_copy {
-                            split_samples_left[i] = left_samples[start_sample + i];
-                            split_samples_right[i] = right_samples[start_sample + i];
-                        }
-
-                        // Only include it if we have more than half of the samples so we do not train on too much silence
-                        if samples_to_copy > samples_per_model_call / 2 {
-                            sample_splits.push((split_samples_left, split_samples_right));
-                            event_splits.push(frame_events);
-                            sample_name_split.push(format!["{}+{}", sample_file_name, split]);
-                        }
-                    }
-
-                    (sample_splits, event_splits, sample_name_split)
-                })
-                .fold((Vec::new(), Vec::new(), Vec::new()), |(mut acc_a, mut acc_b, mut acc_c), (a, b, c)| {
-                    acc_a.extend(a.into_iter().collect::<Vec<_>>());
-                    acc_b.extend(b.into_iter().collect::<Vec<_>>());
-                    acc_c.extend(c.into_iter().collect::<Vec<_>>());
-                    (acc_a, acc_b, acc_c)
-                });
-
-            (audio_samples, events_by_frame, sample_names)
+            (sample_splits, event_splits, sample_name_split)
         })
-    });
+        .fold((Vec::new(), Vec::new(), Vec::new()), |(mut acc_a, mut acc_b, mut acc_c), (a, b, c)| {
+            acc_a.extend(a.into_iter().collect::<Vec<_>>());
+            acc_b.extend(b.into_iter().collect::<Vec<_>>());
+            acc_c.extend(c.into_iter().collect::<Vec<_>>());
+            (acc_a, acc_b, acc_c)
+        });
 
+    EventsAndAudio {
+        samples: audio_samples,
+        events: events_by_frame,
+        sample_names: sample_names,
+    }
+}
+
+fn audio_and_samples_to_python(py: Python, events_and_audio: EventsAndAudio) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let mut audio_results = vec![];
     let mut events_by_frame_results = vec![];
     let mut sample_name_results = vec![];
-    let (all_audio_samples, events_by_frame, sample_names) = all_samples;
+    let (all_audio_samples, events_by_frame, sample_names) = (events_and_audio.samples, events_and_audio.events, events_and_audio.sample_names);
     let iter = all_audio_samples.into_iter()
         .zip(events_by_frame.into_iter())
         .zip(sample_names.into_iter())
@@ -553,6 +559,19 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
         PyList::new(py, &events_by_frame_results).into(),
         PyList::new(py, &sample_name_results).into()
     ))
+}
+
+#[pyfunction]
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+
+    let events_and_audio = py.allow_threads(move || {
+        TOKIO_RUNTIME.block_on(async {
+            load_events_and_audio_rust(&sample_files, sample_rate, model_duration, num_model_outputs, skip_cache).await
+        })
+    });
+
+    audio_and_samples_to_python(py, events_and_audio)
 }
 
 #[pyfunction]
