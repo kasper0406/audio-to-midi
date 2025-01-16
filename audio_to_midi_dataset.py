@@ -295,6 +295,20 @@ class AudioToMidiDatasetLoader:
         midi_events = np.stack(midi_events)
 
         return midi_events, audio_samples, sample_names
+    
+    @classmethod
+    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], skip_cache: bool = False):
+        audio_samples, midi_events, sample_names = modelutil.load_events_and_audio_with_transformations(
+            str(dataset_dir),
+            samples,
+            AudioToMidiDatasetLoader.SAMPLE_RATE,
+            MODEL_AUDIO_LENGTH,
+            num_model_output_frames,
+            skip_cache)
+        audio_samples = np.stack(audio_samples)
+        midi_events = np.stack(midi_events)
+
+        return midi_events, audio_samples, sample_names
 
     def _data_load_thread(
         self,
@@ -340,10 +354,7 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
-
-            # Notice the sample_names can become out of sync in this step
-            midi_events, audio = self.__apply_training_transformations(midi_events, audio)
+            midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load)
 
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])

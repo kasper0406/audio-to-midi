@@ -27,6 +27,8 @@ use half::f16;
 use num_traits::cast::AsPrimitive;
 use futures::TryFutureExt;
 use sha2::{Sha256, Digest};
+use rand::prelude::*;
+use rand_distr::{Distribution, Uniform, Beta};
 
 use log::{debug, error, info, trace, warn};
 
@@ -561,6 +563,109 @@ fn audio_and_samples_to_python(py: Python, events_and_audio: EventsAndAudio) -> 
     ))
 }
 
+fn cut_mix_transformation(events_and_audio: &mut EventsAndAudio, cut_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(cut_probability * (size as f64)) as usize {
+        let a = sample_range.sample(&mut rng);
+        let b = sample_range.sample(&mut rng);
+
+        let min_cut = 0.01;
+        let cut_start = Uniform::from(0.0..(1.0 - min_cut)).sample(&mut rng);
+        let cut_length = Uniform::from(min_cut..(1.0 - cut_start)).sample(&mut rng);
+
+        debug!["Applying CutMix from at (a, b) = ({}, {}) from {} -> {}", a, b, cut_start, cut_start + cut_length];
+
+        let num_samples = events_and_audio.samples[a].0.len() as f64;
+        let audio_cut_start = (cut_start * num_samples) as usize;
+        let audio_cut_end = ((cut_start + cut_length) * num_samples) as usize;
+    
+        let (b_samples_left, b_samples_right) = {
+            let (samples_left, samples_right) = &events_and_audio.samples[b];
+            (
+                samples_left[audio_cut_start..audio_cut_end].to_vec(),
+                samples_right[audio_cut_start..audio_cut_end].to_vec(),
+            )
+        };
+
+        let num_frames = events_and_audio.events[a].len() as f64;
+        let event_cut_start = (cut_start * num_frames) as usize;
+        let event_cut_end = ((cut_start + cut_length) * num_frames) as usize;
+
+        let events_to_copy = {
+            let copy_len = event_cut_end - event_cut_start;
+            let num_events = events_and_audio.events[a][0].len();
+            let mut events_to_copy = vec![vec![0.0; num_events]; copy_len];
+
+            for i in event_cut_start..event_cut_end {
+                for event_idx in 0..events_and_audio.events[a][i].len() {
+                    events_to_copy[i - event_cut_start][event_idx] = events_and_audio.events[b][i][event_idx];
+                }
+            }
+            events_to_copy
+        };
+
+        let (ref mut left_channel_a, ref mut right_channel_a) = &mut events_and_audio.samples[a];
+        for i in audio_cut_start..audio_cut_end {
+            left_channel_a[i] = b_samples_left[i - audio_cut_start];
+            right_channel_a[i] = b_samples_right[i - audio_cut_start];
+        }
+
+        for i in event_cut_start..event_cut_end {
+            for event_idx in 0..events_and_audio.events[a][i].len() {
+                events_and_audio.events[a][i][event_idx] = events_to_copy[i - event_cut_start][event_idx];
+            }
+        }
+    }
+}
+
+fn rotate_transformation(events_and_audio: &mut EventsAndAudio, rotate_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(rotate_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+        let roll_distance = Uniform::from(0.0..1.0).sample(&mut rng);
+        debug!["Rotating idx {} by {}", idx, roll_distance];
+        
+        let num_samples = events_and_audio.samples[idx].0.len() as f64;
+        let audio_rotations = (roll_distance * num_samples) as usize;
+        let num_frames = events_and_audio.events[idx].len() as f64;
+        let event_rotations = (roll_distance * num_frames) as usize;
+        
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+        left_channel.rotate_right(audio_rotations);
+        right_channel.rotate_right(audio_rotations);
+
+        events_and_audio.events[idx].rotate_right(event_rotations);
+    }
+}
+
+fn transform_for_training(mut events_and_audio: &mut EventsAndAudio) {
+    cut_mix_transformation(&mut events_and_audio, 0.5);
+    rotate_transformation(&mut events_and_audio, 0.5);
+}
+
+#[pyfunction]
+fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+    let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
+
+    let events_and_audio = py.allow_threads(move || {
+        TOKIO_RUNTIME.block_on(async {
+            let mut events_and_audio = load_events_and_audio_rust(&sample_files, sample_rate, model_duration, num_model_outputs, skip_cache).await;
+            transform_for_training(&mut events_and_audio);
+            return events_and_audio
+        })
+    });
+
+    audio_and_samples_to_python(py, events_and_audio)
+}
+
 #[pyfunction]
 fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
@@ -625,6 +730,7 @@ fn modelutil(_py: Python, m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(load_events_and_audio_with_transformations, m)?)?;
     m.add_function(wrap_pyfunction!(stitch_probs, m)?)?;
     m.add_function(wrap_pyfunction!(extract_events, m)?)?;
     m.add_function(wrap_pyfunction!(to_frame_events, m)?)?;
