@@ -28,7 +28,7 @@ use num_traits::cast::AsPrimitive;
 use futures::TryFutureExt;
 use sha2::{Sha256, Digest};
 use rand::prelude::*;
-use rand_distr::{Distribution, Uniform, Beta};
+use rand_distr::{Distribution, Uniform, Normal, Beta};
 
 use log::{debug, error, info, trace, warn};
 
@@ -622,6 +622,64 @@ fn cut_mix_transformation(events_and_audio: &mut EventsAndAudio, cut_probability
     }
 }
 
+fn mixup_transformation(events_and_audio: &mut EventsAndAudio, mixup_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(mixup_probability * (size as f64)) as usize {
+        let a = sample_range.sample(&mut rng);
+        let b = sample_range.sample(&mut rng);
+
+        let lambda = Beta::new(2.0, 2.0).unwrap().sample(&mut rng);
+
+        debug!["Applying MixUp at (a, b) = ({}, {}) with lambda = {}", a, b, lambda];
+
+        let (new_samples_left, new_samples_right) = {
+            let (a_samples_left, a_samples_right) = &events_and_audio.samples[a];
+            let (b_samples_left, b_samples_right) = &events_and_audio.samples[b];
+
+            let mut new_samples_left = vec![0.0; a_samples_left.len()];
+            let mut new_samples_right = vec![0.0; a_samples_right.len()];
+
+            for i in 0..a_samples_left.len() {
+                new_samples_left[i] = lambda * a_samples_left[i] + (1.0 - lambda) * b_samples_left[i];
+                new_samples_right[i] = lambda * a_samples_right[i] + (1.0 - lambda) * b_samples_right[i];
+            }
+
+            (new_samples_left, new_samples_right)
+        };
+
+        let num_frames = events_and_audio.events[a].len();
+        let events_to_copy = {
+            let num_events = events_and_audio.events[a][0].len();
+            let mut events_to_copy = vec![vec![0.0; num_events]; num_frames];
+
+            for i in 0..num_frames {
+                for event_idx in 0..events_and_audio.events[a][i].len() {
+                    let event_val_a = events_and_audio.events[a][i][event_idx];
+                    let event_val_b = events_and_audio.events[b][i][event_idx];
+                    events_to_copy[i][event_idx] = event_val_a.max(event_val_b);
+                }
+            }
+            events_to_copy
+        };
+
+        let (ref mut left_channel_a, ref mut right_channel_a) = &mut events_and_audio.samples[a];
+        for i in 0..left_channel_a.len() {
+            left_channel_a[i] = new_samples_left[i];
+            right_channel_a[i] = new_samples_right[i];
+        }
+
+        for i in 0..num_frames {
+            for event_idx in 0..events_and_audio.events[a][i].len() {
+                events_and_audio.events[a][i][event_idx] = events_to_copy[i][event_idx];
+            }
+        }
+    }
+}
+
 fn rotate_transformation(events_and_audio: &mut EventsAndAudio, rotate_probability: f64) {
     let size = events_and_audio.samples.len();
 
@@ -646,9 +704,102 @@ fn rotate_transformation(events_and_audio: &mut EventsAndAudio, rotate_probabili
     }
 }
 
+fn random_erasing_transformation(events_and_audio: &mut EventsAndAudio, erase_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    let min_erase: f64 = 0.01;
+    let max_erase: f64 = 0.10;
+
+    for _nr in 0..(erase_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+        let erase_start = Uniform::from(0.0..(1.0 - min_erase)).sample(&mut rng);
+        let erase_length = Uniform::from(min_erase..max_erase.min(1.0 - erase_start)).sample(&mut rng);
+        debug!["Erasing idx {} from {} -> {}", idx, erase_start, erase_start + erase_length];
+        
+        let num_samples = events_and_audio.samples[idx].0.len() as f64;
+        let audio_erase_start = (erase_start * num_samples) as usize;
+        let audio_erase_end = ((erase_start + erase_length) * num_samples) as usize;
+        
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+        for i in audio_erase_start..audio_erase_end {
+            left_channel[i] = 0.0;
+            right_channel[i] = 0.0;
+        }
+    }
+}
+
+fn gain_transformation(events_and_audio: &mut EventsAndAudio, gain_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(gain_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+        let gain = Normal::new(1.0f32, 0.25f32).unwrap().sample(&mut rng).min(1.5f32).max(0.5f32);
+        debug!["Gain adjustment for {}: {}", idx, gain];
+        
+        let num_samples = events_and_audio.samples[idx].0.len() as f64;
+        
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+        for i in 0..left_channel.len() {
+            left_channel[i] = left_channel[i] * gain;
+            right_channel[i] = right_channel[i] * gain;
+        }
+    }
+}
+
+fn noise_transformation(events_and_audio: &mut EventsAndAudio, noise_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(noise_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+        let sigma = Uniform::new(0.0, 0.25).sample(&mut rng);
+        let noise_distr = Normal::new(0.0f32, sigma).unwrap();
+        debug!["Adding noise for {} with sigma = {}", idx, sigma];
+        
+        let num_samples = events_and_audio.samples[idx].0.len() as f64;
+        
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+        for i in 0..left_channel.len() {
+            left_channel[i] = left_channel[i] + noise_distr.sample(&mut rng);
+            right_channel[i] = right_channel[i] + noise_distr.sample(&mut rng);
+        }
+    }
+}
+
+fn label_smoothing_transformation(events_and_audio: &mut EventsAndAudio) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let alpha = 0.005;
+
+    for idx in 0..size {
+        let num_frames = events_and_audio.events[idx].len();
+        for i in 0..num_frames {
+            for event_idx in 0..events_and_audio.events[idx][i].len() {
+                let mut current_value = events_and_audio.events[idx][i][event_idx];
+                let mut updated_value = current_value.min(1.0 - alpha).max(alpha);
+                events_and_audio.events[idx][i][event_idx] = updated_value;
+            }
+        }
+    }
+}
+
 fn transform_for_training(mut events_and_audio: &mut EventsAndAudio) {
-    cut_mix_transformation(&mut events_and_audio, 0.5);
-    rotate_transformation(&mut events_and_audio, 0.5);
+    cut_mix_transformation(&mut events_and_audio, 0.6);
+    rotate_transformation(&mut events_and_audio, 0.8);
+    random_erasing_transformation(&mut events_and_audio, 0.6);
+    mixup_transformation(&mut events_and_audio, 0.8);
+    gain_transformation(&mut events_and_audio, 0.8);
+    noise_transformation(&mut events_and_audio, 0.8);
+    label_smoothing_transformation(&mut events_and_audio);
 }
 
 #[pyfunction]
