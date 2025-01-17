@@ -119,6 +119,7 @@ class AudioToMidiDatasetLoader:
         key: jax.random.PRNGKey,
         num_workers: int = 1,
         epochs: int = 1,
+        apply_transformations: bool = True,
     ):
         self.num_model_output_frames = num_model_output_frames
         self.dataset_dir = dataset_dir
@@ -144,7 +145,7 @@ class AudioToMidiDatasetLoader:
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs, apply_transformations=apply_transformations),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -201,6 +202,7 @@ class AudioToMidiDatasetLoader:
         batch_size: int,
         key: jax.random.PRNGKey,
         epochs: int = 1,
+        apply_transformations: bool = True,
     ):
         idx = 0
         epoch = 0
@@ -239,7 +241,10 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load)
+            if apply_transformations:
+                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load)
+            else:
+                midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
 
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])
@@ -510,7 +515,8 @@ if __name__ == "__main__":
 
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
@@ -518,6 +524,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
         batch_size=1,
         prefetch_count=1,
+        # apply_transformations=False,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)

@@ -6,7 +6,7 @@ use num_traits::Zero;
 
 use num_traits::cast::AsPrimitive;
 
-use log::{debug, error, info, trace, warn};
+use log::debug;
 
 pub type MidiEvents = Vec<(u32, u32, u32, u32)>;
 
