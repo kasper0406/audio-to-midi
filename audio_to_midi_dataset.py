@@ -516,7 +516,7 @@ if __name__ == "__main__":
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset_2"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),

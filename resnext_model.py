@@ -12,6 +12,7 @@ import einops
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
+from model import TransformerStack
 from rope import calculate_rope
 
 @jax.jit
@@ -21,6 +22,10 @@ def identity(arg):
 model_config = {
     "dims": [12, 16, 20, 24, 48, 96, 192, 384],
     "depths": [3, 3, 3, 3, 3, 3, 9, 3],
+
+    "num_transformer_layers": 2,
+    "transformer_num_heads": 1,
+    "transformer_dropout_rate": 0.1,
 
     "sdd_rate": 0.1,
 }
@@ -179,8 +184,7 @@ class Decoder(eqx.Module):
         x,
         key: Optional[jax.random.PRNGKey] = None,
     ):  # Probability distribution over the midi events
-        output = jnp.transpose(x)
-        output = jax.vmap(self.norm)(output)
+        output = jax.vmap(self.norm)(x)
 
         logits = jax.vmap(self.decoder_pooling)(output)
         probs = jax.nn.sigmoid(logits)
@@ -192,6 +196,7 @@ class Decoder(eqx.Module):
 
 class OutputSequenceGenerator(eqx.Module):
     layers: list[eqx.nn.Sequential]
+    transformer_stack: TransformerStack
     decoder: Decoder
 
     def __init__(
@@ -199,7 +204,7 @@ class OutputSequenceGenerator(eqx.Module):
         conf: Dict[str, any],
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        layers_key, decoder_key = _split_key(key, 2)
+        layers_key, decoder_key, transformer_key = _split_key(key, 3)
 
         dims = conf["dims"]
         hidden_dims = [d * 4 for d in dims]
@@ -230,23 +235,50 @@ class OutputSequenceGenerator(eqx.Module):
             ]))
             depth_count += depths[i]
         
+        self.transformer_stack = TransformerStack(
+            num_layers=conf["num_transformer_layers"],
+            attention_size=dims[-1],
+            intermediate_size=4 * dims[-1],
+            num_heads=conf["transformer_num_heads"],
+            dropout_rate=conf["transformer_dropout_rate"],
+            stochastic_depth_dropout_rate=0.0,
+            key=transformer_key,
+        )
+
         self.decoder = Decoder(dims[-1], key=decoder_key)
 
     def __call__(
         self,
         samples: Float[Array, "frame_seq_len frame_size"],
         state,
+        cos_freq: jax.Array,
+        sin_freq: jax.Array,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
         print(f"Enable dropout? {enable_dropout}")
         print(f"Sample shape: {samples.shape}")
-        layer_keys = _split_key(key, num=len(self.layers))
+        resnext_key, transformer_key = _split_key(key, 2)
+        layer_keys = _split_key(resnext_key, num=len(self.layers))
 
+        # Compute ResNext layers
         h = samples
         for layer, layer_key in zip(self.layers, layer_keys):
             h = layer(h, key=layer_key)
+        
+        # Compute Transformer layers
+        h = jnp.transpose(h)
+        mask = jnp.ones(h.shape[0], dtype=jnp.int32)
+        h = self.transformer_stack(
+            cos_freq=cos_freq,
+            sin_freq=sin_freq,
+            inputs=h,
+            inputs_mask=mask,
+            enable_dropout=enable_dropout,
+            key=transformer_key,
+        )
 
+        # Decode the result
         logits, probs = self.decoder(h)
         return (logits, probs), state
 
