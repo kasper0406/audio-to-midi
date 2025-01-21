@@ -35,24 +35,22 @@ def compute_loss_from_output(logits, expected_output):
 
 @eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, cos_freq, sin_freq, audio, expected_outputs, key):
+def compute_loss(model, state, audio, expected_outputs, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     (logits, probs), state = jax.vmap(
-        model, in_axes=(0, None, None, None, 0, None), out_axes=(0, None), axis_name="batch",
-    )(audio, state, cos_freq, sin_freq, batched_keys, True)
+        model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
+    )(audio, state, batched_keys, True)
 
     loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
     return jnp.mean(loss), state
 
-@eqx.filter_vmap(in_axes=(None, eqx.if_array(0), eqx.if_array(0), None, None))
-def compute_model_output_frames(batch_size, model, state, cos_freq, sin_freq):
+@eqx.filter_vmap(in_axes=(None, eqx.if_array(0), eqx.if_array(0)))
+def compute_model_output_frames(batch_size, model, state):
     # TODO(knielsen): Find a better way of doing this
-    (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(
+    (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(
         jnp.zeros((batch_size, 2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
         state,
-        cos_freq,
-        sin_freq
     )
     num_model_output_frames = find_shape_output_logits.shape[1]  # Output 0 is the batch size
     return num_model_output_frames
@@ -67,7 +65,7 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
         batches.append((sample_name, audio, midi_events))
     return batches
 
-def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
@@ -78,18 +76,18 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
 
     @eqx.filter_jit
     @eqx.filter_vmap(
-        in_axes=(eqx.if_array(0), eqx.if_array(0), None, None, None, None),
+        in_axes=(eqx.if_array(0), eqx.if_array(0), None, None),
         out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0))
     )
-    def run_inference_single_model(inference_model, state, cos_freq, sin_freq, audio, midi_events):
+    def run_inference_single_model(inference_model, state, audio, midi_events):
         # Compute the full batched model, even though we only compute one audio sample
         pretend_batch_audio = jnp.zeros((1, *audio.shape))
         pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio)
 
-        pretend_batch_midi_events = jnp.zeros((1, *midi_events.shape))
+        pretend_batch_midi_events = jnp.zeros((11, *midi_events.shape))
         pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
 
-        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, cos_freq, sin_freq)
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state)
         test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
         return logits[0, ...], probs[0, ...], test_losses[0, ...]
 
@@ -100,7 +98,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
         probs_all = []
         test_losses_all = []
         for audio, midi_event in zip(audios, midi_events):
-            logits, probs, test_losses = run_inference_single_model(inference_model, state_ensemble, cos_freq, sin_freq, audio, midi_event)
+            logits, probs, test_losses = run_inference_single_model(inference_model, state_ensemble, audio, midi_event)
 
             if len(logits_all) == 0:
                 # TODO: Nicer way to initialize?
@@ -143,8 +141,8 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, si
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, key, sharding, batch_size)
+def compute_testset_loss(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
+    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, key, sharding, batch_size)
 
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
@@ -165,8 +163,6 @@ def train(
     summary_writer: SummaryWriter,
     model_ensemble,
     state_ensemble,
-    cos_freq: jnp.ndarray,
-    sin_freq: jnp.ndarray,
     tx: optax.GradientTransformation,
     data_loader,
     opt_state_ensemble: optax.OptState,
@@ -212,11 +208,11 @@ def train(
     @eqx.filter_jit
     @eqx.filter_vmap(
         # TODO: Handle vmap'ed keys
-        in_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None, None, None),
+        in_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None),
         out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None),
     )
     def compute_training_step(
-        flat_model, flat_state, flat_opt_state, cos_freq, sin_freq, audio, expected_outputs, key, tx: optax.GradientTransformation,
+        flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, tx: optax.GradientTransformation,
     ):
         model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
         state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
@@ -226,8 +222,6 @@ def train(
         (loss, update_state), grads = compute_loss(
             model,
             state,
-            cos_freq=cos_freq,
-            sin_freq=sin_freq,
             audio=audio,
             expected_outputs=expected_outputs,
             key=key,
@@ -259,8 +253,6 @@ def train(
             flat_model, 
             flat_state,
             flat_opt_state,
-            cos_freq,
-            sin_freq,
             audio,
             events,
             key,
@@ -311,7 +303,7 @@ def train(
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(model_ensemble, state_ensemble, cos_freq, sin_freq, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, eval_key, batch_sharding)
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
                 testset_losses.append(testset_loss)
@@ -455,8 +447,8 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 
 
 def init_model(model, key: jax.random.PRNGKey):
-    head_weight_std = 0.02
-    cnn_weight_std = 0.02
+    head_weight_std = 0.2
+    cnn_weight_std = 0.2
 
     def flatten(lst):
         return [item for sublist in lst for item in sublist]
@@ -538,7 +530,7 @@ def main():
     weight_decay = 1e-8
     num_models = 1
 
-    checkpoint_every = 10
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
     dataset_prefetch_count = 20
@@ -554,8 +546,6 @@ def main():
     h_params["train/total_steps"] = num_steps
     h_params["train/warmup_steps"] = warmup_steps
     summary_writer.add_hparams(h_params, {})
-
-    cos_freq, sin_freq = precompute_frequencies(model_config["dims"][-1], 200)
 
     @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
     def make_ensemble(key):
@@ -638,7 +628,7 @@ def main():
         return tx.init(eqx.filter(model, eqx.is_inexact_array))
     opt_state_ensemble = make_opt_states(audio_to_midi_ensemble)
 
-    num_model_output_frames = compute_model_output_frames(batch_size, audio_to_midi_ensemble, model_states, cos_freq, sin_freq)
+    num_model_output_frames = compute_model_output_frames(batch_size, audio_to_midi_ensemble, model_states)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -658,8 +648,6 @@ def main():
         summary_writer,
         audio_to_midi_ensemble,
         model_states,
-        cos_freq,
-        sin_freq,
         tx,
         dataset_loader_iter,
         opt_state_ensemble,
@@ -669,7 +657,7 @@ def main():
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
         num_steps=num_steps,
-        print_every=1,
+        print_every=25,
         key=training_key,
         testset_loss_every=checkpoint_every,
     )

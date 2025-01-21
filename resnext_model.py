@@ -24,7 +24,7 @@ model_config = {
     "depths": [3, 3, 3, 3, 3, 3, 9, 3],
 
     "num_transformer_layers": 2,
-    "transformer_num_heads": 1,
+    "num_transformer_heads": 1,
     "transformer_dropout_rate": 0.1,
 
     "sdd_rate": 0.1,
@@ -194,9 +194,199 @@ class Decoder(eqx.Module):
             probs,
         )
 
+class FeedForwardBlock(eqx.Module):
+    attention_to_intermediate_proj: eqx.nn.Linear
+    intermediate_to_attention_proj: eqx.nn.Linear
+    dropout: eqx.nn.Dropout
+
+    def __init__(
+        self,
+        attention_size: int,
+        intermediate_size: int,
+        dropout_rate: float,
+        key: jax.random.PRNGKey,
+    ):
+        attention_to_intermediate_key, intermediate_to_attention_key = _split_key(key, 2)
+        self.attention_to_intermediate_proj = eqx.nn.Linear(
+            in_features=attention_size,
+            out_features=2 * intermediate_size,  # x2 due to the glu activation
+            key=attention_to_intermediate_key,
+        )
+        self.intermediate_to_attention_proj = eqx.nn.Linear(
+            in_features=intermediate_size,
+            out_features=attention_size,
+            key=intermediate_to_attention_key,
+        )
+
+        self.dropout = eqx.nn.Dropout(dropout_rate)
+
+    def __call__(
+        self,
+        inputs: Float[Array, "attention_size"],
+        enable_dropout: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "attention_size"]:
+        h = jax.nn.glu(self.attention_to_intermediate_proj(inputs))
+        output = self.intermediate_to_attention_proj(h)
+        output = self.dropout(output, inference=not enable_dropout, key=key)
+        return output
+
+class AttentionBlock(eqx.Module):
+    attention: eqx.nn.MultiheadAttention
+
+    def __init__(
+        self,
+        attention_size: int,  # The attention size
+        num_heads: int,
+        dropout_rate: float,
+        key: jax.random.PRNGKey,
+    ):
+        self.attention = eqx.nn.MultiheadAttention(
+            num_heads=num_heads,
+            query_size=attention_size,  # Defaults for `value_size` and `output_size` automatically assumes `query_size`
+            use_key_bias=True,
+            use_output_bias=True,
+            use_query_bias=True,
+            use_value_bias=True,
+            dropout_p=dropout_rate,
+            key=key,
+        )
+
+    def __call__(
+        self,
+        inputs: Float[Array, "seq_len attention_size"],
+        enable_dropout: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "seq_len attention_size"]:
+        # Self attention across the entire input sequence (nothing is masked)
+        result = self.attention(
+            query=inputs,
+            key_=inputs,
+            value=inputs,
+            inference=not enable_dropout,
+            key=key,
+        )
+        return result
+
+class TransformerLayer(eqx.Module):
+    attention_norm: eqx.nn.RMSNorm
+    attention_block: AttentionBlock
+    feed_forward_norm: eqx.nn.RMSNorm
+    feed_forward_block: FeedForwardBlock
+
+    def __init__(
+        self,
+        attention_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        dropout_rate: float,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        self_attention_key, feed_forward_key = _split_key(key, 2)
+
+        self.attention_block = AttentionBlock(
+            attention_size=attention_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            key=self_attention_key,
+        )
+        self.attention_norm = eqx.nn.RMSNorm(attention_size)
+
+        self.feed_forward_block = FeedForwardBlock(
+            attention_size=attention_size,
+            intermediate_size=intermediate_size,
+            dropout_rate=dropout_rate,
+            key=feed_forward_key,
+        )
+        self.feed_forward_norm = eqx.nn.RMSNorm(attention_size)
+
+    def __call__(
+        self,
+        inputs: Float[Array, "seq_len attention_size"],
+        enable_dropout: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "seq_len attention_size"]:
+        encoder_attention_key, feed_forward_key = _split_key(key, num=2)
+
+        output = self.attention_block(
+            inputs=jax.vmap(self.attention_norm)(inputs),
+            enable_dropout=enable_dropout,
+            key=encoder_attention_key
+        )
+
+        feed_forward_keys = _split_key(feed_forward_key, num=output.shape[0])
+        if enable_dropout:
+            output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
+                jax.vmap(self.feed_forward_norm)(output), enable_dropout, feed_forward_keys,
+            )
+        else:
+            output = jax.vmap(self.feed_forward_block, in_axes=(0, None))(
+                jax.vmap(self.feed_forward_norm)(output), enable_dropout,
+            )
+        return output
+
+class TransformerStack(eqx.Module):
+    layers: list[TransformerLayer]
+    num_layers: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        num_layers: int,
+        attention_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        dropout_rate: float,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        self.num_layers = num_layers
+
+        layer_keys = jax.random.split(key, num_layers)
+        self.layers = []
+        for layer_key in layer_keys:
+            self.layers.append(TransformerLayer(
+                attention_size=attention_size,
+                intermediate_size=intermediate_size,
+                num_heads=num_heads,
+                dropout_rate=dropout_rate,
+                key=layer_key,
+            ))
+
+    def __call__(
+        self,
+        inputs: Float[Array, "frames attention_size"],
+        enable_dropout: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "seq_len attention_size"]:
+        layer_keys = _split_key(key, num=self.num_layers)
+
+        output = inputs
+        for layer, layer_key in zip(self.layers, layer_keys):
+            output = layer(
+                inputs=output,
+                enable_dropout=enable_dropout,
+                key=layer_key,
+            )
+
+        return output
+
+class PositionalEncoder(eqx.Module):
+    embedding: eqx.nn.Embedding
+
+    def __init__(self, max_length: int, attention_dim: int, key: Optional[jax.random.PRNGKey] = None):
+        self.embedding = eqx.nn.Embedding(
+            num_embeddings=max_length,
+            embedding_size=attention_dim,
+            key=key,
+        )
+    
+    def __call__(self, input):
+        # print(f"Input shape: {input.shape[0]}")
+        return jax.vmap(self.embedding)(jnp.arange(input.shape[0]))
+
 class OutputSequenceGenerator(eqx.Module):
     layers: list[eqx.nn.Sequential]
-    transformer_stack: TransformerStack
+    transformer: TransformerStack
+    pos_encoder: PositionalEncoder
     decoder: Decoder
 
     def __init__(
@@ -204,7 +394,7 @@ class OutputSequenceGenerator(eqx.Module):
         conf: Dict[str, any],
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        layers_key, decoder_key, transformer_key = _split_key(key, 3)
+        layers_key, decoder_key, pos_encoding_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]
         hidden_dims = [d * 4 for d in dims]
@@ -234,14 +424,19 @@ class OutputSequenceGenerator(eqx.Module):
                 ],
             ]))
             depth_count += depths[i]
-        
-        self.transformer_stack = TransformerStack(
+
+        self.pos_encoder = PositionalEncoder(
+            max_length=83,
+            attention_dim=dims[-1],
+            key=pos_encoding_key
+        )
+
+        self.transformer = TransformerStack(
             num_layers=conf["num_transformer_layers"],
             attention_size=dims[-1],
-            intermediate_size=4 * dims[-1],
-            num_heads=conf["transformer_num_heads"],
+            intermediate_size=dims[-1] * 4,
+            num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
-            stochastic_depth_dropout_rate=0.0,
             key=transformer_key,
         )
 
@@ -251,8 +446,6 @@ class OutputSequenceGenerator(eqx.Module):
         self,
         samples: Float[Array, "frame_seq_len frame_size"],
         state,
-        cos_freq: jax.Array,
-        sin_freq: jax.Array,
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
@@ -265,18 +458,11 @@ class OutputSequenceGenerator(eqx.Module):
         h = samples
         for layer, layer_key in zip(self.layers, layer_keys):
             h = layer(h, key=layer_key)
-        
+
         # Compute Transformer layers
         h = jnp.transpose(h)
-        mask = jnp.ones(h.shape[0], dtype=jnp.int32)
-        h = self.transformer_stack(
-            cos_freq=cos_freq,
-            sin_freq=sin_freq,
-            inputs=h,
-            inputs_mask=mask,
-            enable_dropout=enable_dropout,
-            key=transformer_key,
-        )
+        h = h + self.pos_encoder(h)
+        h = self.transformer(h, enable_dropout=enable_dropout, key=transformer_key)
 
         # Decode the result
         logits, probs = self.decoder(h)
