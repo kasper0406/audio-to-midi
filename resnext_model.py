@@ -308,22 +308,23 @@ class TransformerLayer(eqx.Module):
     ) -> Float[Array, "seq_len attention_size"]:
         encoder_attention_key, feed_forward_key = _split_key(key, num=2)
 
-        output = self.attention_block(
+        r = self.attention_block(
             inputs=jax.vmap(self.attention_norm)(inputs),
             enable_dropout=enable_dropout,
             key=encoder_attention_key
         )
 
-        feed_forward_keys = _split_key(feed_forward_key, num=output.shape[0])
+        h = inputs + r
+        feed_forward_keys = _split_key(feed_forward_key, num=h.shape[0])
         if enable_dropout:
-            output = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-                jax.vmap(self.feed_forward_norm)(output), enable_dropout, feed_forward_keys,
+            r = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
+                jax.vmap(self.feed_forward_norm)(h), enable_dropout, feed_forward_keys,
             )
         else:
-            output = jax.vmap(self.feed_forward_block, in_axes=(0, None))(
-                jax.vmap(self.feed_forward_norm)(output), enable_dropout,
+            r = jax.vmap(self.feed_forward_block, in_axes=(0, None))(
+                jax.vmap(self.feed_forward_norm)(h), enable_dropout,
             )
-        return output
+        return h + r
 
 class TransformerStack(eqx.Module):
     layers: list[TransformerLayer]
