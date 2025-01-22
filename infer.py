@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import sys
 import argparse
 
-from model import OutputSequenceGenerator, model_config, get_model_metadata
+from resnext_model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader
 import modelutil
 import matplotlib
@@ -157,14 +157,20 @@ def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
         title=f"Probability distribution for {quantity}",
     )
 
-def load_newest_checkpoint(checkpoint_path: Path, model_replication=True):
+def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemble_select: int = 0, model_replication=True):
     num_devices = len(jax.devices())
 
     # The randomness does not matter as we will load a checkpoint model anyways
     key = jax.random.PRNGKey(1234)
-    audio_to_midi, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
-    checkpoint_manager = ocp.CheckpointManager(checkpoint_path, item_names=('params', 'state'))
 
+    # Setup model ensemble    
+    @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
+    def make_ensemble(key):
+        return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
+    ensemble_keys = jax.random.split(key, ensemble_size)
+    audio_to_midi, state = make_ensemble(ensemble_keys) 
+
+    checkpoint_manager = ocp.CheckpointManager(checkpoint_path, item_names=('params', 'state'))
     step_to_restore = checkpoint_manager.latest_step()
     if step_to_restore is None:
         raise "There is no checkpoint to load! Inference will be useless"
@@ -185,8 +191,20 @@ def load_newest_checkpoint(checkpoint_path: Path, model_replication=True):
     )
     model_params = restored_map["params"]
     state = restored_map["state"]
-    
-    audio_to_midi = eqx.combine(model_params, static_model)
+
+    # Select the ensemble member to use
+    def ensemble_selector(path, x):
+        if not eqx.is_array(x):
+            # print(f"Skipping at {path} as it is not an array, value: {x}")
+            return x
+
+        # print(f"Selecting at {path} value {x}")
+        return x[ensemble_select, ...]
+
+    model_params = jax.tree.map_with_path(ensemble_selector, model_params)
+    state = jax.tree.map_with_path(ensemble_selector, state)
+
+    audio_to_midi = eqx.combine(model_params, eqx.filter(OutputSequenceGenerator(model_config, key), lambda x: not eqx.is_array(x)))
 
     if model_replication:
         # Replicate the model on all JAX devices
@@ -214,7 +232,7 @@ def main():
     # Access the input file path from the parsed arguments
     input_file = args.input_file
 
-    model, state = load_newest_checkpoint("./audio_to_midi_checkpoints")  # Assuming this function exists
+    model, state = load_newest_checkpoint("/Volumes/git/ml/audio-to-midi/audio_to_midi_checkpoints")  # Assuming this function exists
 
     overlap = 0.25
     windowed_samples, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(input_file, overlap=overlap)  # Assuming this function exists

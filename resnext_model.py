@@ -20,10 +20,10 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [12, 16, 20, 24, 48, 96, 192, 384],
-    "depths": [3, 3, 3, 3, 3, 3, 9, 3],
+    "dims": [6, 10, 14, 24, 48, 96, 192, 384],
+    "depths": [3, 3, 3, 3, 3, 3, 27, 3],
 
-    "num_transformer_layers": 2,
+    "num_transformer_layers": 4,
     "num_transformer_heads": 1,
     "transformer_dropout_rate": 0.1,
 
