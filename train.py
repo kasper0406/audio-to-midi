@@ -23,8 +23,8 @@ from collections import defaultdict
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
+from modelutil import DatasetTransfromSettings
 
-from rope import precompute_frequencies
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
@@ -530,6 +530,16 @@ def main():
     weight_decay = 1e-8
     num_models = 1
 
+    transform_settings = DatasetTransfromSettings(
+        cut_probability=0.6,
+        rotate_probability=0.8,
+        random_erasing_probability=0.6,
+        mixup_probability=0.8,
+        gain_probability=0.8,
+        noise_probability=0.8,
+        label_smoothing_alpha=0.005,
+    )
+
     checkpoint_every = 1000
     checkpoints_to_keep = 3
     dataset_num_workers = 2
@@ -640,6 +650,7 @@ def main():
         key=dataset_loader_key,
         num_workers=dataset_num_workers,
         epochs=100000,
+        transform_settings=transform_settings,
     )
     dataset_loader_iter = iter(dataset_loader)
 

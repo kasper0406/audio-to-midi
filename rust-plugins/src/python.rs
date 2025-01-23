@@ -774,11 +774,9 @@ fn noise_transformation(events_and_audio: &mut EventsAndAudio, noise_probability
     }
 }
 
-fn label_smoothing_transformation(events_and_audio: &mut EventsAndAudio) {
+fn label_smoothing_transformation(events_and_audio: &mut EventsAndAudio, alpha: f32) {
     let size = events_and_audio.samples.len();
-
     let sample_range = Uniform::from(0..size);
-    let alpha = 0.005;
 
     for idx in 0..size {
         let num_frames = events_and_audio.events[idx].len();
@@ -792,24 +790,86 @@ fn label_smoothing_transformation(events_and_audio: &mut EventsAndAudio) {
     }
 }
 
-fn transform_for_training(mut events_and_audio: &mut EventsAndAudio) {
-    cut_mix_transformation(&mut events_and_audio, 0.6);
-    rotate_transformation(&mut events_and_audio, 0.8);
-    random_erasing_transformation(&mut events_and_audio, 0.6);
-    mixup_transformation(&mut events_and_audio, 0.8);
-    gain_transformation(&mut events_and_audio, 0.8);
-    noise_transformation(&mut events_and_audio, 0.8);
-    label_smoothing_transformation(&mut events_and_audio);
+#[derive(Debug, Copy, Clone)]
+#[pyclass]
+struct DatasetTransfromSettings {
+    #[pyo3(get, set)]
+    cut_probability: f64,
+
+    #[pyo3(get, set)]
+    rotate_probability: f64,
+
+    #[pyo3(get, set)]
+    random_erasing_probability: f64,
+
+    #[pyo3(get, set)]
+    mixup_probability: f64,
+
+    #[pyo3(get, set)]
+    gain_probability: f64,
+
+    #[pyo3(get, set)]
+    noise_probability: f64,
+
+    #[pyo3(get, set)]
+    label_smoothing_alpha: f32,
+}
+
+#[pymethods]
+impl DatasetTransfromSettings {
+    #[new]
+    fn new(
+        cut_probability: f64,
+        rotate_probability: f64,
+        random_erasing_probability: f64,
+        mixup_probability: f64,
+        gain_probability: f64,
+        noise_probability: f64,
+        label_smoothing_alpha: f32,
+    ) -> Self {
+        DatasetTransfromSettings {
+            cut_probability,
+            rotate_probability,
+            random_erasing_probability,
+            mixup_probability,
+            gain_probability,
+            noise_probability,
+            label_smoothing_alpha,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DatasetTransfromSettings(cut_probability={}, rotate_probability={}, random_erasing_probability={}, mixup_probability={}, gain_probability={}, noise_probability={}, label_smoothing_alpha={})",
+            self.cut_probability,
+            self.rotate_probability,
+            self.random_erasing_probability,
+            self.mixup_probability,
+            self.gain_probability,
+            self.noise_probability,
+            self.label_smoothing_alpha
+        )
+    }
+}
+
+fn transform_for_training(mut events_and_audio: &mut EventsAndAudio, settings: &DatasetTransfromSettings) {
+    cut_mix_transformation(&mut events_and_audio, settings.cut_probability);
+    rotate_transformation(&mut events_and_audio, settings.rotate_probability);
+    random_erasing_transformation(&mut events_and_audio, settings.random_erasing_probability);
+    mixup_transformation(&mut events_and_audio, settings.mixup_probability);
+    gain_transformation(&mut events_and_audio, settings.gain_probability);
+    noise_transformation(&mut events_and_audio, settings.noise_probability);
+    label_smoothing_transformation(&mut events_and_audio, settings.label_smoothing_alpha);
 }
 
 #[pyfunction]
-fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, settings: DatasetTransfromSettings, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let events_and_audio = py.allow_threads(move || {
         TOKIO_RUNTIME.block_on(async {
             let mut events_and_audio = load_events_and_audio_rust(&sample_files, sample_rate, model_duration, num_model_outputs, skip_cache).await;
-            transform_for_training(&mut events_and_audio);
+            transform_for_training(&mut events_and_audio, &settings);
             return events_and_audio
         })
     });
@@ -878,6 +938,8 @@ fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyR
 #[pymodule]
 fn modelutil(_py: Python, m: &PyModule) -> PyResult<()> {
     env_logger::init();
+
+    m.add_class::<DatasetTransfromSettings>()?;
 
     m.add_function(wrap_pyfunction!(load_full_audio, m)?)?;
     m.add_function(wrap_pyfunction!(load_events_and_audio, m)?)?;

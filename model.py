@@ -12,9 +12,6 @@ import einops
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
-from model import TransformerStack
-from rope import calculate_rope
-
 @jax.jit
 def identity(arg):
     return arg

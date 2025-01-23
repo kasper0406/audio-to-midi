@@ -119,7 +119,7 @@ class AudioToMidiDatasetLoader:
         key: jax.random.PRNGKey,
         num_workers: int = 1,
         epochs: int = 1,
-        apply_transformations: bool = True,
+        transform_settings: Optional[modelutil.DatasetTransfromSettings] = None,
     ):
         self.num_model_output_frames = num_model_output_frames
         self.dataset_dir = dataset_dir
@@ -145,7 +145,7 @@ class AudioToMidiDatasetLoader:
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs, apply_transformations=apply_transformations),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs, transform_settings=transform_settings),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -183,13 +183,14 @@ class AudioToMidiDatasetLoader:
         return midi_events, audio_samples, sample_names
     
     @classmethod
-    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], skip_cache: bool = False):
+    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], transform_settings: modelutil.DatasetTransfromSettings, skip_cache: bool = False):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio_with_transformations(
             str(dataset_dir),
             samples,
             AudioToMidiDatasetLoader.SAMPLE_RATE,
             MODEL_AUDIO_LENGTH,
             num_model_output_frames,
+            transform_settings,
             skip_cache)
         audio_samples = np.stack(audio_samples)
         midi_events = np.stack(midi_events)
@@ -202,7 +203,7 @@ class AudioToMidiDatasetLoader:
         batch_size: int,
         key: jax.random.PRNGKey,
         epochs: int = 1,
-        apply_transformations: bool = True,
+        transform_settings: Optional[modelutil.DatasetTransfromSettings] = None,
     ):
         idx = 0
         epoch = 0
@@ -241,8 +242,8 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            if apply_transformations:
-                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load)
+            if transform_settings is not None:
+                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load, transform_settings)
             else:
                 midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
 
