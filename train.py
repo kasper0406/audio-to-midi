@@ -19,6 +19,7 @@ from functools import reduce
 from more_itertools import chunked
 import numpy as np
 from collections import defaultdict
+from dataclasses import dataclass
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata
@@ -510,6 +511,61 @@ def init_model(model, key: jax.random.PRNGKey):
     return model
 
 
+def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, weight_decay: float, warmup_steps: int, num_steps: int):
+    # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth
+    def depth_extracting_label_fn(tree):
+        def map_fn(path, value):
+            if path[0].name == "layers":
+                # We are inside our Conv-blocks
+                conv_depth = path[1].idx
+                layer_depth = path[3].idx
+
+                # Compute the prefix sum, and add the current layer depth
+                computed_depth = 0
+                for i in range(conv_depth):
+                    computed_depth += model_config["depths"][i]
+                computed_depth += layer_depth
+
+                # print(f"Conv path {path} at depth {computed_depth}")
+                return f"conv_layer|{computed_depth}"
+            elif path[0].name == "transformer":
+                seq_nr = path[2].idx
+                # We are inside the transformer stack
+                # print(f"Transformer path {path} at depth {seq_nr}")
+                return f"transformer_layer|{seq_nr}"
+            else:
+                return f"default|0"
+
+        return jax.tree_util.tree_map_with_path(map_fn, tree)
+
+    def max_depth(acc, value: str):
+        # print(f"Value: {value}, acc: {acc}")
+        layername, depth = value.split("|")
+        depth = int(depth)
+
+        if layername == "conv_layer":
+            return max(acc[0], depth), acc[1]
+        elif layername == "transformer_layer":
+            return acc[0], max(acc[1], depth)
+        else:
+            return acc
+    max_conv_depth, max_transformer_depth = jax.tree_util.tree_reduce(
+        max_depth,
+        depth_extracting_label_fn(model), (0, 0),
+    )
+    print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
+
+    conv_lr_by_depth = { f"conv_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps) for depth in range(max_conv_depth + 1) }
+    transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
+    default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
+    learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
+    tx = optax.multi_transform({
+        depth: optax.adamw(lr_schedule, weight_decay=weight_decay) for depth, lr_schedule in learning_rates_by_depth.items()
+    }, depth_extracting_label_fn)
+
+    return tx, default_lr["default|0"]
+
+
 def main():
     # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
 
@@ -611,26 +667,7 @@ def main():
     audio_to_midi_ensemble = eqx.combine(model_params, static_model)
     model_states = jax.device_put(model_states, replicate_everywhere)
 
-    # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth
-    def depth_extracting_label_fn(tree):
-        def map_fn(path, value):
-            first_seq = None
-            for part in path:
-                if isinstance(part, jax.tree_util.SequenceKey):
-                    first_seq = part
-                    break
-            
-            if first_seq:
-                # print(f"Path {path} at depth {first_seq.idx}")
-                return first_seq.idx
-            return 0  # Default is depth 0 with standard learning rate
-
-        return jax.tree_util.tree_map_with_path(map_fn, tree)
-
-    learning_rates_by_depth = { depth: create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** depth), warmup_steps, num_steps) for depth in range(0, 10) }
-    tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay) for depth, lr_schedule in learning_rates_by_depth.items()
-    }, depth_extracting_label_fn)
+    tx, base_learning_rate_schedule = setup_optimizers(audio_to_midi_ensemble, base_learning_rate, layer_lr_decay, weight_decay, warmup_steps, num_steps)
 
     @eqx.filter_vmap
     def make_opt_states(model):
@@ -663,7 +700,7 @@ def main():
         dataset_loader_iter,
         opt_state_ensemble,
         checkpoint_manager,
-        learning_rate_schedule=learning_rates_by_depth[0],
+        learning_rate_schedule=base_learning_rate_schedule,
         device_mesh=device_mesh,
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
