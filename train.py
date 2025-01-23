@@ -21,7 +21,7 @@ import numpy as np
 from collections import defaultdict
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
-from resnext_model import OutputSequenceGenerator, model_config, get_model_metadata
+from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
 
 from rope import precompute_frequencies

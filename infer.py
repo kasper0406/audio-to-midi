@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import sys
 import argparse
 
-from resnext_model import OutputSequenceGenerator, model_config, get_model_metadata
+from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader
 import modelutil
 import matplotlib
