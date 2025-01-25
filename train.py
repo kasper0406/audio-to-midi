@@ -31,7 +31,9 @@ from tensorboardX import SummaryWriter
 
 @eqx.filter_jit
 def compute_loss_from_output(logits, expected_output):
-    loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=1.0))(logits, expected_output)
+    # loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=1.0))(logits, expected_output)
+    # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=2.0))(logits, expected_output)
+    loss = jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
     return jnp.sum(loss)
 
 @eqx.filter_jit
@@ -579,19 +581,19 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 4 * num_devices
-    num_steps = 10000
+    num_steps = 110_000
     warmup_steps = 1000
-    base_learning_rate = 5 * 1e-5
+    base_learning_rate = 1 * 1e-5
     layer_lr_decay = 0.9
     weight_decay = 1e-8
     num_models = 1
 
     transform_settings = DatasetTransfromSettings(
-        cut_probability=0.6,
+        cut_probability=0.0,
         rotate_probability=0.8,
-        random_erasing_probability=0.6,
-        mixup_probability=0.8,
-        gain_probability=0.8,
+        random_erasing_probability=0.0,
+        mixup_probability=0.0,
+        gain_probability=0.6,
         noise_probability=0.8,
         label_smoothing_alpha=0.005,
     )

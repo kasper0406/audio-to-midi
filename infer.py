@@ -225,6 +225,7 @@ def main():
 
     # Add an argument for the input file
     parser.add_argument("input_file", help="Path to the input audio file.")
+    parser.add_argument("--midi", help="Path to the output MIDI file.", default=None)
 
     # Parse the command-line arguments
     args = parser.parse_args()
@@ -238,7 +239,17 @@ def main():
     windowed_samples, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(input_file, overlap=overlap)  # Assuming this function exists
     _probs, stitched_probs, duration_per_frame = predict_and_stitch(model, state, windowed_samples, window_duration, overlap=overlap) # Assuming this function exists
 
-    print(f"Stitched probs: {stitched_probs}")
+    print(f"Frame count: {stitched_probs.shape[0]}")
+    events = modelutil.extract_events(np.array(stitched_probs))
+    frame_events = modelutil.to_frame_events([events], stitched_probs.shape[0])[0]
+    print(f"Events: {events}")
+    print(f"Frame events: {frame_events}")
+
+    if args.midi:
+        write_midi_file(events, duration_per_frame, args.midi)
+
+    plot_output_probs("Inferred probs", duration_per_frame, stitched_probs)
+    plt.show(block = True)
 
     return
 
