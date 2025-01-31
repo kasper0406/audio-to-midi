@@ -447,6 +447,7 @@ class OutputSequenceGenerator(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
+        samples = samples.astype(jnp.float16)
         print(f"Enable dropout? {enable_dropout}")
         print(f"Sample shape: {samples.shape}")
         resnext_key, transformer_key = _split_key(key, 2)

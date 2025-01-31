@@ -29,23 +29,27 @@ from modelutil import DatasetTransfromSettings
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
-@eqx.filter_jit
-def compute_loss_from_output(logits, expected_output):
-    # loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=1.0))(logits, expected_output)
-    # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=2.0))(logits, expected_output)
+@eqx.filter_jit(donate="all")
+def compute_loss_from_output(logits, expected_output, scale):
+    # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=-1.0))(logits, expected_output)
+    # jax.debug.print("logits = {l}", l=logits)
     loss = jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
-    return jnp.sum(loss)
+    scaled_loss = loss * scale
+    # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
 
-@eqx.filter_jit
+    # loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=2.0))(logits, expected_output)
+    return jnp.sum(scaled_loss)
+
+@eqx.filter_jit(donate="all-except-first")
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, audio, expected_outputs, key):
+def compute_loss(model, state, audio, expected_outputs, scale, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     (logits, probs), state = jax.vmap(
         model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
     )(audio, state, batched_keys, True)
 
-    loss = jax.vmap(compute_loss_from_output)(logits, expected_outputs)
+    loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
 @eqx.filter_vmap(in_axes=(None, eqx.if_array(0), eqx.if_array(0)))
@@ -72,11 +76,12 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
-    @eqx.filter_jit
+    @eqx.filter_jit(donate="all-except-first")
     def testset_loss_function(logits, expected_output):
         loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
         return jnp.sum(loss)
 
+    # @eqx.filter_jit(donate="all-except-first")
     @eqx.filter_jit
     @eqx.filter_vmap(
         in_axes=(eqx.if_array(0), eqx.if_array(0), None, None),
@@ -87,7 +92,7 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
         pretend_batch_audio = jnp.zeros((1, *audio.shape))
         pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio)
 
-        pretend_batch_midi_events = jnp.zeros((11, *midi_events.shape))
+        pretend_batch_midi_events = jnp.zeros((1, *midi_events.shape))
         pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
 
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state)
@@ -208,72 +213,101 @@ def train(
     flat_state, treedef_state = jax.tree_util.tree_flatten(state_ensemble)
     flat_opt_state, treedef_opt_state = jax.tree_util.tree_flatten(opt_state_ensemble)
 
-    @eqx.filter_jit
+    @eqx.filter_jit(donate="all-except-first")
     @eqx.filter_vmap(
         # TODO: Handle vmap'ed keys
-        in_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None),
-        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None),
+        in_axes=(None, eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None),
+        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, eqx.if_array(0), eqx.if_array(0)),
     )
     def compute_training_step(
-        flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, tx: optax.GradientTransformation,
+        tx: optax.GradientTransformation,
+        flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, grad_scale,
     ):
         model = jax.tree_util.tree_unflatten(treedef_model, flat_model)
         state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
         opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
         key, new_key = jax.random.split(key)
-        (loss, update_state), grads = compute_loss(
+        (scaled_loss, update_state), scaled_grads = compute_loss(
             model,
             state,
             audio=audio,
             expected_outputs=expected_outputs,
+            scale=jnp.array(grad_scale, dtype=jnp.float16),
             key=key,
         )
+
+        # max_grad = jax.tree_util.tree_reduce(lambda acc, x: jnp.maximum(acc, jnp.max(jnp.abs(x))), scaled_grads, initializer=0.0)
+        # jax.debug.print("L1 scaled grads: {l1}", l1=max_grad)
+
+        # grads = jax.tree_util.tree_map(lambda g: jnp.clip(g / scale, -1_000, 1_000), scaled_grads)
+        grads = jax.tree_util.tree_map(lambda g: g / grad_scale, scaled_grads)
+        grads_valid = jnp.all(jnp.array(
+            [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
+        ))
 
         updates, update_opt_state = tx.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
         update_model = eqx.apply_updates(model, updates)
 
-        flat_update_model = jax.tree_util.tree_leaves(update_model)
-        flat_update_state = jax.tree_util.tree_leaves(update_state)
-        flat_update_opt_state = jax.tree_util.tree_leaves(update_opt_state)
+        update_flat_model = jax.tree_util.tree_leaves(update_model)
+        update_flat_opt_state = jax.tree_util.tree_leaves(update_opt_state)
+        update_update_state = jax.tree_util.tree_leaves(update_state)
 
-        return loss, flat_update_model, flat_update_state, flat_update_opt_state, new_key
+        loss = scaled_loss / grad_scale
+        return loss, update_flat_model, update_update_state, update_flat_opt_state, new_key, grads_valid, scaled_loss
 
+    recovery_model = jax.tree.flatten(flat_model)
+    recovery_state = jax.tree.flatten(flat_state)
+    recovery_opt_state = jax.tree.flatten(flat_opt_state)
+    grad_scale = 1.0
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
 
+        print("Putting data on GPU...")
         (audio, events) = jax.device_put(
-            (batch["audio"], batch["events"]),
+            (batch["audio"].astype(jnp.float16), batch["events"].astype(jnp.float16)),
             batch_sharding,
         )
 
         # Keep the old model state in memory until we are sure the loss is not nan
-        recovery_model = flat_model
-        recovery_state = flat_state
-        recovery_opt_state = flat_opt_state
+        # make sure to copy them so we can do donation
+        if step % 100 == 0:
+            recovery_model = jax.tree.flatten(flat_model)
+            recovery_state = jax.tree.flatten(flat_state)
+            recovery_opt_state = jax.tree.flatten(flat_opt_state)
 
-        loss, flat_model, flat_state, flat_opt_state, key = compute_training_step(
+        print(f"Executing step {step}")
+        loss, flat_model, flat_state, flat_opt_state, key, grads_valid, scaled_loss = compute_training_step(
+            tx,
             flat_model, 
             flat_state,
             flat_opt_state,
             audio,
             events,
             key,
-            tx,
+            jnp.array(grad_scale, dtype=jnp.float16),
         )
-        step_end_time = time.time()
+        print(f"Finished executing step {step}")
 
-        if jnp.any(jnp.isnan(loss)):
-            print(f"Encountered NAN loss at step {step}. Trying to recover!")
+        if not np.all(grads_valid) or not np.all(np.isfinite(loss)):
+            new_grad_scale = grad_scale / 2
+            print(f"Encountered NAN/inf loss at step {step}, loss = {loss}. Trying to recover! Gradscale {grad_scale} -> {new_grad_scale}")
+
+            grad_scale = new_grad_scale
             flat_model = recovery_model
             flat_state = recovery_state
             flat_opt_state = recovery_opt_state
             continue
 
+        if scaled_loss < 20_000: # TODO: Make this configurable
+            new_grad_scale = grad_scale * 2
+            print(f"Grad scale: {grad_scale} -> {new_grad_scale}")
+            grad_scale = new_grad_scale
+
         if checkpoint_manager.should_save(step):
             model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
             state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
-            filtered_model = eqx.filter(model_ensemble, eqx.is_array)
+            filtered_model = eqx.filter(model_ensemble, eqx.is_inexact_array)
             checkpoint_manager.save(
                 step,
                 args=ocp.args.Composite(
@@ -512,6 +546,12 @@ def init_model(model, key: jax.random.PRNGKey):
 
     return model
 
+def change_fp_precision(model, dtype):
+    def to_dtype(leaf):
+        if eqx.is_inexact_array(leaf):
+            return leaf.astype(dtype)
+        return leaf
+    return jax.tree_util.tree_map(to_dtype, model)
 
 def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, weight_decay: float, warmup_steps: int, num_steps: int):
     # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth
@@ -562,15 +602,14 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
     learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
     tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay) for depth, lr_schedule in learning_rates_by_depth.items()
+        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3) for depth, lr_schedule in learning_rates_by_depth.items()
     }, depth_extracting_label_fn)
+    tx = optax.chain(tx, optax.clip_by_global_norm(3.0))
 
     return tx, default_lr["default|0"]
 
 
 def main():
-    # os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
-
     current_directory = Path(__file__).resolve().parent
     dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/test/")
     testset_dirs = {
@@ -580,20 +619,20 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 4 * num_devices
-    num_steps = 110_000
+    batch_size = 128 * num_devices
+    num_steps = 150_000
     warmup_steps = 1000
-    base_learning_rate = 1 * 1e-5
-    layer_lr_decay = 0.9
-    weight_decay = 1e-8
+    base_learning_rate = 1 * 1e-4
+    layer_lr_decay = 1.0
+    weight_decay = 0.02
     num_models = 1
 
     transform_settings = DatasetTransfromSettings(
-        cut_probability=0.0,
-        rotate_probability=0.8,
-        random_erasing_probability=0.0,
-        mixup_probability=0.0,
-        gain_probability=0.6,
+        cut_probability=0.4,
+        rotate_probability=0.9,
+        random_erasing_probability=0.3,
+        mixup_probability=0.6,
+        gain_probability=0.8,
         noise_probability=0.8,
         label_smoothing_alpha=0.005,
     )
@@ -622,6 +661,7 @@ def main():
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
     init_model(audio_to_midi_ensemble, key=model_init_key_2)
+    audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=jnp.float16)
     print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
@@ -716,8 +756,18 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.9'
+    os.environ['XLA_FLAGS'] = (
+        '--xla_gpu_enable_triton_gemm=true '
+        '--xla_gpu_enable_latency_hiding_scheduler=true '
+        '--xla_gpu_enable_highest_priority_async_stream=true '
+        '--xla_gpu_all_reduce_combine_threshold_bytes=51200 '
+        '--xla_gpu_graph_level=0 '
+    )
+
+    # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.config.update("jax_threefry_partitionable", True)
+    jax.config.update("jax_default_matmul_precision", "F16_F16_F32")
 
     # with jax.profiler.trace("/tmp/jax-trace"):
     main()

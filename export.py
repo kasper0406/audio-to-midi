@@ -2,7 +2,6 @@ from pathlib import Path
 
 import equinox as eqx
 import jax
-import numpy as np
 import equinox.internal as eqxi
 import jax
 from jax._src.lib.mlir import ir
@@ -10,9 +9,6 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.export import export
 
 from infer import load_newest_checkpoint
-from model import model_config
-from audio_to_midi_dataset import AudioToMidiDatasetLoader
-from functools import partial
 import jax.numpy as jnp
 
 import coremltools as ct
