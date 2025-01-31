@@ -82,8 +82,18 @@ class AudioToMidiSource(grain.RandomAccessDataSource):
         return int(len(self.all_sample_names) / self.mini_batch_size)
 
 
-def extend_batch_fn(mini_batches):
-    return jax.tree_util.tree_map(lambda *xs: np.concatenate(xs, axis=0), *mini_batches)
+def collect_and_crop_batch(desired_batch_size: int):
+    def crop_or_pad(*xs):
+        batched = np.concatenate(xs, axis=0)
+        if batched.shape[0] < desired_batch_size:
+            padded = np.zeros(tuple([desired_batch_size] + list(batched.shape[1:])))
+            padded[0:batched.shape[0], ...] = batched
+            batched = padded
+        return batched[:desired_batch_size]
+
+    def extend_batch_fn(mini_batches):
+        return jax.tree_util.tree_map(crop_or_pad, *mini_batches)
+    return extend_batch_fn
 
 
 def create_dataset_loader(
@@ -111,12 +121,12 @@ def create_dataset_loader(
             .seed(seed)
             .repeat(num_epochs)
             .shuffle()
-            .batch(batch_size=max(1, int(batch_size / mini_batch_size)), batch_fn=extend_batch_fn)
+            .batch(batch_size=max(1, int(batch_size / mini_batch_size)), batch_fn=collect_and_crop_batch(batch_size))
     )
 
     iter_dataset = dataset.to_iter_dataset(grain.ReadOptions(
-        num_threads=2,
-        prefetch_buffer_size=10,
+        num_threads=1,
+        prefetch_buffer_size=4,
     )).prefetch(grain.MultiprocessingOptions(
         num_workers=num_workers,
         # enable_profiling=True,

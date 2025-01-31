@@ -5,6 +5,7 @@ import os
 import time
 import sys
 from typing import Dict
+import copy
 
 import equinox as eqx
 import jax
@@ -68,7 +69,8 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for sample_name in sample_names:
-        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], skip_cache=True)
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_A
+UDIO_LENGTH, skip_cache=True)
         batches.append((sample_name, audio, midi_events))
     return batches
 
@@ -256,9 +258,16 @@ def train(
         loss = scaled_loss / grad_scale
         return loss, update_flat_model, update_update_state, update_flat_opt_state, new_key, grads_valid, scaled_loss
 
-    recovery_model = jax.tree.flatten(flat_model)
-    recovery_state = jax.tree.flatten(flat_state)
-    recovery_opt_state = jax.tree.flatten(flat_opt_state)
+    def copy_pytree(tree):
+        def copy_leaf(x):
+            if isinstance(x, jnp.ndarray):
+                return np.copy(x) # Copy in main memory
+            return copy.deepcopy(x)
+        return jax.tree.map(copy_leaf, tree)
+
+    recovery_model = copy_pytree(flat_model)
+    recovery_state = copy_pytree(flat_state)
+    recovery_opt_state = copy_pytree(flat_opt_state)
     grad_scale = 1.0
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
@@ -269,9 +278,9 @@ def train(
         # Keep the old model state in memory until we are sure the loss is not nan
         # make sure to copy them so we can do donation
         if step % 100 == 0:
-            recovery_model = jax.tree.flatten(flat_model)
-            recovery_state = jax.tree.flatten(flat_state)
-            recovery_opt_state = jax.tree.flatten(flat_opt_state)
+            recovery_model = copy_pytree(flat_model)
+            recovery_state = copy_pytree(flat_state)
+            recovery_opt_state = copy_pytree(flat_opt_state)
 
         # print(f"Executing step {step}")
         loss, flat_model, flat_state, flat_opt_state, key, grads_valid, scaled_loss = compute_training_step(
@@ -296,7 +305,7 @@ def train(
             flat_opt_state = recovery_opt_state
             continue
 
-        if scaled_loss < 20_000: # TODO: Make this configurable
+        if scaled_loss < 10_000: # TODO: Make this configurable
             new_grad_scale = grad_scale * 2
             print(f"Grad scale: {grad_scale} -> {new_grad_scale}")
             grad_scale = new_grad_scale
@@ -636,7 +645,7 @@ def main():
 
     checkpoint_every = 1000
     checkpoints_to_keep = 3
-    dataset_num_workers = 8
+    dataset_num_workers = 4
 
     main_key = jax.random.PRNGKey(1234)
     model_init_key, model_init_key_2, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=5)
