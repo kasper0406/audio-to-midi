@@ -169,12 +169,12 @@ class AudioToMidiDatasetLoader:
                 time.sleep(1.0)
 
     @classmethod
-    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], skip_cache: bool = False):
+    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sample_rate: int, audio_duration: float, skip_cache: bool = False):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio(
             str(dataset_dir),
             samples,
-            AudioToMidiDatasetLoader.SAMPLE_RATE,
-            MODEL_AUDIO_LENGTH,
+            sample_rate,
+            audio_duration,
             num_model_output_frames,
             skip_cache)
         audio_samples = np.stack(audio_samples)
@@ -183,12 +183,12 @@ class AudioToMidiDatasetLoader:
         return midi_events, audio_samples, sample_names
     
     @classmethod
-    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], transform_settings: modelutil.DatasetTransfromSettings, skip_cache: bool = False):
+    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sample_rate: int, audio_duration: float, transform_settings: modelutil.DatasetTransfromSettings, skip_cache: bool = False):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio_with_transformations(
             str(dataset_dir),
             samples,
-            AudioToMidiDatasetLoader.SAMPLE_RATE,
-            MODEL_AUDIO_LENGTH,
+            sample_rate,
+            audio_duration,
             num_model_output_frames,
             transform_settings,
             skip_cache)
@@ -243,9 +243,9 @@ class AudioToMidiDatasetLoader:
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
             if transform_settings is not None:
-                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load, transform_settings)
+                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load, AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, transform_settings)
             else:
-                midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
+                midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH)
 
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])
@@ -348,7 +348,7 @@ class AudioToMidiDatasetLoader:
             csv_no_audio = label_names - audio_names
             raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
-        return np.asarray(list(sorted(audio_names)), object)
+        return list(sorted(audio_names))
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):

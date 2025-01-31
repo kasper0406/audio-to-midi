@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from infer import detailed_event_loss
-from modelutil import DatasetTransfromSettings
+from grain_loader import TransformSettings, AudioToMidiSource, create_dataset_loader
 
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
@@ -52,11 +52,11 @@ def compute_loss(model, state, audio, expected_outputs, scale, key):
     loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
-@eqx.filter_vmap(in_axes=(None, eqx.if_array(0), eqx.if_array(0)))
-def compute_model_output_frames(batch_size, model, state):
+@eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0)))
+def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state):
     # TODO(knielsen): Find a better way of doing this
     (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(
-        jnp.zeros((batch_size, 2, int(AudioToMidiDatasetLoader.SAMPLE_RATE * MODEL_AUDIO_LENGTH))),
+        jnp.zeros((batch_size, 2, int(sample_rate * audio_duration))),
         state,
     )
     num_model_output_frames = find_shape_output_logits.shape[1]  # Output 0 is the batch size
@@ -263,11 +263,8 @@ def train(
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
 
-        print("Putting data on GPU...")
-        (audio, events) = jax.device_put(
-            (batch["audio"].astype(jnp.float16), batch["events"].astype(jnp.float16)),
-            batch_sharding,
-        )
+        # print("Putting data on GPU...")
+        (events, audio) = jax.device_put(batch, batch_sharding)
 
         # Keep the old model state in memory until we are sure the loss is not nan
         # make sure to copy them so we can do donation
@@ -276,7 +273,7 @@ def train(
             recovery_state = jax.tree.flatten(flat_state)
             recovery_opt_state = jax.tree.flatten(flat_opt_state)
 
-        print(f"Executing step {step}")
+        # print(f"Executing step {step}")
         loss, flat_model, flat_state, flat_opt_state, key, grads_valid, scaled_loss = compute_training_step(
             tx,
             flat_model, 
@@ -287,7 +284,7 @@ def train(
             key,
             jnp.array(grad_scale, dtype=jnp.float16),
         )
-        print(f"Finished executing step {step}")
+        # print(f"Finished executing step {step}")
 
         if not np.all(grads_valid) or not np.all(np.isfinite(loss)):
             new_grad_scale = grad_scale / 2
@@ -619,7 +616,7 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 128 * num_devices
+    batch_size = 32 * num_devices
     num_steps = 150_000
     warmup_steps = 1000
     base_learning_rate = 1 * 1e-4
@@ -627,7 +624,7 @@ def main():
     weight_decay = 0.02
     num_models = 1
 
-    transform_settings = DatasetTransfromSettings(
+    transform_settings = TransformSettings(
         cut_probability=0.4,
         rotate_probability=0.9,
         random_erasing_probability=0.3,
@@ -639,8 +636,7 @@ def main():
 
     checkpoint_every = 1000
     checkpoints_to_keep = 3
-    dataset_num_workers = 2
-    dataset_prefetch_count = 20
+    dataset_num_workers = 8
 
     main_key = jax.random.PRNGKey(1234)
     model_init_key, model_init_key_2, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=5)
@@ -709,6 +705,7 @@ def main():
     audio_to_midi_ensemble = eqx.combine(model_params, static_model)
     model_states = jax.device_put(model_states, replicate_everywhere)
 
+    print("Setting up optimizers...")
     tx, base_learning_rate_schedule = setup_optimizers(audio_to_midi_ensemble, base_learning_rate, layer_lr_decay, weight_decay, warmup_steps, num_steps)
 
     @eqx.filter_vmap
@@ -717,18 +714,20 @@ def main():
         return tx.init(eqx.filter(model, eqx.is_inexact_array))
     opt_state_ensemble = make_opt_states(audio_to_midi_ensemble)
 
-    num_model_output_frames = compute_model_output_frames(batch_size, audio_to_midi_ensemble, model_states)
+    sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
+    audio_duration = MODEL_AUDIO_LENGTH
+    num_model_output_frames = compute_model_output_frames(batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
-    dataset_loader = AudioToMidiDatasetLoader(
-        num_model_output_frames=num_model_output_frames,
+    dataset_loader = create_dataset_loader(
         dataset_dir=dataset_dir,
         batch_size=batch_size,
-        prefetch_count=dataset_prefetch_count,
-        key=dataset_loader_key,
         num_workers=dataset_num_workers,
-        epochs=100000,
+        num_epochs=100000,
+        sample_rate=sample_rate,
+        duration=audio_duration,
+        output_divisions=num_model_output_frames,
         transform_settings=transform_settings,
     )
     dataset_loader_iter = iter(dataset_loader)
