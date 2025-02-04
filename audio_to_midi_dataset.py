@@ -210,6 +210,7 @@ class AudioToMidiDatasetLoader:
 
         # Shuffle all samples to make training see all kinds of data
         key, shuffle_key = jax.random.split(key, num=2)
+        all_sample_names = np.array(all_sample_names, dtype=np.object_)
         sample_name_mapping = jax.random.permutation(shuffle_key, len(all_sample_names))
 
         # TODO: Consider to do this nicer.
@@ -224,7 +225,8 @@ class AudioToMidiDatasetLoader:
             key, noise_key = jax.random.split(key, num=2)
 
             # print(f"Loading index {idx} epoch {epoch}")
-            samples_to_load = list(all_sample_names[sample_name_mapping[idx:idx + batch_size]])
+            sample_indices = sample_name_mapping[idx:idx + batch_size]
+            samples_to_load = list(all_sample_names[sample_indices])
             idx = idx + batch_size
             if idx > len(all_sample_names):
                 num_leftover = batch_size - len(samples_to_load)
@@ -514,6 +516,18 @@ if __name__ == "__main__":
     jax.config.update("jax_threefry_partitionable", True)
     key = jax.random.PRNGKey(42)
 
+    transform_settings = modelutil.DatasetTransfromSettings(
+        pan_probability=0.8,
+        channel_switch_probability=0.5,
+        cut_probability=0.4,
+        rotate_probability=0.9,
+        random_erasing_probability=0.3,
+        mixup_probability=0.6,
+        gain_probability=0.8,
+        noise_probability=0.8,
+        label_smoothing_alpha=0.005,
+    )
+
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
@@ -525,7 +539,7 @@ if __name__ == "__main__":
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
         batch_size=1,
         prefetch_count=1,
-        # apply_transformations=False,
+        transform_settings=transform_settings,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)

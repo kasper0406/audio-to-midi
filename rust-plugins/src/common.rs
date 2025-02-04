@@ -59,7 +59,7 @@ where
         ((end_frame as i32) - (start_frame as i32)).max(1) as u32
     };
 
-    let velocity = |activation_prob: f32| -> u32 {
+    let velocity = |_activation_prob: f32| -> u32 {
         // TODO(knielsen): Implement this
         7
     };

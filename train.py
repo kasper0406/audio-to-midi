@@ -69,8 +69,7 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for sample_name in sample_names:
-        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_A
-UDIO_LENGTH, skip_cache=True)
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, skip_cache=True)
         batches.append((sample_name, audio, midi_events))
     return batches
 
@@ -634,6 +633,8 @@ def main():
     num_models = 1
 
     transform_settings = TransformSettings(
+        pan_probability=0.8,
+        channel_switch_probability=0.5,
         cut_probability=0.4,
         rotate_probability=0.9,
         random_erasing_probability=0.3,

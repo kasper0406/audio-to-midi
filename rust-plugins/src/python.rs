@@ -704,6 +704,51 @@ fn rotate_transformation(events_and_audio: &mut EventsAndAudio, rotate_probabili
     }
 }
 
+fn channel_switch_transformation(events_and_audio: &mut EventsAndAudio, channel_switch_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    for _nr in 0..(channel_switch_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+        std::mem::swap(left_channel, right_channel);
+    }
+}
+
+fn pan_transformation(events_and_audio: &mut EventsAndAudio, pan_probability: f64) {
+    let size = events_and_audio.samples.len();
+
+    let sample_range = Uniform::from(0..size);
+    let mut rng = rand::thread_rng();
+
+    let eps = 0.01;
+    let pan_range = Uniform::from(0.0..1.0);
+
+    for _nr in 0..(pan_probability * (size as f64)) as usize {
+        let idx = sample_range.sample(&mut rng);
+
+        let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
+
+        let left_channel_empty = left_channel.iter().all(|s| *s < eps);
+        let right_channel_empty = right_channel.iter().all(|s| *s < eps);
+        if left_channel_empty || right_channel_empty {
+            // Skip panning as we only have one channel playing, and this would
+            // be mixed properly by the gain/channel swap transformations
+            continue;
+        }
+
+        let pan_factor: f32 = pan_range.sample(&mut rng);
+
+        for i in 0..left_channel.len() {
+            left_channel[i] = left_channel[i] * (2.0 * (1.0 - pan_factor)).min(1.0);
+            right_channel[i] = right_channel[i] * (2.0 * pan_factor).min(1.0);
+        }
+    }
+}
+
 fn random_erasing_transformation(events_and_audio: &mut EventsAndAudio, erase_probability: f64) {
     let size = events_and_audio.samples.len();
 
@@ -794,6 +839,12 @@ fn label_smoothing_transformation(events_and_audio: &mut EventsAndAudio, alpha: 
 #[pyclass]
 struct DatasetTransfromSettings {
     #[pyo3(get, set)]
+    pan_probability: f64,
+
+    #[pyo3(get, set)]
+    channel_switch_probability: f64,
+
+    #[pyo3(get, set)]
     cut_probability: f64,
 
     #[pyo3(get, set)]
@@ -819,6 +870,8 @@ struct DatasetTransfromSettings {
 impl DatasetTransfromSettings {
     #[new]
     fn new(
+        pan_probability: f64,
+        channel_switch_probability: f64,
         cut_probability: f64,
         rotate_probability: f64,
         random_erasing_probability: f64,
@@ -828,6 +881,8 @@ impl DatasetTransfromSettings {
         label_smoothing_alpha: f32,
     ) -> Self {
         DatasetTransfromSettings {
+            pan_probability,
+            channel_switch_probability,
             cut_probability,
             rotate_probability,
             random_erasing_probability,
@@ -840,7 +895,19 @@ impl DatasetTransfromSettings {
 
     fn __repr__(&self) -> String {
         format!(
-            "DatasetTransfromSettings(cut_probability={}, rotate_probability={}, random_erasing_probability={}, mixup_probability={}, gain_probability={}, noise_probability={}, label_smoothing_alpha={})",
+            r#"DatasetTransfromSettings(
+                pan_probability={},
+                channel_switch_probability={},
+                cut_probability={},
+                rotate_probability={},
+                random_erasing_probability={},
+                mixup_probability={},
+                gain_probability={},
+                noise_probability={},
+                label_smoothing_alpha={}
+            )"#,
+            self.pan_probability,
+            self.channel_switch_probability,
             self.cut_probability,
             self.rotate_probability,
             self.random_erasing_probability,
@@ -853,6 +920,8 @@ impl DatasetTransfromSettings {
 }
 
 fn transform_for_training(mut events_and_audio: &mut EventsAndAudio, settings: &DatasetTransfromSettings) {
+    pan_transformation(&mut events_and_audio, settings.channel_switch_probability);
+    channel_switch_transformation(&mut events_and_audio, settings.channel_switch_probability);
     cut_mix_transformation(&mut events_and_audio, settings.cut_probability);
     rotate_transformation(&mut events_and_audio, settings.rotate_probability);
     random_erasing_transformation(&mut events_and_audio, settings.random_erasing_probability);

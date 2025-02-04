@@ -14,6 +14,8 @@ from dataclasses import dataclass
 # Wrapper around modelutil.DatasetTransformSettings to make it pickleable
 @dataclass(frozen=True)
 class TransformSettings:
+    pan_probability: float
+    channel_switch_probability: float
     cut_probability: float
     rotate_probability: float
     random_erasing_probability: float
@@ -24,6 +26,8 @@ class TransformSettings:
 
     def to_modelutils(self):
         return modelutil.DatasetTransfromSettings(
+            pan_probability=self.pan_probability,
+            channel_switch_probability=self.channel_switch_probability,
             cut_probability=self.cut_probability,
             rotate_probability=self.rotate_probability,
             random_erasing_probability=self.random_erasing_probability,
@@ -58,8 +62,13 @@ class AudioToMidiSource(grain.RandomAccessDataSource):
         self.audio_duration = audio_duration
         self.mini_batch_size = mini_batch_size
         self.output_divisions = output_divisions
-        self.all_sample_names = AudioToMidiDatasetLoader.load_sample_names(dataset_dir)
         self.transform_settings = transform_settings
+
+        # Do a deterministic permutation of the sample names
+        rng = np.random.default_rng(0xBEEF)
+        all_sample_names = np.array(AudioToMidiDatasetLoader.load_sample_names(dataset_dir), dtype=np.object_)
+        sample_name_mapping = rng.permutation(len(all_sample_names))
+        self.all_sample_names = list(all_sample_names[sample_name_mapping])
 
     def __getitem__(self, idx):
         mini_batch_start_idx = idx * self.mini_batch_size
