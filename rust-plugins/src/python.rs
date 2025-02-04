@@ -425,7 +425,7 @@ fn convert_to_frame_events(events: &MidiEvents, model_output_size: i32, start_fr
 
     for (attack_frame, key, frame_duration, velocity) in events {
         let decay_function = |t: f32| -> f32 {
-            (-0.1 * t).exp().max(0.3) // Do not drop below 0.3 while the note is actually playing
+            (-0.05 * t).exp().max(0.6) // Do not drop below 0.6 while the note is actually playing
         };
 
         let frame_start = (*attack_frame as i32) - start_frame;
@@ -732,8 +732,8 @@ fn pan_transformation(events_and_audio: &mut EventsAndAudio, pan_probability: f6
 
         let (ref mut left_channel, ref mut right_channel) = &mut events_and_audio.samples[idx];
 
-        let left_channel_empty = left_channel.iter().all(|s| *s < eps);
-        let right_channel_empty = right_channel.iter().all(|s| *s < eps);
+        let left_channel_empty = left_channel.iter().all(|s| s.abs() < eps);
+        let right_channel_empty = right_channel.iter().all(|s| s.abs() < eps);
         if left_channel_empty || right_channel_empty {
             // Skip panning as we only have one channel playing, and this would
             // be mixed properly by the gain/channel swap transformations
