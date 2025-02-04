@@ -6,7 +6,7 @@ use num_traits::Zero;
 
 use num_traits::cast::AsPrimitive;
 
-use log::{debug, error, info, trace, warn};
+use log::debug;
 
 pub type MidiEvents = Vec<(u32, u32, u32, u32)>;
 
@@ -48,8 +48,8 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
-    let reactivation_threshold = 0.4 as f32;
-    let activation_threshold = 0.60 as f32;
+    let reactivation_threshold = 0.2 as f32;
+    let activation_threshold = 0.4 as f32;
     let deactivation_threshold = 0.05 as f32;
 
     let mut events: MidiEvents = vec![];

@@ -35,7 +35,7 @@ NUM_VELOCITY_CATEGORIES = 10
 SAMPLES_PER_FFT = 2 ** 12
 WINDOW_OVERLAP = 0.97
 COMPRESSION_FACTOR = None
-FREQUENCY_CUTOFF = 4000
+FREQUENCY_CUTOFF = 16_000
 LINEAR_SCALING = 180
 
 def get_data_prep_config():
@@ -106,6 +106,7 @@ def fft_audio(
 
     return absolute_values
 
+
 class AudioToMidiDatasetLoader:
     SAMPLE_RATE = 2 * FREQUENCY_CUTOFF
 
@@ -118,6 +119,7 @@ class AudioToMidiDatasetLoader:
         key: jax.random.PRNGKey,
         num_workers: int = 1,
         epochs: int = 1,
+        transform_settings: Optional[modelutil.DatasetTransfromSettings] = None,
     ):
         self.num_model_output_frames = num_model_output_frames
         self.dataset_dir = dataset_dir
@@ -143,7 +145,7 @@ class AudioToMidiDatasetLoader:
         worker_keys = jax.random.split(key, num=num_workers)
         for worker_id in range(num_workers):
             worker_thread = threading.Thread(
-                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs),
+                target=partial(self._data_load_thread, all_sample_names=all_sample_names, batch_size=batch_size, key=worker_keys[worker_id], epochs=epochs, transform_settings=transform_settings),
                 daemon=True,
             )
             self._threads.append(worker_thread)
@@ -167,13 +169,29 @@ class AudioToMidiDatasetLoader:
                 time.sleep(1.0)
 
     @classmethod
-    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str]):
+    def load_samples(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sample_rate: int, audio_duration: float, skip_cache: bool = False):
         audio_samples, midi_events, sample_names = modelutil.load_events_and_audio(
             str(dataset_dir),
             samples,
-            AudioToMidiDatasetLoader.SAMPLE_RATE,
-            MODEL_AUDIO_LENGTH,
-            num_model_output_frames)
+            sample_rate,
+            audio_duration,
+            num_model_output_frames,
+            skip_cache)
+        audio_samples = np.stack(audio_samples)
+        midi_events = np.stack(midi_events)
+
+        return midi_events, audio_samples, sample_names
+    
+    @classmethod
+    def load_samples_with_transformations(cls, dataset_dir: Path, num_model_output_frames: int, samples: List[str], sample_rate: int, audio_duration: float, transform_settings: modelutil.DatasetTransfromSettings, skip_cache: bool = False):
+        audio_samples, midi_events, sample_names = modelutil.load_events_and_audio_with_transformations(
+            str(dataset_dir),
+            samples,
+            sample_rate,
+            audio_duration,
+            num_model_output_frames,
+            transform_settings,
+            skip_cache)
         audio_samples = np.stack(audio_samples)
         midi_events = np.stack(midi_events)
 
@@ -185,6 +203,7 @@ class AudioToMidiDatasetLoader:
         batch_size: int,
         key: jax.random.PRNGKey,
         epochs: int = 1,
+        transform_settings: Optional[modelutil.DatasetTransfromSettings] = None,
     ):
         idx = 0
         epoch = 0
@@ -223,7 +242,10 @@ class AudioToMidiDatasetLoader:
 
             # print(f"Loading {len(samples_to_load)} samples")
             # print(f"Actual samplpes: {samples_to_load}")
-            midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load)
+            if transform_settings is not None:
+                midi_events, audio, sample_names = self.load_samples_with_transformations(self.dataset_dir, self.num_model_output_frames, samples_to_load, AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, transform_settings)
+            else:
+                midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH)
 
             audio_batch = np.concatenate([ audio_batch, audio ])
             event_batch = np.concatenate([ event_batch, midi_events ])
@@ -326,7 +348,7 @@ class AudioToMidiDatasetLoader:
             csv_no_audio = label_names - audio_names
             raise ValueError(f"Did not find the same set of labels and samples!, {audio_no_csv}, {csv_no_audio}")
 
-        return np.asarray(list(sorted(audio_names)), object)
+        return list(sorted(audio_names))
 
 
 def plot_time_domain_audio(sample_rate: int, samples: NDArray[jnp.float32]):
@@ -366,7 +388,7 @@ def plot_frequency_domain_audio(
         title=f"Audio signal\n{sample_name}",
     )
     ax1.legend(loc='upper right')
-    ax1.set_ylim(-1, 1)
+    ax1.set_ylim(-5, 5)
     ax1.set_xlim(0, left_samples.shape[0])
     
     x_time_formatter = ticker.FuncFormatter(lambda x, pos: MODEL_AUDIO_LENGTH *  (x / left_samples.shape[0]))
@@ -405,6 +427,8 @@ def plot_output_probs(sample_name: str, duration_per_frame: float, events: Float
     ax1_twin = ax1.twiny()
     ax1_twin.set_xlim(0, events.shape[0])
     ax1_twin.set_xlabel("Frame count")
+
+    return fig
 
 def plot_embedding(
     sample_name: str, embeddings: Float[Array, "frame_count embedding_size"]
@@ -493,13 +517,15 @@ if __name__ == "__main__":
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
+        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset_2"),
+        # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
         batch_size=1,
         prefetch_count=1,
+        # apply_transformations=False,
         key=key,
     )
     dataset_loader_iter = iter(dataset_loader)

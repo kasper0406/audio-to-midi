@@ -2,7 +2,6 @@ from pathlib import Path
 
 import equinox as eqx
 import jax
-import numpy as np
 import equinox.internal as eqxi
 import jax
 from jax._src.lib.mlir import ir
@@ -11,8 +10,6 @@ from jax.export import export
 
 from infer import load_newest_checkpoint
 from model import model_config
-from audio_to_midi_dataset import AudioToMidiDatasetLoader
-from functools import partial
 import jax.numpy as jnp
 
 import coremltools as ct
@@ -20,7 +17,7 @@ from stablehlo_coreml.converter import convert
 from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 
 # TODO: Figure out a way to not hardcode this
-SAMPLE_RATE = 8000.0
+SAMPLE_RATE = 32_000
 DURATION = 2.0
 
 
@@ -65,3 +62,5 @@ if __name__ == "__main__":
 
     print("Exporting the model itself...")
     export_model_to_coreml(model, state)
+
+    print("Done exporting model!")
