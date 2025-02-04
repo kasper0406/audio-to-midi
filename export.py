@@ -9,6 +9,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.export import export
 
 from infer import load_newest_checkpoint
+from model import model_config
 import jax.numpy as jnp
 
 import coremltools as ct
