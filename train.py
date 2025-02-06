@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from infer import detailed_event_loss
+from infer import detailed_event_loss, change_fp_precision
 from grain_loader import TransformSettings, AudioToMidiSource, create_dataset_loader
 
 from metrics import configure_tensorboard
@@ -550,13 +550,6 @@ def init_model(model, key: jax.random.PRNGKey):
     model = eqx.tree_at(get_cnn_biases, model, new_cnn_biases)
 
     return model
-
-def change_fp_precision(model, dtype):
-    def to_dtype(leaf):
-        if eqx.is_inexact_array(leaf):
-            return leaf.astype(dtype)
-        return leaf
-    return jax.tree_util.tree_map(to_dtype, model)
 
 def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, weight_decay: float, warmup_steps: int, num_steps: int):
     # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth

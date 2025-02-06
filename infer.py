@@ -22,11 +22,19 @@ from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZ
 import modelutil
 import matplotlib
 
+def change_fp_precision(model, dtype):
+    def to_dtype(leaf):
+        if eqx.is_inexact_array(leaf):
+            return leaf.astype(dtype)
+        return leaf
+    return jax.tree_util.tree_map(to_dtype, model)
+
 def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     return modelutil.stitch_probs(np.stack(all_probs), overlap, duration_per_frame)
 
 def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
     _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, samples)
+    probs = probs.astype(np.float32)  # Convert probs to f32 to make them compatible with the rust plugin
     duration_per_frame = window_duration / probs.shape[1]
     print(f"Duration per frame: {duration_per_frame}")
     return probs, stitch_output_probs(probs, duration_per_frame, overlap), duration_per_frame
@@ -189,6 +197,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
             state=ocp.args.StandardRestore(state),
         ),
     )
+    print(f"Read model parameters...")
     model_params = restored_map["params"]
     state = restored_map["state"]
 
@@ -216,6 +225,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
         model_params = jax.device_put(model_params, replicate_everywhere)
         audio_to_midi = eqx.combine(model_params, static_model)
 
+    audio_to_midi = change_fp_precision(audio_to_midi, dtype=jnp.float16)
     audio_to_midi = eqx.nn.inference_mode(audio_to_midi)
     return audio_to_midi, state
 

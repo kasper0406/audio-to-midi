@@ -48,9 +48,9 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
-    let reactivation_threshold = 0.2 as f32;
-    let activation_threshold = 0.4 as f32;
-    let deactivation_threshold = 0.05 as f32;
+    let reactivation_threshold = 0.3 as f32;
+    let activation_threshold = 0.5 as f32;
+    let deactivation_threshold = 0.075 as f32;
 
     let mut events: MidiEvents = vec![];
     let [num_frames, num_notes] = *probs.shape() else { todo!("Unsupported probs format") };
@@ -95,7 +95,7 @@ where
                     // We expect the probability of a note to increase (instead of decrease) when a note is re-attacked
                     // We try to figure this out by computing the average probability of the past frames and the next frames
                     let mut should_reactivate = false;
-                    if time_since_activation > 5.0 {
+                    if time_since_activation > 3.0 {
                         let samples = 5;
                         let mut prev_average = 0.0;
                         for i in (frame - samples)..frame {
@@ -123,13 +123,7 @@ where
                     }
                 }
             } else {
-                // The model output quite a bit of noise for bass notes. Only emit them if we are very confident
-                let mut dimish_bass_notes = 0.0;
-                if key < 30 {
-                    dimish_bass_notes += ((30.0 - key as f32) / 30.0) * 0.3;
-                }
-
-                if probs[(frame, key)].as_() > activation_threshold + dimish_bass_notes {
+                if probs[(frame, key)].as_() > activation_threshold {
                     currently_playing[key] = Some((frame, get_activation_prob()));
                 }
             }

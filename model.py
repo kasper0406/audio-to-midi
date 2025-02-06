@@ -17,8 +17,8 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [6, 12, 16, 32, 64, 128, 256, 512],
-    "depths": [3, 3, 3, 3, 3, 3, 27, 3],
+    "dims": [12, 18, 24, 32, 64, 128, 256, 386, 512],
+    "depths": [3, 3, 3, 3, 3, 3, 3, 27, 3],
 
     "num_transformer_layers": 6,
     "num_transformer_heads": 2,
@@ -424,7 +424,7 @@ class OutputSequenceGenerator(eqx.Module):
             depth_count += depths[i]
 
         self.pos_encoder = PositionalEncoder(
-            max_length=83,
+            max_length=150,
             attention_dim=dims[-1],
             key=pos_encoding_key
         )

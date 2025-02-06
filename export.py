@@ -18,17 +18,17 @@ from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 
 # TODO: Figure out a way to not hardcode this
 SAMPLE_RATE = 32_000
-DURATION = 2.0
+DURATION = 5.0
 
 
-def export_model_to_coreml(model, state):
+def export_model_to_coreml(model, state, infer_batch_size: int = 1):
     context = jax_mlir.make_ir_context()
     input_sample_count = int(DURATION * SAMPLE_RATE)
-    example_samples = jnp.zeros((2, input_sample_count))
+    example_samples = jnp.zeros((infer_batch_size, 2, input_sample_count))
 
     @jax.jit
     def infer_fn(samples):
-        return eqxi.finalise_fn(model.predict)(state, samples)
+        return eqxi.finalise_fn(jax.vmap(model.predict))(state, samples)
 
     jax_exported = export(infer_fn)(example_samples)
     hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
@@ -42,10 +42,10 @@ def export_model_to_coreml(model, state):
     )
 
     # Kind of hacky output renaming, but better here then in the app...
-    # spec = coreml_model.get_spec()
-    # ct.utils.rename_feature(spec, "Identity", "logits")
-    # ct.utils.rename_feature(spec, "Identity_1", "probs")
-    # coreml_model = ct.models.model.MLModel(spec, weights_dir=coreml_model.weights_dir)
+    spec = coreml_model.get_spec()
+    ct.utils.rename_feature(spec, "Identity", "logits")
+    ct.utils.rename_feature(spec, "Identity_1", "probs")
+    coreml_model = ct.models.model.MLModel(spec, weights_dir=coreml_model.weights_dir)
 
     coreml_model.save("Audio2Midi.mlpackage")
 
