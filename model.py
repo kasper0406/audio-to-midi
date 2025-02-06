@@ -312,8 +312,8 @@ class TransformerLayer(eqx.Module):
         )
 
         h = inputs + r
-        feed_forward_keys = _split_key(feed_forward_key, num=h.shape[0])
         if enable_dropout:
+            feed_forward_keys = _split_key(feed_forward_key, num=h.shape[0])
             r = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
                 jax.vmap(self.feed_forward_norm)(h), enable_dropout, feed_forward_keys,
             )
