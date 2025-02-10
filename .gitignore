@@ -174,3 +174,4 @@ tf_prepare
 *.tflite
 *.mlpackage
 runs/
+*.mid

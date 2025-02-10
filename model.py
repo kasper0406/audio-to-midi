@@ -18,13 +18,16 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [6, 12, 24, 48, 96, 192, 384, 768],
-    "depths": [3, 3, 3, 3, 3, 3, 21, 3],
+    "dims": [6, 12, 24, 48, 96, 192, 384],
+    # "dims": [12, 24, 48, 96, 192, 384, 768],
+    # "dims": [8, 16, 32, 64, 128, 256, 512, 1024],
+    # "dims": [16, 32, 64, 128, 256, 512, 1024, 2048],
+    "depths": [3, 3, 3, 3, 3, 21, 3],
 
-    "num_transformer_layers": 5,
-    "num_transformer_heads": 2,
-    "attention_size": 512,
-    "compressed_attention_size": 384,
+    "num_transformer_layers": 4,
+    "num_transformer_heads": 1,
+    "attention_size": 384,
+    "compressed_attention_size": 256,
     "transformer_dropout_rate": 0.1,
 
     "sdd_rate": 0.1,
@@ -254,7 +257,7 @@ def dot_product_attention(
 
 
 class SelfAttention(eqx.Module, strict=True):
-    query_down_proj: eqx.nn.Linear
+    query_down_proj: eqx.nn.Linear | None = None
     query_up_proj: eqx.nn.Linear
     kv_down_proj: eqx.nn.Linear
     key_up_proj: eqx.nn.Linear
@@ -279,16 +282,24 @@ class SelfAttention(eqx.Module, strict=True):
     ):
         q_down_key, q_up_key, kv_down_key, key_up_key, value_up_key, out_key = _split_key(key, 6)
 
-        self.query_down_proj = eqx.nn.Linear(
-            input_size,
-            compressed_q_size,
-            key=q_down_key,
-        )
-        self.query_up_proj = eqx.nn.Linear(
-            compressed_q_size,
-            num_heads * head_dim,
-            key=q_up_key,
-        )
+        if compressed_q_size < head_dim:
+            self.query_down_proj = eqx.nn.Linear(
+                input_size,
+                compressed_q_size,
+                key=q_down_key,
+            )
+            self.query_up_proj = eqx.nn.Linear(
+                compressed_q_size,
+                num_heads * head_dim,
+                key=q_up_key,
+            )
+        else:
+            self.query_up_proj = eqx.nn.Linear(
+                input_size,
+                num_heads * head_dim,
+                key=q_up_key,
+            )
+
 
         self.kv_down_proj = eqx.nn.Linear(
             input_size,
@@ -328,7 +339,9 @@ class SelfAttention(eqx.Module, strict=True):
     ) -> Float[Array, "q_seq o_size"]:
         query_seq_length, _ = inputs.shape
 
-        c_q = jax.vmap(self.query_down_proj)(inputs)
+        c_q = inputs
+        if self.query_down_proj:
+            c_q = jax.vmap(self.query_down_proj)(inputs)
         query_heads = calculate_rope(self._project(self.query_up_proj, c_q), rope_freqs)
 
         c_kv = jax.vmap(self.kv_down_proj)(inputs)
@@ -484,7 +497,7 @@ class OutputSequenceGenerator(eqx.Module):
         layers_key, decoder_key, pos_encoding_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]
-        hidden_dims = [d * 4 for d in dims]
+        hidden_dims = [d * 2 for d in dims]
         depths = conf["depths"]
 
         self.layers = []
@@ -519,7 +532,7 @@ class OutputSequenceGenerator(eqx.Module):
             num_layers=conf["num_transformer_layers"],
             attention_size=conf["attention_size"],
             compressed_attention_size=conf["compressed_attention_size"],
-            intermediate_size=dims[-1] * 4,
+            intermediate_size=conf["attention_size"] * 4,
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
             key=transformer_key,

@@ -501,11 +501,18 @@ def init_model(model, key: jax.random.PRNGKey):
     
     head_weight_key, head_bias_key, cnn_weight_key, cnn_bias_key = jax.random.split(key, num=4)
 
+    def extract_field(objs, field: str):
+        res = []
+        for obj in objs:
+            if hasattr(obj, field):
+                res.append(getattr(obj, field))
+        return res
+
     # Initialize head weights
     def is_self_attention(node):
         return isinstance(node, SelfAttention)
     get_head_weights = lambda m: flatten([
-        [x.query_down_proj.weight, x.query_up_proj.weight, x.kv_down_proj.weight, x.key_up_proj.weight, x.value_up_proj.weight, x.output_proj.weight]
+        extract_field([x.query_down_proj, x.query_up_proj, x.kv_down_proj, x.key_up_proj, x.value_up_proj], "weight")
         for x in jax.tree_util.tree_leaves(m, is_leaf=is_self_attention) if is_self_attention(x)
     ])
     head_weights = get_head_weights(model)
@@ -517,7 +524,7 @@ def init_model(model, key: jax.random.PRNGKey):
 
     # Initialize head biases
     get_head_biases = lambda m: flatten([
-        [x.query_down_proj.bias, x.query_up_proj.bias, x.kv_down_proj.bias, x.key_up_proj.bias, x.value_up_proj.bias, x.output_proj.bias]
+        extract_field([x.query_down_proj, x.query_up_proj, x.kv_down_proj, x.key_up_proj, x.value_up_proj], "bias")
         for x in jax.tree_util.tree_leaves(m, is_leaf=is_self_attention) if is_self_attention(x)
     ])
     head_biases = get_head_biases(model)
