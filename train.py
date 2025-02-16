@@ -31,6 +31,10 @@ from rope import precompute_frequencies, RopeFreqs
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
+MODEL_DTYPE = jnp.float32
+FORWARD_DTYPE = jnp.float16
+BACKWARD_DTYPE = jnp.float16
+
 @eqx.filter_jit(donate="all")
 def compute_loss_from_output(logits, expected_output, scale):
     # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=-1.0))(logits, expected_output)
@@ -44,13 +48,15 @@ def compute_loss_from_output(logits, expected_output, scale):
 
 @eqx.filter_jit(donate="all-except-first")
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, audio, rope_freqs, expected_outputs, scale, key):
+def compute_loss(model_back_precision, state, audio, rope_freqs, expected_outputs, scale, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
+    model_back_precision = change_fp_precision(model_back_precision, dtype=FORWARD_DTYPE)
     (logits, probs), state = jax.vmap(
-        model, in_axes=(0, None, None, 0, None), out_axes=(0, None), axis_name="batch",
+        model_back_precision, in_axes=(0, None, None, 0, None), out_axes=(0, None), axis_name="batch",
     )(audio, state, rope_freqs, batched_keys, True)
 
+    logits = logits.astype(dtype=jnp.float32)  # Calculate the actual losses with float32 precision
     loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
@@ -232,8 +238,9 @@ def train(
         opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
         key, new_key = jax.random.split(key)
+        model_backward_dtype = change_fp_precision(model, dtype=BACKWARD_DTYPE)
         (scaled_loss, update_state), scaled_grads = compute_loss(
-            model,
+            model_backward_dtype,
             state,
             audio=audio,
             rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
@@ -251,6 +258,7 @@ def train(
             [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
         ))
 
+        grads = change_fp_precision(grads, dtype=MODEL_DTYPE)
         updates, update_opt_state = tx.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
         update_model = eqx.apply_updates(model, updates)
 
@@ -673,7 +681,7 @@ def main():
     ensemble_keys = jax.random.split(model_init_key, num_models)
     audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
     init_model(audio_to_midi_ensemble, key=model_init_key_2)
-    audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=jnp.float16)
+    audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
     print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"

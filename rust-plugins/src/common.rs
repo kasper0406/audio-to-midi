@@ -48,9 +48,10 @@ pub fn extract_events<T>(probs: &ArrayView2<T>) -> MidiEvents
 where
     T: AsPrimitive<f32>,
 {
-    let reactivation_threshold = 0.3 as f32;
+    let reactivation_gap = 0.1 as f32;
+    let reactivation_threshold = 0.4 as f32;
     let activation_threshold = 0.5 as f32;
-    let deactivation_threshold = 0.075 as f32;
+    let deactivation_threshold = 0.1 as f32;
 
     let mut events: MidiEvents = vec![];
     let [num_frames, num_notes] = *probs.shape() else { todo!("Unsupported probs format") };
@@ -69,7 +70,7 @@ where
         for key in 0..num_notes {
             let get_activation_prob = || -> f32 {
                 let mut activation_prob = probs[(frame, key)].as_();
-                let lookahead = 5;
+                let lookahead = 10;
                 for i in (frame + 1)..num_frames {
                     if probs[(i, key)].as_() > activation_prob {
                         activation_prob = probs[(i, key)].as_();
@@ -95,8 +96,8 @@ where
                     // We expect the probability of a note to increase (instead of decrease) when a note is re-attacked
                     // We try to figure this out by computing the average probability of the past frames and the next frames
                     let mut should_reactivate = false;
-                    if time_since_activation > 3.0 {
-                        let samples = 5;
+                    if time_since_activation > 5.0 {
+                        let samples = 6;
                         let mut prev_average = 0.0;
                         for i in (frame - samples)..frame {
                             prev_average += probs[(i, key)].as_();
@@ -109,7 +110,7 @@ where
                         }
                         next_average /= samples as f32;
 
-                        should_reactivate = next_average - prev_average > 0.05;
+                        should_reactivate = next_average - prev_average > reactivation_gap;
                     }
 
                     if frame < num_frames - 1 && probs[(frame, key)].as_() < probs[(frame + 1, key)].as_() {
