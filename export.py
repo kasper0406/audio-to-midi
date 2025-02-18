@@ -3,7 +3,6 @@ from pathlib import Path
 import equinox as eqx
 import jax
 import equinox.internal as eqxi
-import jax
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 from jax.export import export

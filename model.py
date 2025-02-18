@@ -18,16 +18,18 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [6, 12, 24, 48, 96, 192, 384],
+    # "dims": [6, 12, 24, 48, 96, 192, 384],
+    # "dims": [8, 16, 32, 64, 128, 256, 512],
+    "dims": [8 * (2 ** i) for i in range(7)],
+    # "dims": [10, 20, 40, 80, 160, 320, 640],
     # "dims": [12, 24, 48, 96, 192, 384, 768],
-    # "dims": [8, 16, 32, 64, 128, 256, 512, 1024],
-    # "dims": [16, 32, 64, 128, 256, 512, 1024, 2048],
-    "depths": [3, 3, 3, 3, 3, 21, 3],
+    "depths": [3, 3, 3, 3, 3, 29, 3],
 
     "num_transformer_layers": 4,
     "num_transformer_heads": 1,
-    "attention_size": 384,
-    "compressed_attention_size": 256,
+    "attention_size": 512,
+    "compressed_attention_q_size": 512,
+    "compressed_attention_kv_size": 512,
     "transformer_dropout_rate": 0.1,
 
     "sdd_rate": 0.1,
@@ -282,22 +284,25 @@ class SelfAttention(eqx.Module, strict=True):
     ):
         q_down_key, q_up_key, kv_down_key, key_up_key, value_up_key, out_key = _split_key(key, 6)
 
-        if compressed_q_size < head_dim:
+        if compressed_q_size != input_size:
             self.query_down_proj = eqx.nn.Linear(
                 input_size,
                 compressed_q_size,
                 key=q_down_key,
+                use_bias=False,
             )
             self.query_up_proj = eqx.nn.Linear(
                 compressed_q_size,
                 num_heads * head_dim,
                 key=q_up_key,
+                use_bias=False,
             )
         else:
             self.query_up_proj = eqx.nn.Linear(
                 input_size,
                 num_heads * head_dim,
                 key=q_up_key,
+                use_bias=False,
             )
 
 
@@ -305,24 +310,28 @@ class SelfAttention(eqx.Module, strict=True):
             input_size,
             compressed_kv_size,
             key=kv_down_key,
+            use_bias=False,
         )
 
         self.key_up_proj = eqx.nn.Linear(
             compressed_kv_size,
             num_heads * head_dim,
             key=key_up_key,
+            use_bias=False,
         )
 
         self.value_up_proj = eqx.nn.Linear(
             compressed_kv_size,
             num_heads * head_dim,
             key=value_up_key,
+            use_bias=False,
         )
 
         self.output_proj = eqx.nn.Linear(
             num_heads * head_dim,
             output_size,
             key=out_key,
+            use_bias=False,
         )
         self.dropout = eqx.nn.Dropout(dropout_rate, inference=inference)
 
@@ -376,7 +385,8 @@ class TransformerLayer(eqx.Module):
         self,
         input_size: int,
         attention_size: int,
-        compressed_attention_size: int,
+        compressed_attention_q_size: int,
+        compressed_attention_kv_size: int,
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
@@ -389,8 +399,8 @@ class TransformerLayer(eqx.Module):
             output_size=input_size,
             head_dim=attention_size,
             num_heads=num_heads,
-            compressed_q_size=compressed_attention_size,
-            compressed_kv_size=compressed_attention_size,
+            compressed_q_size=compressed_attention_q_size,
+            compressed_kv_size=compressed_attention_kv_size,
             dropout_rate=dropout_rate,
             key=self_attention_key,
         )
@@ -441,7 +451,8 @@ class TransformerStack(eqx.Module):
         input_size: int,
         num_layers: int,
         attention_size: int,
-        compressed_attention_size: int,
+        compressed_attention_q_size: int,
+        compressed_attention_kv_size: int,
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
@@ -455,7 +466,8 @@ class TransformerStack(eqx.Module):
             self.layers.append(TransformerLayer(
                 input_size=input_size,
                 attention_size=attention_size,
-                compressed_attention_size=compressed_attention_size,
+                compressed_attention_q_size=compressed_attention_q_size,
+                compressed_attention_kv_size=compressed_attention_kv_size,
                 intermediate_size=intermediate_size,
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
@@ -531,7 +543,8 @@ class OutputSequenceGenerator(eqx.Module):
             input_size=dims[-1],
             num_layers=conf["num_transformer_layers"],
             attention_size=conf["attention_size"],
-            compressed_attention_size=conf["compressed_attention_size"],
+            compressed_attention_q_size=conf["compressed_attention_q_size"],
+            compressed_attention_kv_size=conf["compressed_attention_kv_size"],
             intermediate_size=conf["attention_size"] * 4,
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],

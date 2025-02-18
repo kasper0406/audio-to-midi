@@ -513,7 +513,9 @@ def init_model(model, key: jax.random.PRNGKey):
         res = []
         for obj in objs:
             if hasattr(obj, field):
-                res.append(getattr(obj, field))
+                value = getattr(obj, field)
+                if value is not None:
+                    res.append(value)
         return res
 
     # Initialize head weights

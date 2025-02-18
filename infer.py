@@ -35,6 +35,7 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
 
 def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
     rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+    samples = samples.astype(np.float16)
     _logits, probs = jax.vmap(model.predict, in_axes=(None, 0, None))(state, samples, rope_freqs)
     probs = probs.astype(np.float32)  # Convert probs to f32 to make them compatible with the rust plugin
     duration_per_frame = window_duration / probs.shape[1]
