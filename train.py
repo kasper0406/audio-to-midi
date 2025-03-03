@@ -316,7 +316,7 @@ def train(
             flat_opt_state = recovery_opt_state
             continue
 
-        if scaled_loss < 10_000: # TODO: Make this configurable
+        if (scaled_loss < 10_000).all(): # TODO: Make this configurable
             new_grad_scale = grad_scale * 2
             print(f"Grad scale: {grad_scale} -> {new_grad_scale}")
             grad_scale = new_grad_scale
@@ -371,9 +371,10 @@ def train(
             # TODO(knielsen): Refactor this! 
             # TODO: Consider sum of testset losses
             # TODO: Reset optimizer state?
-            # TODO(knielsen): Consider re-enabling recombination?
-            # recombination_key, key = jax.random.split(key, num=2)
-            # model_ensemble = evolve_model_ensemble(model_ensemble, testset_losses[0], recombination_key)
+            recombination_key, key = jax.random.split(key, num=2)
+            ensemble_testset_losses = np.mean(np.stack(testset_losses), axis=0)
+            print(f"Ensemble scores: {ensemble_testset_losses}")
+            model_ensemble = evolve_model_ensemble(model_ensemble, ensemble_testset_losses, recombination_key)
 
     model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
     state_ensemble = jax.tree.unflatten(treedef_state, flat_state)

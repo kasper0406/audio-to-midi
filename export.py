@@ -27,7 +27,7 @@ DURATION = 5.0
 def export_model_to_coreml(model, state):
     context = jax_mlir.make_ir_context()
     input_sample_count = int(DURATION * SAMPLE_RATE)
-    example_samples = jnp.zeros((2, input_sample_count))
+    example_samples = jnp.zeros((2, input_sample_count), dtype=jnp.float16)
 
     rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
 
@@ -100,7 +100,7 @@ if __name__ == "__main__":
         model_replication=False  # Disable model sharding as it is not supported by coremlutils
     )
     
-    test_samples = np.zeros((2, int(DURATION * SAMPLE_RATE)))
+    test_samples = np.zeros((2, int(DURATION * SAMPLE_RATE)), dtype=np.float16)
     rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
     logits, probs = model.predict(state, test_samples, rope_freqs)
     plot_output(probs)
