@@ -76,11 +76,21 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for sample_name in sample_names:
+        # print(f"Loading {sample_name}")
         midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, skip_cache=True)
         batches.append((sample_name, audio, midi_events))
     return batches
 
-def compute_testset_loss_individual(model_ensemble, state_ensemble, rope_freqs: RopeFreqs, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(
+    model_ensemble,
+    state_ensemble,
+    rope_freqs: RopeFreqs,
+    testset_dir: Path,
+    num_model_output_frames: int,
+    key: jax.random.PRNGKey,
+    sharding,
+    batch_size: int = 32,
+):
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
@@ -106,6 +116,8 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, rope_freqs: 
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, rope_freqs)
         test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
         return logits[0, ...], probs[0, ...], test_losses[0, ...]
+
+    generate_visualizations = len(batches) < 30
 
     inference_model = eqx.nn.inference_mode(model_ensemble)
     loss_map = {}
@@ -137,13 +149,15 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, rope_freqs: 
             stitched_probs = np.concatenate(probs, axis=0)
             stitched_events = np.concatenate(midi_events, axis=0)
 
-            detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=True)
+            detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=generate_visualizations)
             test_losses.append(np.mean(np_test_losses))
             hit_rates.append(detailed_loss.hit_rate)
             eventized_diffs.append(detailed_loss.full_diff)
             phantom_note_diffs.append(detailed_loss.phantom_notes_diff)
             missed_note_diffs.append(detailed_loss.missed_notes_diff)
-            visualizations.append(detailed_loss.visualization)
+
+            if generate_visualizations:
+                visualizations.append(detailed_loss.visualization)
 
         loss_map[sample_name] = {
             "loss": np.array(test_losses),
@@ -157,8 +171,26 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, rope_freqs: 
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model_ensemble, state_ensemble, rope_freqs: RopeFreqs, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, rope_freqs, testset_dir, num_model_output_frames, key, sharding, batch_size)
+def compute_testset_loss(
+    model_ensemble,
+    state_ensemble,
+    rope_freqs: RopeFreqs,
+    testset_dir: Path,
+    num_model_output_frames,
+    key: jax.random.PRNGKey,
+    sharding,
+    batch_size: int = 32,
+):
+    per_sample_map = compute_testset_loss_individual(
+        model_ensemble,
+        state_ensemble,
+        rope_freqs,
+        testset_dir,
+        num_model_output_frames,
+        key,
+        sharding,
+        batch_size,
+    )
 
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
@@ -357,7 +389,15 @@ def train(
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(model_ensemble, state_ensemble, rope_freqs, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(
+                    model_ensemble,
+                    state_ensemble,
+                    rope_freqs,
+                    testset_dir,
+                    num_model_output_frames,
+                    eval_key,
+                    batch_sharding,
+                )
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
                 testset_losses.append(testset_loss)
@@ -636,6 +676,7 @@ def main():
     testset_dirs = {
         'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
         'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        'validation_set_generated': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_generated"),
     }
 
     num_devices = len(jax.devices())
