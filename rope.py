@@ -41,8 +41,8 @@ def calculate_rope(x, rope_freqs: RopeFreqs):
     cos = jax.lax.expand_dims(rope_freqs.cos_freq, (1,))[:seq_len]
 
     # Get the even-odd positions from the inputs
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
+    x1 = x[..., 0::2].astype(rope_freqs.cos_freq.dtype)
+    x2 = x[..., 1::2].astype(rope_freqs.cos_freq.dtype)
 
     # Matmul with the rotation matrix
     # [cos_nθ, -sin_nθ] [x1]

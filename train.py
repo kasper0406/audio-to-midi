@@ -51,6 +51,7 @@ def compute_loss(model_back_precision, state, audio, rope_freqs, expected_output
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
     model_back_precision = change_fp_precision(model_back_precision, dtype=FORWARD_DTYPE)
+    audio = audio.astype(dtype=FORWARD_DTYPE)
     (logits, probs), state = jax.vmap(
         model_back_precision, in_axes=(0, None, None, 0, None), out_axes=(0, None), axis_name="batch",
     )(audio, state, rope_freqs, batched_keys, True)
@@ -283,13 +284,12 @@ def train(
         # max_grad = jax.tree_util.tree_reduce(lambda acc, x: jnp.maximum(acc, jnp.max(jnp.abs(x))), scaled_grads, initializer=0.0)
         # jax.debug.print("L1 scaled grads: {l1}", l1=max_grad)
 
-        # grads = jax.tree_util.tree_map(lambda g: jnp.clip(g / scale, -1_000, 1_000), scaled_grads)
+        scaled_grads = change_fp_precision(scaled_grads, dtype=MODEL_DTYPE)
         grads = jax.tree_util.tree_map(lambda g: g / grad_scale, scaled_grads)
         grads_valid = jnp.all(jnp.array(
             [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
         ))
 
-        grads = change_fp_precision(grads, dtype=MODEL_DTYPE)
         updates, update_opt_state = tx.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
         update_model = eqx.apply_updates(model, updates)
 
@@ -433,7 +433,7 @@ def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, 
     )
     return optax.join_schedules(
         schedules=[warmup_fn, cosine_fn],
-        boundaries=[warmup_steps]
+        boundaries=[warmup_steps],
     )
 
 def score_by_checkpoint_metrics(metrics):
@@ -663,9 +663,10 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
     learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
     tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3) for depth, lr_schedule in learning_rates_by_depth.items()
+        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3, b1=0.9, b2=0.999)
+        for depth, lr_schedule in learning_rates_by_depth.items()
     }, depth_extracting_label_fn)
-    tx = optax.chain(tx, optax.clip_by_global_norm(3.0))
+    tx = optax.chain(tx, optax.clip_by_global_norm(1.0))
 
     return tx, default_lr["default|0"]
 
@@ -684,15 +685,15 @@ def main():
     batch_size = 8 * num_devices
     num_steps = 200_000
     warmup_steps = 1000
-    base_learning_rate = 5 * 1e-4
+    base_learning_rate = 1 * 1e-4
     layer_lr_decay = 1.0
-    weight_decay = 0.02
+    weight_decay = 0.005
     model_init_keys = jnp.stack([
         jax.random.key(1),
-        jax.random.key(2),
-        jax.random.key(3),
-        jax.random.key(4),
-        jax.random.key(5),
+        # jax.random.key(2),
+        # jax.random.key(3),
+        # jax.random.key(4),
+        # jax.random.key(5),
     ])
 
     transform_settings = TransformSettings(
@@ -707,7 +708,7 @@ def main():
         label_smoothing_alpha=0.005,
     )
 
-    checkpoint_every = 25
+    checkpoint_every = 20
     checkpoints_to_keep = 3
     dataset_num_workers = 3
 
@@ -729,7 +730,7 @@ def main():
     def make_ensemble(key):
         init_key_1, init_key_2 = jax.random.split(key, num=2)
         model, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, init_key_1)
-        model = init_model(model, key=init_key_2)
+        # model = init_model(model, key=init_key_2)
         return model, state
 
     audio_to_midi_ensemble, model_states = make_ensemble(model_init_keys)
@@ -842,8 +843,8 @@ if __name__ == "__main__":
     )
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-    jax.config.update("jax_threefry_partitionable", True)
-    # jax.config.update("jax_default_matmul_precision", "F16_F16_F32")
+    jax.threefry_partitionable(True)
+    jax.default_matmul_precision("BF16_BF16_BF16")
 
     # with jax.profiler.trace("/tmp/jax-trace"):
     main()

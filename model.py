@@ -18,18 +18,14 @@ def identity(arg):
     return arg
 
 model_config = {
-    # "dims": [6, 12, 24, 48, 96, 192, 384],
-    # "dims": [8, 16, 32, 64, 128, 256, 512],
-    "dims": [8 * (2 ** i) for i in range(7)],
-    # "dims": [10, 20, 40, 80, 160, 320, 640],
-    # "dims": [12, 24, 48, 96, 192, 384, 768],
-    "depths": [3, 3, 3, 3, 3, 29, 3],
+    "dims": [4 * (2 ** i) for i in range(7)],
+    "depths": [3, 3, 3, 3, 3, 21, 3],
 
-    "num_transformer_layers": 4,
-    "num_transformer_heads": 1,
-    "attention_size": 512,
-    "compressed_attention_q_size": 512,
-    "compressed_attention_kv_size": 512,
+    "num_transformer_layers": 8,
+    "num_transformer_heads": 4,
+    "attention_size": 64,
+    "compressed_attention_q_size": 64,
+    "compressed_attention_kv_size": 64,
     "transformer_dropout_rate": 0.1,
 
     "sdd_rate": 0.1,
@@ -99,7 +95,7 @@ class Stem(eqx.Module):
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
         out = self.conv(x)
-        return jax.vmap(self.norm, in_axes=1, out_axes=1)(out)
+        return jax.vmap(self.norm, in_axes=1, out_axes=1)(out.astype(jnp.float32)).astype(out.dtype)
 
 class Downsample(eqx.Module):
     conv: eqx.nn.Conv1d
@@ -116,7 +112,7 @@ class Downsample(eqx.Module):
         self.norm = eqx.nn.LayerNorm(in_channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(x)
+        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(x.astype(jnp.float32)).astype(x.dtype)
         return self.conv(out)
 
 class Block(eqx.Module):
@@ -161,7 +157,7 @@ class Block(eqx.Module):
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
         out = self.depth_conv(x)
-        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(out)
+        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(out.astype(jnp.float32)).astype(out.dtype)
         out = self.point_conv_1(out)
         out = jax.nn.gelu(out)
         out = self.point_conv_2(out)
@@ -189,7 +185,7 @@ class Decoder(eqx.Module):
         x,
         key: Optional[jax.random.PRNGKey] = None,
     ):  # Probability distribution over the midi events
-        output = jax.vmap(self.norm)(x)
+        output = jax.vmap(self.norm)(x.astype(jnp.float32)).astype(x.dtype)
 
         logits = jax.vmap(self.decoder_pooling)(output)
         probs = jax.nn.sigmoid(logits)
@@ -206,20 +202,20 @@ class FeedForwardBlock(eqx.Module):
 
     def __init__(
         self,
-        attention_size: int,
-        intermediate_size: int,
+        hidden_dim: int,
+        intermediate_dim: int,
         dropout_rate: float,
         key: jax.random.PRNGKey,
     ):
         attention_to_intermediate_key, intermediate_to_attention_key = _split_key(key, 2)
         self.attention_to_intermediate_proj = eqx.nn.Linear(
-            in_features=attention_size,
-            out_features=2 * intermediate_size,  # x2 due to the glu activation
+            in_features=hidden_dim,
+            out_features=2 * intermediate_dim,  # x2 due to the glu-like activation
             key=attention_to_intermediate_key,
         )
         self.intermediate_to_attention_proj = eqx.nn.Linear(
-            in_features=intermediate_size,
-            out_features=attention_size,
+            in_features=intermediate_dim,
+            out_features=hidden_dim,
             key=intermediate_to_attention_key,
         )
 
@@ -231,7 +227,10 @@ class FeedForwardBlock(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "attention_size"]:
-        h = jax.nn.glu(self.attention_to_intermediate_proj(inputs))
+        x = self.attention_to_intermediate_proj(inputs)
+        x1, x2 = jnp.split(x, 2, axis=-1)
+        h = jax.nn.gelu(x1) * x2  # GLU-like activation with gelu instead of silu
+
         output = self.intermediate_to_attention_proj(h)
         output = self.dropout(output, inference=not enable_dropout, key=key)
         return output
@@ -248,9 +247,7 @@ def dot_product_attention(
 ) -> Float[Array, "q_seq v_size"]:
     query = query / jnp.sqrt(query.shape[-1])
     logits = jnp.einsum("sd,Sd->sS", query, key_)
-    with jax.numpy_dtype_promotion("standard"):
-        dtype = jnp.result_type(logits.dtype, jnp.float32)
-    weights = jax.nn.softmax(logits.astype(dtype)).astype(logits.dtype)
+    weights = jax.nn.softmax(logits.astype(jnp.float32)).astype(logits.dtype)
 
     if dropout is not None:
         weights = dropout(weights, key=key, inference=inference)
@@ -407,8 +404,8 @@ class TransformerLayer(eqx.Module):
         self.attention_norm = eqx.nn.LayerNorm(input_size)
 
         self.feed_forward_block = FeedForwardBlock(
-            attention_size=input_size,
-            intermediate_size=intermediate_size,
+            hidden_dim=input_size,
+            intermediate_dim=intermediate_size,
             dropout_rate=dropout_rate,
             key=feed_forward_key,
         )
@@ -424,21 +421,22 @@ class TransformerLayer(eqx.Module):
         encoder_attention_key, feed_forward_key = _split_key(key, num=2)
 
         r = self.attention_block(
-            inputs=jax.vmap(self.attention_norm)(inputs),
+            inputs=jax.vmap(self.attention_norm)(inputs.astype(jnp.float32)).astype(inputs.dtype),
             rope_freqs=rope_freqs,
             enable_dropout=enable_dropout,
             key=encoder_attention_key
         )
 
         h = inputs + r
+        normalized_h = jax.vmap(self.feed_forward_norm)(h.astype(jnp.float32)).astype(h.dtype)
         if enable_dropout:
             feed_forward_keys = _split_key(feed_forward_key, num=h.shape[0])
             r = jax.vmap(self.feed_forward_block, in_axes=(0, None, 0))(
-                jax.vmap(self.feed_forward_norm)(h), enable_dropout, feed_forward_keys,
+                normalized_h, enable_dropout, feed_forward_keys,
             )
         else:
             r = jax.vmap(self.feed_forward_block, in_axes=(0, None))(
-                jax.vmap(self.feed_forward_norm)(h), enable_dropout,
+                normalized_h, enable_dropout,
             )
         return h + r
 
@@ -509,7 +507,7 @@ class OutputSequenceGenerator(eqx.Module):
         layers_key, decoder_key, pos_encoding_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]
-        hidden_dims = [d * 2 for d in dims]
+        hidden_dims = [int(d * 4.0) for d in dims]
         depths = conf["depths"]
 
         self.layers = []
@@ -545,7 +543,7 @@ class OutputSequenceGenerator(eqx.Module):
             attention_size=conf["attention_size"],
             compressed_attention_q_size=conf["compressed_attention_q_size"],
             compressed_attention_kv_size=conf["compressed_attention_kv_size"],
-            intermediate_size=conf["attention_size"] * 4,
+            intermediate_size=int(dims[-1] * 2.0),
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
             key=transformer_key,
@@ -572,7 +570,7 @@ class OutputSequenceGenerator(eqx.Module):
         h = samples
         for layer, layer_key in zip(self.layers, layer_keys):
             h = layer(h, key=layer_key)
-        h = jax.vmap(self.norm, in_axes=1, out_axes=1)(h)
+        h = jax.vmap(self.norm, in_axes=1, out_axes=1)(h.astype(jnp.float32)).astype(h.dtype)
 
         # Compute Transformer layers
         h = jnp.transpose(h)
