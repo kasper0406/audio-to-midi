@@ -16,11 +16,12 @@ from mido import MidiFile, MidiTrack, Message, MetaMessage
 from dataclasses import dataclass
 import sys
 import argparse
+import matplotlib
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader
 import modelutil
-import matplotlib
+from rope import precompute_frequencies
 
 def change_fp_precision(model, dtype):
     def to_dtype(leaf):
@@ -33,7 +34,9 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
     return modelutil.stitch_probs(np.stack(all_probs), overlap, duration_per_frame)
 
 def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
-    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0))(state, samples)
+    rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+    samples = samples.astype(np.float16)
+    _logits, probs = jax.vmap(model.predict, in_axes=(None, 0, None))(state, samples, rope_freqs)
     probs = probs.astype(np.float32)  # Convert probs to f32 to make them compatible with the rust plugin
     duration_per_frame = window_duration / probs.shape[1]
     print(f"Duration per frame: {duration_per_frame}")

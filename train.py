@@ -23,12 +23,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
-from model import OutputSequenceGenerator, model_config, get_model_metadata
+from model import OutputSequenceGenerator, model_config, get_model_metadata, SelfAttention
 from infer import detailed_event_loss, change_fp_precision
 from grain_loader import TransformSettings, AudioToMidiSource, create_dataset_loader
+from rope import precompute_frequencies, RopeFreqs
 
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
+
+MODEL_DTYPE = jnp.float32
+FORWARD_DTYPE = jnp.float16
+BACKWARD_DTYPE = jnp.float16
 
 @eqx.filter_jit(donate="all")
 def compute_loss_from_output(logits, expected_output, scale):
@@ -38,27 +43,30 @@ def compute_loss_from_output(logits, expected_output, scale):
     scaled_loss = loss * scale
     # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
 
-    # loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=2.0))(logits, expected_output)
     return jnp.sum(scaled_loss)
 
 @eqx.filter_jit(donate="all-except-first")
 @eqx.filter_value_and_grad(has_aux=True)
-def compute_loss(model, state, audio, expected_outputs, scale, key):
+def compute_loss(model_back_precision, state, audio, rope_freqs, expected_outputs, scale, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
+    model_back_precision = change_fp_precision(model_back_precision, dtype=FORWARD_DTYPE)
+    audio = audio.astype(dtype=FORWARD_DTYPE)
     (logits, probs), state = jax.vmap(
-        model, in_axes=(0, None, 0, None), out_axes=(0, None), axis_name="batch",
-    )(audio, state, batched_keys, True)
+        model_back_precision, in_axes=(0, None, None, 0, None), out_axes=(0, None), axis_name="batch",
+    )(audio, state, rope_freqs, batched_keys, True)
 
+    logits = logits.astype(dtype=jnp.float32)  # Calculate the actual losses with float32 precision
     loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
-@eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0)))
-def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state):
+@eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0), None))
+def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state, rope_freqs: RopeFreqs):
     # TODO(knielsen): Find a better way of doing this
-    (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(
+    (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(
         jnp.zeros((batch_size, 2, int(sample_rate * audio_duration))),
         state,
+        rope_freqs,
     )
     num_model_output_frames = find_shape_output_logits.shape[1]  # Output 0 is the batch size
     return num_model_output_frames
@@ -69,11 +77,21 @@ def load_test_set(testset_dir: Path, num_model_output_frames: int, sharding, bat
 
     batches = []
     for sample_name in sample_names:
+        # print(f"Loading {sample_name}")
         midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, skip_cache=True)
         batches.append((sample_name, audio, midi_events))
     return batches
 
-def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames: int, key: jax.random.PRNGKey, sharding, batch_size=32):
+def compute_testset_loss_individual(
+    model_ensemble,
+    state_ensemble,
+    rope_freqs: RopeFreqs,
+    testset_dir: Path,
+    num_model_output_frames: int,
+    key: jax.random.PRNGKey,
+    sharding,
+    batch_size: int = 32,
+):
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
     print("Loaded test set")
 
@@ -96,9 +114,11 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
         pretend_batch_midi_events = jnp.zeros((1, *midi_events.shape))
         pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
 
-        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state)
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, rope_freqs)
         test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
         return logits[0, ...], probs[0, ...], test_losses[0, ...]
+
+    generate_visualizations = len(batches) < 30
 
     inference_model = eqx.nn.inference_mode(model_ensemble)
     loss_map = {}
@@ -130,13 +150,15 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
             stitched_probs = np.concatenate(probs, axis=0)
             stitched_events = np.concatenate(midi_events, axis=0)
 
-            detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=True)
+            detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=generate_visualizations)
             test_losses.append(np.mean(np_test_losses))
             hit_rates.append(detailed_loss.hit_rate)
             eventized_diffs.append(detailed_loss.full_diff)
             phantom_note_diffs.append(detailed_loss.phantom_notes_diff)
             missed_note_diffs.append(detailed_loss.missed_notes_diff)
-            visualizations.append(detailed_loss.visualization)
+
+            if generate_visualizations:
+                visualizations.append(detailed_loss.visualization)
 
         loss_map[sample_name] = {
             "loss": np.array(test_losses),
@@ -150,8 +172,26 @@ def compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir:
     print("Finished evaluating test loss")
     return loss_map
 
-def compute_testset_loss(model_ensemble, state_ensemble, testset_dir: Path, num_model_output_frames, key: jax.random.PRNGKey, sharding, batch_size=32):
-    per_sample_map = compute_testset_loss_individual(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, key, sharding, batch_size)
+def compute_testset_loss(
+    model_ensemble,
+    state_ensemble,
+    rope_freqs: RopeFreqs,
+    testset_dir: Path,
+    num_model_output_frames,
+    key: jax.random.PRNGKey,
+    sharding,
+    batch_size: int = 32,
+):
+    per_sample_map = compute_testset_loss_individual(
+        model_ensemble,
+        state_ensemble,
+        rope_freqs,
+        testset_dir,
+        num_model_output_frames,
+        key,
+        sharding,
+        batch_size,
+    )
 
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
@@ -179,6 +219,7 @@ def train(
     learning_rate_schedule: Callable,
     device_mesh: [],
     num_model_output_frames: int,
+    rope_freqs: RopeFreqs,
     testset_dirs: Dict[str, Path],
     num_steps: int = 10000,
     print_every: int = 1000,
@@ -229,10 +270,12 @@ def train(
         opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
         key, new_key = jax.random.split(key)
+        model_backward_dtype = change_fp_precision(model, dtype=BACKWARD_DTYPE)
         (scaled_loss, update_state), scaled_grads = compute_loss(
-            model,
+            model_backward_dtype,
             state,
             audio=audio,
+            rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
             expected_outputs=expected_outputs,
             scale=jnp.array(grad_scale, dtype=jnp.float16),
             key=key,
@@ -241,7 +284,7 @@ def train(
         # max_grad = jax.tree_util.tree_reduce(lambda acc, x: jnp.maximum(acc, jnp.max(jnp.abs(x))), scaled_grads, initializer=0.0)
         # jax.debug.print("L1 scaled grads: {l1}", l1=max_grad)
 
-        # grads = jax.tree_util.tree_map(lambda g: jnp.clip(g / scale, -1_000, 1_000), scaled_grads)
+        scaled_grads = change_fp_precision(scaled_grads, dtype=MODEL_DTYPE)
         grads = jax.tree_util.tree_map(lambda g: g / grad_scale, scaled_grads)
         grads_valid = jnp.all(jnp.array(
             [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
@@ -304,7 +347,7 @@ def train(
             flat_opt_state = recovery_opt_state
             continue
 
-        if scaled_loss < 10_000: # TODO: Make this configurable
+        if (scaled_loss < 10_000).all(): # TODO: Make this configurable
             new_grad_scale = grad_scale * 2
             print(f"Grad scale: {grad_scale} -> {new_grad_scale}")
             grad_scale = new_grad_scale
@@ -329,8 +372,9 @@ def train(
             averaged_loss = (loss_sum / print_every)[0]
 
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
-            
-            summary_writer.add_scalar("train/loss", averaged_loss[0], step)
+
+            # Pick the average loss of the best model in the ensemble
+            summary_writer.add_scalar("train/loss", jnp.min(averaged_loss), step)
             summary_writer.add_scalar("train/learning_rate", learning_rate, step)
             summary_writer.flush()
 
@@ -345,7 +389,15 @@ def train(
             testset_losses = []
             for (name, testset_dir) in testset_dirs.items():
                 eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(model_ensemble, state_ensemble, testset_dir, num_model_output_frames, eval_key, batch_sharding)
+                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(
+                    model_ensemble,
+                    state_ensemble,
+                    rope_freqs,
+                    testset_dir,
+                    num_model_output_frames,
+                    eval_key,
+                    batch_sharding,
+                )
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
                 testset_losses.append(testset_loss)
@@ -359,9 +411,10 @@ def train(
             # TODO(knielsen): Refactor this! 
             # TODO: Consider sum of testset losses
             # TODO: Reset optimizer state?
-            # TODO(knielsen): Consider re-enabling recombination?
-            # recombination_key, key = jax.random.split(key, num=2)
-            # model_ensemble = evolve_model_ensemble(model_ensemble, testset_losses[0], recombination_key)
+            recombination_key, key = jax.random.split(key, num=2)
+            ensemble_testset_losses = np.mean(np.stack(testset_losses), axis=0)
+            print(f"Ensemble scores: {ensemble_testset_losses}")
+            model_ensemble = evolve_model_ensemble(model_ensemble, ensemble_testset_losses, recombination_key)
 
     model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
     state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
@@ -380,7 +433,7 @@ def create_learning_rate_schedule(base_learning_rate: float, warmup_steps: int, 
     )
     return optax.join_schedules(
         schedules=[warmup_fn, cosine_fn],
-        boundaries=[warmup_steps]
+        boundaries=[warmup_steps],
     )
 
 def score_by_checkpoint_metrics(metrics):
@@ -491,18 +544,28 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 def init_model(model, key: jax.random.PRNGKey):
     head_weight_std = 0.2
     cnn_weight_std = 0.2
+    cnn_bias_std = 0.01
 
     def flatten(lst):
         return [item for sublist in lst for item in sublist]
     
     head_weight_key, head_bias_key, cnn_weight_key, cnn_bias_key = jax.random.split(key, num=4)
 
+    def extract_field(objs, field: str):
+        res = []
+        for obj in objs:
+            if hasattr(obj, field):
+                value = getattr(obj, field)
+                if value is not None:
+                    res.append(value)
+        return res
+
     # Initialize head weights
-    def is_multihead_attention(node):
-        return isinstance(node, eqx.nn.MultiheadAttention)
+    def is_self_attention(node):
+        return isinstance(node, SelfAttention)
     get_head_weights = lambda m: flatten([
-        [x.query_proj.weight, x.key_proj.weight, x.value_proj.weight, x.output_proj.weight]
-        for x in jax.tree_util.tree_leaves(m, is_leaf=is_multihead_attention) if is_multihead_attention(x)
+        extract_field([x.query_down_proj, x.query_up_proj, x.kv_down_proj, x.key_up_proj, x.value_up_proj], "weight")
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_self_attention) if is_self_attention(x)
     ])
     head_weights = get_head_weights(model)
     new_head_weights = [
@@ -513,8 +576,8 @@ def init_model(model, key: jax.random.PRNGKey):
 
     # Initialize head biases
     get_head_biases = lambda m: flatten([
-        [x.query_proj.bias, x.key_proj.bias, x.value_proj.bias, x.output_proj.bias]
-        for x in jax.tree_util.tree_leaves(m, is_leaf=is_multihead_attention) if is_multihead_attention(x)
+        extract_field([x.query_down_proj, x.query_up_proj, x.kv_down_proj, x.key_up_proj, x.value_up_proj], "bias")
+        for x in jax.tree_util.tree_leaves(m, is_leaf=is_self_attention) if is_self_attention(x)
     ])
     head_biases = get_head_biases(model)
     new_head_biases = [
@@ -542,10 +605,10 @@ def init_model(model, key: jax.random.PRNGKey):
         [x.bias]
         for x in jax.tree_util.tree_leaves(m, is_leaf=is_conv_1d) if is_conv_1d(x)
     ])
-    cnn_biases  = get_cnn_biases(model)
+    cnn_biases = get_cnn_biases(model)
     new_cnn_biases = [
-        jnp.zeros_like(weight)
-        for weight, subkey in zip(cnn_weights, jax.random.split(cnn_bias_key, len(cnn_biases)))
+        jax.random.normal(subkey, weight.shape) * cnn_bias_std
+        for weight, subkey in zip(cnn_biases, jax.random.split(cnn_bias_key, len(cnn_biases)))
     ]
     model = eqx.tree_at(get_cnn_biases, model, new_cnn_biases)
 
@@ -600,9 +663,10 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
     learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
     tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3) for depth, lr_schedule in learning_rates_by_depth.items()
+        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3, b1=0.9, b2=0.999)
+        for depth, lr_schedule in learning_rates_by_depth.items()
     }, depth_extracting_label_fn)
-    tx = optax.chain(tx, optax.clip_by_global_norm(3.0))
+    tx = optax.chain(tx, optax.clip_by_global_norm(1.0))
 
     return tx, default_lr["default|0"]
 
@@ -613,17 +677,24 @@ def main():
     testset_dirs = {
         'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
         'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        'validation_set_generated': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_generated"),
     }
 
     num_devices = len(jax.devices())
 
-    batch_size = 32 * num_devices
-    num_steps = 150_000
+    batch_size = 8 * num_devices
+    num_steps = 200_000
     warmup_steps = 1000
     base_learning_rate = 1 * 1e-4
     layer_lr_decay = 1.0
-    weight_decay = 0.02
-    num_models = 1
+    weight_decay = 0.005
+    model_init_keys = jnp.stack([
+        jax.random.key(1),
+        # jax.random.key(2),
+        # jax.random.key(3),
+        # jax.random.key(4),
+        # jax.random.key(5),
+    ])
 
     transform_settings = TransformSettings(
         pan_probability=0.8,
@@ -637,12 +708,12 @@ def main():
         label_smoothing_alpha=0.005,
     )
 
-    checkpoint_every = 1000
+    checkpoint_every = 20
     checkpoints_to_keep = 3
-    dataset_num_workers = 4
+    dataset_num_workers = 3
 
     main_key = jax.random.PRNGKey(1234)
-    model_init_key, model_init_key_2, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=5)
+    training_key, = jax.random.split(main_key, num=1)
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
     
@@ -653,14 +724,17 @@ def main():
     h_params["train/warmup_steps"] = warmup_steps
     summary_writer.add_hparams(h_params, {})
 
+    rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+
     @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
     def make_ensemble(key):
-        return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
+        init_key_1, init_key_2 = jax.random.split(key, num=2)
+        model, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, init_key_1)
+        # model = init_model(model, key=init_key_2)
+        return model, state
 
-    ensemble_keys = jax.random.split(model_init_key, num_models)
-    audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
-    init_model(audio_to_midi_ensemble, key=model_init_key_2)
-    audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=jnp.float16)
+    audio_to_midi_ensemble, model_states = make_ensemble(model_init_keys)
+    audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
     print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
@@ -719,7 +793,7 @@ def main():
 
     sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
     audio_duration = MODEL_AUDIO_LENGTH
-    num_model_output_frames = compute_model_output_frames(batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states)
+    num_model_output_frames = compute_model_output_frames(batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -746,6 +820,7 @@ def main():
         checkpoint_manager,
         learning_rate_schedule=base_learning_rate_schedule,
         device_mesh=device_mesh,
+        rope_freqs=rope_freqs,
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
         num_steps=num_steps,
@@ -768,8 +843,8 @@ if __name__ == "__main__":
     )
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-    jax.config.update("jax_threefry_partitionable", True)
-    jax.config.update("jax_default_matmul_precision", "F16_F16_F32")
+    jax.threefry_partitionable(True)
+    jax.default_matmul_precision("BF16_BF16_BF16")
 
     # with jax.profiler.trace("/tmp/jax-trace"):
     main()
