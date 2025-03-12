@@ -43,7 +43,6 @@ def compute_loss_from_output(logits, expected_output, scale):
     scaled_loss = loss * scale
     # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
 
-    # loss = jax.vmap(partial(optax.sigmoid_focal_loss, alpha=None, gamma=2.0))(logits, expected_output)
     return jnp.sum(scaled_loss)
 
 @eqx.filter_jit(donate="all-except-first")
@@ -341,8 +340,9 @@ def train(
             averaged_loss = (loss_sum / print_every)[0]
 
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
-            
-            summary_writer.add_scalar("train/loss", averaged_loss[0], step)
+
+            # Pick the average loss of the best model in the ensemble
+            summary_writer.add_scalar("train/loss", jnp.min(averaged_loss), step)
             summary_writer.add_scalar("train/learning_rate", learning_rate, step)
             summary_writer.flush()
 
@@ -504,6 +504,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 def init_model(model, key: jax.random.PRNGKey):
     head_weight_std = 0.2
     cnn_weight_std = 0.2
+    cnn_bias_std = 0.01
 
     def flatten(lst):
         return [item for sublist in lst for item in sublist]
@@ -564,10 +565,10 @@ def init_model(model, key: jax.random.PRNGKey):
         [x.bias]
         for x in jax.tree_util.tree_leaves(m, is_leaf=is_conv_1d) if is_conv_1d(x)
     ])
-    cnn_biases  = get_cnn_biases(model)
+    cnn_biases = get_cnn_biases(model)
     new_cnn_biases = [
-        jnp.zeros_like(weight)
-        for weight, subkey in zip(cnn_weights, jax.random.split(cnn_bias_key, len(cnn_biases)))
+        jax.random.normal(subkey, weight.shape) * cnn_bias_std
+        for weight, subkey in zip(cnn_biases, jax.random.split(cnn_bias_key, len(cnn_biases)))
     ]
     model = eqx.tree_at(get_cnn_biases, model, new_cnn_biases)
 
@@ -640,12 +641,18 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 8 * num_devices
-    num_steps = 100_000
+    num_steps = 200_000
     warmup_steps = 1000
     base_learning_rate = 5 * 1e-4
     layer_lr_decay = 1.0
     weight_decay = 0.02
-    num_models = 1
+    model_init_keys = jnp.stack([
+        jax.random.key(1),
+        jax.random.key(2),
+        jax.random.key(3),
+        jax.random.key(4),
+        jax.random.key(5),
+    ])
 
     transform_settings = TransformSettings(
         pan_probability=0.8,
@@ -659,12 +666,12 @@ def main():
         label_smoothing_alpha=0.005,
     )
 
-    checkpoint_every = 1000
+    checkpoint_every = 25
     checkpoints_to_keep = 3
     dataset_num_workers = 3
 
     main_key = jax.random.PRNGKey(1234)
-    model_init_key, model_init_key_2, training_key, dataset_loader_key, recombination_key = jax.random.split(main_key, num=5)
+    training_key, = jax.random.split(main_key, num=1)
 
     print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
     
@@ -679,11 +686,12 @@ def main():
 
     @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
     def make_ensemble(key):
-        return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
+        init_key_1, init_key_2 = jax.random.split(key, num=2)
+        model, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, init_key_1)
+        model = init_model(model, key=init_key_2)
+        return model, state
 
-    ensemble_keys = jax.random.split(model_init_key, num_models)
-    audio_to_midi_ensemble, model_states = make_ensemble(ensemble_keys)
-    init_model(audio_to_midi_ensemble, key=model_init_key_2)
+    audio_to_midi_ensemble, model_states = make_ensemble(model_init_keys)
     audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
     print(audio_to_midi_ensemble)
 

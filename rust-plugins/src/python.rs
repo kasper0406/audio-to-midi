@@ -250,7 +250,7 @@ async fn generate_raw_audio_using_ffmpeg(input_file: &str, left_output_file: &st
     } else {
         let total_elements = (left_samples.len() + right_samples.len()) as f64;
         let variance = left_samples.iter().zip(right_samples.iter())
-            .fold(0f64, |acc, (left, right)| acc + (*left as f64).powi(2) + (*right as f64).powi(2)) / total_elements;
+            .fold(0f64, |acc, (left, right)| acc + ((*left as f64).powi(2) + (*right as f64).powi(2)) / total_elements);
         let adjustment = (1.0 / variance).sqrt();
 
         let normalized_left: Vec<f16> = left_samples.iter()

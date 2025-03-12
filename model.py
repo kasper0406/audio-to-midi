@@ -284,26 +284,26 @@ class SelfAttention(eqx.Module, strict=True):
     ):
         q_down_key, q_up_key, kv_down_key, key_up_key, value_up_key, out_key = _split_key(key, 6)
 
-        if compressed_q_size != input_size:
-            self.query_down_proj = eqx.nn.Linear(
-                input_size,
-                compressed_q_size,
-                key=q_down_key,
-                use_bias=False,
-            )
-            self.query_up_proj = eqx.nn.Linear(
-                compressed_q_size,
-                num_heads * head_dim,
-                key=q_up_key,
-                use_bias=False,
-            )
-        else:
-            self.query_up_proj = eqx.nn.Linear(
-                input_size,
-                num_heads * head_dim,
-                key=q_up_key,
-                use_bias=False,
-            )
+        # if compressed_q_size != input_size:
+        #     self.query_down_proj = eqx.nn.Linear(
+        #         input_size,
+        #         compressed_q_size,
+        #         key=q_down_key,
+        #         use_bias=False,
+        #     )
+        #     self.query_up_proj = eqx.nn.Linear(
+        #         compressed_q_size,
+        #         num_heads * head_dim,
+        #         key=q_up_key,
+        #         use_bias=False,
+        #     )
+        # else:
+        self.query_up_proj = eqx.nn.Linear(
+            input_size,
+            num_heads * head_dim,
+            key=q_up_key,
+            use_bias=False,
+        )
 
 
         self.kv_down_proj = eqx.nn.Linear(
