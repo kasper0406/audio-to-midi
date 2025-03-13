@@ -17,11 +17,12 @@ from dataclasses import dataclass
 import sys
 import argparse
 import matplotlib
+import optax
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
-from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader
+from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader, MODEL_AUDIO_LENGTH
 import modelutil
-from rope import precompute_frequencies
+from rope import precompute_frequencies, RopeFreqs
 
 def change_fp_precision(model, dtype):
     def to_dtype(leaf):
@@ -35,7 +36,7 @@ def stitch_output_probs(all_probs, duration_per_frame: float, overlap: float):
 
 def predict_and_stitch(model, state, samples, window_duration: float, overlap=0.0):
     rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
-    samples = samples.astype(np.float16)
+    # samples = samples.astype(np.float16)
     _logits, probs = jax.vmap(model.predict, in_axes=(None, 0, None))(state, samples, rope_freqs)
     probs = probs.astype(np.float32)  # Convert probs to f32 to make them compatible with the rust plugin
     duration_per_frame = window_duration / probs.shape[1]
@@ -180,6 +181,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
         return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
     ensemble_keys = jax.random.split(key, ensemble_size)
     audio_to_midi, state = make_ensemble(ensemble_keys) 
+    # print(audio_to_midi)
 
     checkpoint_manager = ocp.CheckpointManager(checkpoint_path, item_names=('params', 'state'))
     step_to_restore = checkpoint_manager.latest_step()
@@ -228,9 +230,74 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
         model_params = jax.device_put(model_params, replicate_everywhere)
         audio_to_midi = eqx.combine(model_params, static_model)
 
-    audio_to_midi = change_fp_precision(audio_to_midi, dtype=jnp.float16)
+    audio_to_midi = change_fp_precision(audio_to_midi, dtype=jnp.float32)
     audio_to_midi = eqx.nn.inference_mode(audio_to_midi)
     return audio_to_midi, state
+
+
+def load_test_set(testset_dir: Path, num_model_output_frames: int):
+    sample_names = AudioToMidiDatasetLoader.load_sample_names(testset_dir)
+
+    batches = []
+    for sample_name in sample_names:
+        midi_events, audio, _sample_names = AudioToMidiDatasetLoader.load_samples(testset_dir, num_model_output_frames, [sample_name], AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH, skip_cache=True)
+        batches.append((sample_name, audio, midi_events))
+    return batches
+
+def compute_testset_loss(
+    model,
+    state,
+    rope_freqs: RopeFreqs,
+    testset_dir: Path,
+    num_model_output_frames: int,
+):
+    batches = load_test_set(testset_dir, num_model_output_frames)
+    print("Loaded test set")
+
+    @eqx.filter_jit(donate="all-except-first")
+    def testset_loss_function(logits, expected_output):
+        loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+        return jnp.sum(loss)
+
+    @eqx.filter_jit
+    def run_inference_single_model(inference_model, state, audio, midi_events):
+        # Compute the full batched model, even though we only compute one audio sample
+        pretend_batch_audio = jnp.zeros((1, *audio.shape))
+        pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio)
+
+        pretend_batch_midi_events = jnp.zeros((1, *midi_events.shape))
+        pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
+
+        (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, rope_freqs)
+        test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
+        return logits, probs, test_losses
+
+    generate_visualizations = len(batches) < 30
+
+    inference_model = eqx.nn.inference_mode(model)
+    loss_map = {}
+    for sample_name, audios, midi_events in batches:
+        logits_all = []
+        probs_all = []
+        test_losses_all = []
+        for audio, midi_event in zip(audios, midi_events):
+            logits, probs, test_losses = run_inference_single_model(inference_model, state, audio, midi_event)
+            logits_all.append(logits)
+            probs_all.append(probs)
+            test_losses_all.append(test_losses)
+
+        stitched_probs = np.concatenate(probs, axis=0)
+        stitched_events = np.concatenate(midi_events, axis=0)
+
+        # TODO(knielsen): Consider exposing more information
+        detailed_loss = detailed_event_loss(stitched_probs, stitched_events, generate_visualization=generate_visualizations)
+        loss_map[sample_name] = {
+            "loss": np.mean(test_losses_all),
+        }
+
+    print("Finished evaluating test loss")
+    return loss_map
+
 
 def main():
     # Create an argument parser
@@ -239,6 +306,7 @@ def main():
     # Add an argument for the input file
     parser.add_argument("input_file", help="Path to the input audio file.")
     parser.add_argument("--midi", help="Path to the output MIDI file.", default=None)
+    parser.add_argument("--validation", action="store_true", help="Instruct the CLI to expect a directory and calculate the validation loss", default=None)
 
     # Parse the command-line arguments
     args = parser.parse_args()
@@ -248,6 +316,25 @@ def main():
 
     model, state = load_newest_checkpoint("/Volumes/git/ml/audio-to-midi/audio_to_midi_checkpoints")  # Assuming this function exists
 
+    if args.validation:
+        # Calculate and report the validation loss for the directory
+        print(f"Calculating validation loss for {input_file}")
+        rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+        window_size = int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)
+        num_model_output_frames = model.predict(state, jnp.zeros((2, window_size), jnp.float32), rope_freqs)[1].shape[0]
+        # print(f"Model output frames: {num_model_output_frames}")
+        loss_map = compute_testset_loss(
+            model,
+            state,
+            rope_freqs,
+            input_file,
+            num_model_output_frames,
+        )
+        losses = np.stack([v["loss"] for v in loss_map.values()])
+        print("Average loss: ", np.mean(losses))
+        return
+
+    # Infer a single file
     overlap = 0.25
     windowed_samples, window_duration = AudioToMidiDatasetLoader.load_and_slice_full_audio(input_file, overlap=overlap)  # Assuming this function exists
     _probs, stitched_probs, duration_per_frame = predict_and_stitch(model, state, windowed_samples, window_duration, overlap=overlap) # Assuming this function exists
@@ -268,7 +355,7 @@ def main():
 
 if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-    jax.config.update("jax_threefry_partitionable", True)
+    jax.threefry_partitionable(True)
 
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     main()
