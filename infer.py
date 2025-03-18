@@ -169,7 +169,7 @@ def plot_prob_dist(quantity: str, dist: Float[Array, "len"]):
         title=f"Probability distribution for {quantity}",
     )
 
-def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemble_select: int = 0, model_replication=True):
+def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemble_select: int | None = 0, model_replication=True):
     num_devices = len(jax.devices())
 
     # The randomness does not matter as we will load a checkpoint model anyways
@@ -207,16 +207,17 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
     state = restored_map["state"]
 
     # Select the ensemble member to use
-    def ensemble_selector(path, x):
-        if not eqx.is_array(x):
-            # print(f"Skipping at {path} as it is not an array, value: {x}")
-            return x
+    if ensemble_select:
+        def ensemble_selector(path, x):
+            if not eqx.is_array(x):
+                # print(f"Skipping at {path} as it is not an array, value: {x}")
+                return x
 
-        # print(f"Selecting at {path} value {x}")
-        return x[ensemble_select, ...]
+            # print(f"Selecting at {path} value {x}")
+            return x[ensemble_select, ...]
 
-    model_params = jax.tree.map_with_path(ensemble_selector, model_params)
-    state = jax.tree.map_with_path(ensemble_selector, state)
+        model_params = jax.tree.map_with_path(ensemble_selector, model_params)
+        state = jax.tree.map_with_path(ensemble_selector, state)
 
     audio_to_midi = eqx.combine(model_params, eqx.filter(OutputSequenceGenerator(model_config, key), lambda x: not eqx.is_array(x)))
 

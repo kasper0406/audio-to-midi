@@ -659,7 +659,8 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
 
     conv_lr_by_depth = { f"conv_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps) for depth in range(max_conv_depth + 1) }
-    transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
+    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
+    transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
     default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
     learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
     tx = optax.multi_transform({
@@ -686,7 +687,7 @@ def main():
     num_steps = 200_000
     warmup_steps = 1000
     base_learning_rate = 1 * 1e-4
-    layer_lr_decay = 1.0
+    layer_lr_decay = 0.7
     weight_decay = 0.005
     model_init_keys = jnp.stack([
         jax.random.key(1),

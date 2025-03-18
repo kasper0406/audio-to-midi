@@ -496,6 +496,7 @@ class TransformerStack(eqx.Module):
 class OutputSequenceGenerator(eqx.Module):
     layers: list[eqx.nn.Sequential]
     norm: eqx.nn.LayerNorm
+    transformer_projection: eqx.nn.Linear | None = None
     transformer: TransformerStack
     decoder: Decoder
 
@@ -504,10 +505,10 @@ class OutputSequenceGenerator(eqx.Module):
         conf: Dict[str, any],
         key: Optional[jax.random.PRNGKey] = None,
     ):
-        layers_key, decoder_key, pos_encoding_key, transformer_key = _split_key(key, 4)
+        layers_key, decoder_key, transformer_projection_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]
-        hidden_dims = [int(d * 4.0) for d in dims]
+        hidden_dims = [int(d * 1.0) for d in dims]
         depths = conf["depths"]
 
         self.layers = []
@@ -537,13 +538,20 @@ class OutputSequenceGenerator(eqx.Module):
 
         self.norm = eqx.nn.LayerNorm(dims[-1])
 
+        if "transformer_hidden_dim" in conf and conf["transformer_hidden_dim"] != dims[-1]:
+            self.transformer_projection = eqx.nn.Linear(
+                dims[-1],
+                conf["transformer_hidden_dim"],
+                key=transformer_projection_key,
+            )
+
         self.transformer = TransformerStack(
             input_size=dims[-1],
             num_layers=conf["num_transformer_layers"],
             attention_size=conf["attention_size"],
             compressed_attention_q_size=conf["compressed_attention_q_size"],
             compressed_attention_kv_size=conf["compressed_attention_kv_size"],
-            intermediate_size=int(dims[-1] * 2.0),
+            intermediate_size=int(conf["attention_size"] * 1.0),
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
             key=transformer_key,
@@ -574,6 +582,8 @@ class OutputSequenceGenerator(eqx.Module):
 
         # Compute Transformer layers
         h = jnp.transpose(h)
+        if self.transformer_projection is not None:
+            h = self.transformer_projection(h)
         h = self.transformer(h, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=transformer_key)
 
         # Decode the result
