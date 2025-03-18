@@ -538,20 +538,21 @@ class OutputSequenceGenerator(eqx.Module):
 
         self.norm = eqx.nn.LayerNorm(dims[-1])
 
-        if "transformer_hidden_dim" in conf and conf["transformer_hidden_dim"] != dims[-1]:
+        transformer_hidden_dim = conf.get("transformer_hidden_dim", dims[-1])
+        if transformer_hidden_dim != dims[-1]:
             self.transformer_projection = eqx.nn.Linear(
                 dims[-1],
-                conf["transformer_hidden_dim"],
+                transformer_hidden_dim,
                 key=transformer_projection_key,
             )
 
         self.transformer = TransformerStack(
-            input_size=dims[-1],
+            input_size=transformer_hidden_dim,
             num_layers=conf["num_transformer_layers"],
             attention_size=conf["attention_size"],
             compressed_attention_q_size=conf["compressed_attention_q_size"],
             compressed_attention_kv_size=conf["compressed_attention_kv_size"],
-            intermediate_size=int(conf["attention_size"] * 1.0),
+            intermediate_size=int(transformer_hidden_dim * 2.0),
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
             key=transformer_key,
