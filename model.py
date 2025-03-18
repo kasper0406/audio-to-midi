@@ -20,6 +20,7 @@ def identity(arg):
 model_config = {
     "dims": [4 * (2 ** i) for i in range(7)],
     "depths": [3, 3, 3, 3, 3, 21, 3],
+    "cnn_hidden_expansion": 2.0,
 
     "num_transformer_layers": 8,
     "num_transformer_heads": 4,
@@ -27,6 +28,7 @@ model_config = {
     "compressed_attention_q_size": 64,
     "compressed_attention_kv_size": 64,
     "transformer_dropout_rate": 0.1,
+    "transformer_hidden_expansion": 2.0,
 
     "sdd_rate": 0.1,
 }
@@ -508,7 +510,7 @@ class OutputSequenceGenerator(eqx.Module):
         layers_key, decoder_key, transformer_projection_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]
-        hidden_dims = [int(d * 1.0) for d in dims]
+        hidden_dims = [int(d * conf["cnn_hidden_expansion"]) for d in dims]
         depths = conf["depths"]
 
         self.layers = []
@@ -552,7 +554,7 @@ class OutputSequenceGenerator(eqx.Module):
             attention_size=conf["attention_size"],
             compressed_attention_q_size=conf["compressed_attention_q_size"],
             compressed_attention_kv_size=conf["compressed_attention_kv_size"],
-            intermediate_size=int(transformer_hidden_dim * 2.0),
+            intermediate_size=int(transformer_hidden_dim * conf["transformer_hidden_expansion"]),
             num_heads=conf["num_transformer_heads"],
             dropout_rate=conf["transformer_dropout_rate"],
             key=transformer_key,
