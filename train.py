@@ -291,15 +291,19 @@ def train(
             )
 
             scaled_grads_leaves, treedef = jax.tree_util.tree_flatten(scaled_grads)
-            acc_grads_leaves, _ = jax.tree_util.tree_flatten(scaled_grads)
-            accumulated_grads = [ scaled_grad + acc_grad for scaled_grad, acc_grad in zip(scaled_grads_leaves, acc_grads_leaves) ]
+            acc_grads_leaves, _ = jax.tree_util.tree_flatten(accumulated_grads)
+            accumulated_grads = [
+                scaled_grad.astype(acc_grad.dtype) + acc_grad
+                for scaled_grad, acc_grad in zip(scaled_grads_leaves, acc_grads_leaves)
+            ]
             accumulated_grads = treedef.unflatten(accumulated_grads)
 
             return (accumulated_grads, update_state), scaled_loss
 
+        # Keep the accumulated grads in the same precision as the model
         zero_grads = jax.tree_util.tree_map(
-            lambda x: None if x is None else jnp.zeros_like(x),
-            eqx.filter(model_backward_dtype, eqx.is_array)
+            lambda x: None if x is None else jnp.zeros_like(x).astype(MODEL_DTYPE),
+            eqx.filter(model, eqx.is_array)
         )
         audio_minibatches = einops.rearrange(audio, "(b m) ... -> b m ...", m=minibatch_size)
         expected_outputs_minibatches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=minibatch_size)
@@ -311,11 +315,8 @@ def train(
         )
         scaled_loss = jnp.mean(losses)
 
-        
         # max_grad = jax.tree_util.tree_reduce(lambda acc, x: jnp.maximum(acc, jnp.max(jnp.abs(x))), scaled_grads, initializer=0.0)
         # jax.debug.print("L1 scaled grads: {l1}", l1=max_grad)
-
-        accumulated_grads = change_fp_precision(accumulated_grads, dtype=MODEL_DTYPE)
         grads = jax.tree_util.tree_map(lambda g: g / (grad_scale * minibatch_steps), accumulated_grads)
         grads_valid = jnp.all(jnp.array(
             [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
