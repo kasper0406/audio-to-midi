@@ -222,7 +222,7 @@ def train(
     num_model_output_frames: int,
     rope_freqs: RopeFreqs,
     testset_dirs: Dict[str, Path],
-    mini_batch_size: int,
+    minibatch_size: int,
     num_steps: int = 10000,
     print_every: int = 1000,
     testset_loss_every: int = 1000,
@@ -278,14 +278,14 @@ def train(
         @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         def minibatch_scan_body(carry, batch):
             accumulated_grads, state = carry
-            audio_mini_batch, expected_outputs_mini_batch = batch
+            audio_minibatch, expected_outputs_minibatch = batch
 
             (scaled_loss, update_state), scaled_grads = compute_loss(
                 model_backward_dtype,
                 state,
-                audio=audio_mini_batch,
+                audio=audio_minibatch,
                 rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
-                expected_outputs=expected_outputs_mini_batch,
+                expected_outputs=expected_outputs_minibatch,
                 scale=jnp.array(grad_scale, dtype=jnp.float16),
                 key=key,
             )
@@ -301,13 +301,13 @@ def train(
             lambda x: None if x is None else jnp.zeros_like(x),
             eqx.filter(model_backward_dtype, eqx.is_array)
         )
-        audio_mini_batches = einops.rearrange(audio, "(b m) ... -> b m ...", m=mini_batch_size)
-        expected_outputs_mini_batches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=mini_batch_size)
-        minibatch_steps = audio_mini_batches.shape[0]
+        audio_minibatches = einops.rearrange(audio, "(b m) ... -> b m ...", m=minibatch_size)
+        expected_outputs_minibatches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=minibatch_size)
+        minibatch_steps = audio_minibatches.shape[0]
         (accumulated_grads, update_state), losses = jax.lax.scan(
             minibatch_scan_body,
             (zero_grads, state),
-            (audio_mini_batches, expected_outputs_mini_batches)
+            (audio_minibatches, expected_outputs_minibatches)
         )
         scaled_loss = jnp.mean(losses)
 
@@ -717,7 +717,7 @@ def main():
     num_devices = len(jax.devices())
 
     batch_size = 64
-    mini_batch_size = 8 * num_devices
+    minibatch_size = 8 * num_devices
     num_steps = 200_000
     warmup_steps = 1000
     base_learning_rate = 1 * 1e-4
@@ -750,7 +750,7 @@ def main():
     main_key = jax.random.PRNGKey(1234)
     training_key, = jax.random.split(main_key, num=1)
 
-    print(f"Running on {num_devices} devices with an effective batch size of {batch_size} with mini-batches {mini_batch_size}")
+    print(f"Running on {num_devices} devices with an effective batch size of {batch_size} with mini-batches {minibatch_size}")
 
     summary_writer = configure_tensorboard()
     h_params = model_config
@@ -828,7 +828,7 @@ def main():
 
     sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
     audio_duration = MODEL_AUDIO_LENGTH
-    num_model_output_frames = compute_model_output_frames(mini_batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
+    num_model_output_frames = compute_model_output_frames(minibatch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -862,7 +862,7 @@ def main():
         print_every=10,
         key=training_key,
         testset_loss_every=checkpoint_every,
-        mini_batch_size=mini_batch_size,
+        minibatch_size=minibatch_size,
     )
 
     checkpoint_manager.wait_until_finished()
