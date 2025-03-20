@@ -207,7 +207,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
     state = restored_map["state"]
 
     # Select the ensemble member to use
-    if ensemble_select:
+    if ensemble_select is not None:
         def ensemble_selector(path, x):
             if not eqx.is_array(x):
                 # print(f"Skipping at {path} as it is not an array, value: {x}")
