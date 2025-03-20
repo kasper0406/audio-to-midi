@@ -750,8 +750,8 @@ def main():
     main_key = jax.random.PRNGKey(1234)
     training_key, = jax.random.split(main_key, num=1)
 
-    print(f"Running on {num_devices} devices with an effective batch size of {batch_size}")
-    
+    print(f"Running on {num_devices} devices with an effective batch size of {batch_size} with mini-batches {mini_batch_size}")
+
     summary_writer = configure_tensorboard()
     h_params = model_config
     h_params["train/batch_size"] = batch_size
@@ -828,7 +828,7 @@ def main():
 
     sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
     audio_duration = MODEL_AUDIO_LENGTH
-    num_model_output_frames = compute_model_output_frames(batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
+    num_model_output_frames = compute_model_output_frames(mini_batch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
