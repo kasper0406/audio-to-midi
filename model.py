@@ -460,10 +460,8 @@ class TransformerStack(eqx.Module):
     ):
         self.num_layers = num_layers
 
-        layer_keys = jax.random.split(key, num_layers)
-        self.layers = []
-        for layer_key in layer_keys:
-            self.layers.append(TransformerLayer(
+        def make_layer(layer_key):
+            return TransformerLayer(
                 input_size=input_size,
                 attention_size=attention_size,
                 compressed_attention_q_size=compressed_attention_q_size,
@@ -472,7 +470,10 @@ class TransformerStack(eqx.Module):
                 num_heads=num_heads,
                 dropout_rate=dropout_rate,
                 key=layer_key,
-            ))
+            )
+
+        keys = _split_key(key, num=num_layers)
+        self.layers = eqx.filter_vmap(make_layer)(keys)
 
     def __call__(
         self,
@@ -481,16 +482,19 @@ class TransformerStack(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        layer_keys = _split_key(key, num=self.num_layers)
+        dynamic_layers, static_layer = eqx.partition(self.layers, eqx.is_inexact_array)
 
-        output = inputs
-        for layer, layer_key in zip(self.layers, layer_keys):
-            output = layer(
-                inputs=output,
-                rope_freqs=rope_freqs,
-                enable_dropout=enable_dropout,
-                key=layer_key,
-            )
+        @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+        def f(x, spec):
+            dynamic_layer, layer_key = spec
+            layer = eqx.combine(dynamic_layer, static_layer)
+            return layer(x, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=layer_key), None
+
+        if key is None:
+            layer_keys = None
+        else:
+            layer_keys = jnp.stack(_split_key(key, num=self.num_layers))
+        output, _ = jax.lax.scan(f, inputs, (dynamic_layers, layer_keys))
 
         return output
 
@@ -560,7 +564,7 @@ class OutputSequenceGenerator(eqx.Module):
             key=transformer_key,
         )
 
-        self.decoder = Decoder(dims[-1], key=decoder_key)
+        self.decoder = Decoder(transformer_hidden_dim, key=decoder_key)
 
     def __call__(
         self,
@@ -577,7 +581,7 @@ class OutputSequenceGenerator(eqx.Module):
         resnext_key, transformer_key = _split_key(key, 2)
         layer_keys = _split_key(resnext_key, num=len(self.layers))
 
-        # Compute ResNext layers
+        # Compute ConvNext layers
         h = samples
         for layer, layer_key in zip(self.layers, layer_keys):
             h = layer(h, key=layer_key)
@@ -586,7 +590,7 @@ class OutputSequenceGenerator(eqx.Module):
         # Compute Transformer layers
         h = jnp.transpose(h)
         if self.transformer_projection is not None:
-            h = self.transformer_projection(h)
+            h = jax.vmap(self.transformer_projection)(h)
         h = self.transformer(h, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=transformer_key)
 
         # Decode the result

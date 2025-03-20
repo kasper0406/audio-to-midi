@@ -16,7 +16,7 @@ from pathlib import Path
 # Load the existing model with the currently specified architecture
 pretrained_model, pretrained_state = load_newest_checkpoint(
     "/Volumes/git/ml/audio-to-midi/audio_to_midi_checkpoints",
-    ensemble_select=False,
+    ensemble_select=None,
 )
 
 new_config = {

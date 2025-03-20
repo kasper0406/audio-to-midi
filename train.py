@@ -21,6 +21,7 @@ from more_itertools import chunked
 import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass
+import einops
 
 from audio_to_midi_dataset import AudioToMidiDatasetLoader, visualize_sample, MODEL_AUDIO_LENGTH
 from model import OutputSequenceGenerator, model_config, get_model_metadata, SelfAttention
@@ -221,6 +222,7 @@ def train(
     num_model_output_frames: int,
     rope_freqs: RopeFreqs,
     testset_dirs: Dict[str, Path],
+    mini_batch_size: int,
     num_steps: int = 10000,
     print_every: int = 1000,
     testset_loss_every: int = 1000,
@@ -269,23 +271,52 @@ def train(
         state = jax.tree_util.tree_unflatten(treedef_state, flat_state)
         opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
-        key, new_key = jax.random.split(key)
         model_backward_dtype = change_fp_precision(model, dtype=BACKWARD_DTYPE)
-        (scaled_loss, update_state), scaled_grads = compute_loss(
-            model_backward_dtype,
-            state,
-            audio=audio,
-            rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
-            expected_outputs=expected_outputs,
-            scale=jnp.array(grad_scale, dtype=jnp.float16),
-            key=key,
-        )
+        key, new_key = jax.random.split(key)
 
+        # Scan over mini-batches
+        @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+        def minibatch_scan_body(carry, batch):
+            accumulated_grads, state = carry
+            audio_mini_batch, expected_outputs_mini_batch = batch
+
+            (scaled_loss, update_state), scaled_grads = compute_loss(
+                model_backward_dtype,
+                state,
+                audio=audio_mini_batch,
+                rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
+                expected_outputs=expected_outputs_mini_batch,
+                scale=jnp.array(grad_scale, dtype=jnp.float16),
+                key=key,
+            )
+
+            scaled_grads_leaves, treedef = jax.tree_util.tree_flatten(scaled_grads)
+            acc_grads_leaves, _ = jax.tree_util.tree_flatten(scaled_grads)
+            accumulated_grads = [ scaled_grad + acc_grad for scaled_grad, acc_grad in zip(scaled_grads_leaves, acc_grads_leaves) ]
+            accumulated_grads = treedef.unflatten(accumulated_grads)
+
+            return (accumulated_grads, update_state), scaled_loss
+
+        zero_grads = jax.tree_util.tree_map(
+            lambda x: None if x is None else jnp.zeros_like(x),
+            eqx.filter(model_backward_dtype, eqx.is_array)
+        )
+        audio_mini_batches = einops.rearrange(audio, "(b m) ... -> b m ...", m=mini_batch_size)
+        expected_outputs_mini_batches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=mini_batch_size)
+        minibatch_steps = audio_mini_batches.shape[0]
+        (accumulated_grads, update_state), losses = jax.lax.scan(
+            minibatch_scan_body,
+            (zero_grads, state),
+            (audio_mini_batches, expected_outputs_mini_batches)
+        )
+        scaled_loss = jnp.mean(losses)
+
+        
         # max_grad = jax.tree_util.tree_reduce(lambda acc, x: jnp.maximum(acc, jnp.max(jnp.abs(x))), scaled_grads, initializer=0.0)
         # jax.debug.print("L1 scaled grads: {l1}", l1=max_grad)
 
-        scaled_grads = change_fp_precision(scaled_grads, dtype=MODEL_DTYPE)
-        grads = jax.tree_util.tree_map(lambda g: g / grad_scale, scaled_grads)
+        accumulated_grads = change_fp_precision(accumulated_grads, dtype=MODEL_DTYPE)
+        grads = jax.tree_util.tree_map(lambda g: g / (grad_scale * minibatch_steps), accumulated_grads)
         grads_valid = jnp.all(jnp.array(
             [jnp.all(jnp.isfinite(g)) for g in jax.tree_util.tree_leaves(grads)]
         ))
@@ -631,11 +662,12 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
 
                 # print(f"Conv path {path} at depth {computed_depth}")
                 return f"conv_layer|{computed_depth}"
-            elif path[0].name == "transformer":
-                seq_nr = path[2].idx
-                # We are inside the transformer stack
-                # print(f"Transformer path {path} at depth {seq_nr}")
-                return f"transformer_layer|{seq_nr}"
+            # elif path[0].name == "transformer":
+            #     print(path)
+            #     seq_nr = path[2].idx
+            #     # We are inside the transformer stack
+            #     # print(f"Transformer path {path} at depth {seq_nr}")
+            #     return f"transformer_layer|{seq_nr}"
             else:
                 return f"default|0"
 
@@ -656,13 +688,14 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
         max_depth,
         depth_extracting_label_fn(model), (0, 0),
     )
-    print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
+    # print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
+    print(f"Max conv depth: {max_conv_depth}")
 
     conv_lr_by_depth = { f"conv_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps) for depth in range(max_conv_depth + 1) }
     # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth) }
-    learning_rates_by_depth = conv_lr_by_depth | transformer_lr_by_depth | default_lr
+    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
+    default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) }
+    learning_rates_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
     tx = optax.multi_transform({
         depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3, b1=0.9, b2=0.999)
         for depth, lr_schedule in learning_rates_by_depth.items()
@@ -683,7 +716,8 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 8 * num_devices
+    batch_size = 64
+    mini_batch_size = 8 * num_devices
     num_steps = 200_000
     warmup_steps = 1000
     base_learning_rate = 1 * 1e-4
@@ -825,9 +859,10 @@ def main():
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
         num_steps=num_steps,
-        print_every=25,
+        print_every=10,
         key=training_key,
         testset_loss_every=checkpoint_every,
+        mini_batch_size=mini_batch_size,
     )
 
     checkpoint_manager.wait_until_finished()
