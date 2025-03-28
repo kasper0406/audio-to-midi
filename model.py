@@ -374,6 +374,103 @@ class SelfAttention(eqx.Module, strict=True):
         return projection.reshape(seq_length, self.num_heads, -1)
 
 
+class LocalSelfAttention(eqx.Module, strict = True):
+    self_attention: SelfAttention
+    context_length: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        context_length: int,
+        input_size: int,
+        output_size: int,
+        num_heads: int,
+        head_dim: int,
+        compressed_q_size: int,
+        compressed_kv_size: int,
+        dropout_rate: float = 0.0,
+        inference: bool = False,
+        *,
+        key: PRNGKeyArray,
+    ):
+        self.context_length = context_length
+
+        self.self_attention = SelfAttention(
+            input_size=input_size,
+            output_size=output_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            compressed_q_size=compressed_q_size,
+            compressed_kv_size=compressed_kv_size,
+            dropout_rate=dropout_rate,
+            inference=inference,
+            key=key,
+        )
+    
+    def __call__(
+        self,
+        inputs: Float[Array, "q_seq hidden_dim"],
+        rope_freqs: RopeFreqs,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+        enable_dropout: Optional[bool] = None,
+    ):
+        seq_len, hidden_dim = inputs.shape
+        window_size = self.context_length
+        stride = window_size // 2
+
+        # Pad the inputs to ensure everything is attended over
+        required_padding = stride - (seq_len - window_size) % stride
+        if required_padding != stride:
+            # TODO: Nicer way of doing this?
+            if required_padding % 2 == 0:
+                inputs = jnp.pad(inputs, ((required_padding // 2, required_padding // 2), (0, 0)), mode="constant")
+            else:
+                inputs = jnp.pad(inputs, ((required_padding // 2, required_padding // 2 + 1), (0, 0)), mode="constant")
+
+
+        # Compute number of windows
+        num_windows = (inputs.shape[0] - window_size) // stride + 1
+        start_indices = jnp.arange(num_windows) * stride
+
+        # Extract overlapping windows
+        def get_window(start_idx):
+            return jax.lax.dynamic_slice(inputs, (start_idx, 0), (window_size, hidden_dim))
+
+        input_windows = jax.vmap(get_window)(start_indices)  # (num_windows, window_size, hidden_dim)
+
+        # Apply self-attention to each window
+        def attend_fn(window, key):
+            return self.self_attention(window, rope_freqs, key=key, enable_dropout=enable_dropout)
+
+        if key is None:
+            keys = None
+        else:
+            keys = jnp.stack(_split_key(key, num_windows))
+        output_windows = jax.vmap(attend_fn)(input_windows, keys)  # (num_windows, window_size, hidden_dim)
+
+        # Prepare buffer for averaging overlapping results
+        token_offsets = jnp.arange(window_size)  # shape (window_size,)
+        all_token_indices = start_indices[:, None] + token_offsets[None, :]  # shape (num_windows, window_size)
+
+        # Flatten for scatter
+        flat_indices = all_token_indices.reshape(-1)  # shape (num_windows * window_size,)
+        flat_outputs = output_windows.reshape(-1, hidden_dim)  # shape (num_windows * window_size, hidden_dim)
+
+        # Step 4: Accumulate using scatter_add
+        output = jnp.zeros((seq_len, hidden_dim), dtype=inputs.dtype)
+        count = jnp.zeros((seq_len,), dtype=inputs.dtype)
+
+        output = output.at[flat_indices].add(flat_outputs)
+        count = count.at[flat_indices].add(1)
+
+        # jax.debug.print("output: {o}", o=output)
+        # jax.debug.print("count: {c}", c=count)
+
+        output = output / count[:, None]
+
+        return output
+
+
 class TransformerLayer(eqx.Module):
     attention_norm: eqx.nn.LayerNorm
     attention_block: SelfAttention
@@ -389,20 +486,36 @@ class TransformerLayer(eqx.Module):
         intermediate_size: int,
         num_heads: int,
         dropout_rate: float,
+        context_window: int | None = None,  # If context-window is specified, use local self-attention
         key: Optional[jax.random.PRNGKey] = None,
     ):
         self_attention_key, feed_forward_key = _split_key(key, 2)
 
-        self.attention_block = SelfAttention(
-            input_size=input_size,
-            output_size=input_size,
-            head_dim=attention_size,
-            num_heads=num_heads,
-            compressed_q_size=compressed_attention_q_size,
-            compressed_kv_size=compressed_attention_kv_size,
-            dropout_rate=dropout_rate,
-            key=self_attention_key,
-        )
+        if context_window is not None:
+            self.attention_block = LocalSelfAttention(
+                context_length=context_window,
+                input_size=input_size,
+                output_size=input_size,
+                head_dim=attention_size,
+                num_heads=num_heads,
+                compressed_q_size=compressed_attention_q_size,
+                compressed_kv_size=compressed_attention_kv_size,
+                dropout_rate=dropout_rate,
+                key=self_attention_key,
+            )
+        else:
+            self.attention_block = SelfAttention(
+                input_size=input_size,
+                output_size=input_size,
+                head_dim=attention_size,
+                num_heads=num_heads,
+                compressed_q_size=compressed_attention_q_size,
+                compressed_kv_size=compressed_attention_kv_size,
+                dropout_rate=dropout_rate,
+                key=self_attention_key,
+            )
+
+
         self.attention_norm = eqx.nn.LayerNorm(input_size)
 
         self.feed_forward_block = FeedForwardBlock(
@@ -442,6 +555,63 @@ class TransformerLayer(eqx.Module):
             )
         return h + r
 
+
+class AlternatingLocalAndGlobalAttention(eqx.Module):
+    local_attention: TransformerLayer
+    global_attention: TransformerLayer
+
+    def __init__(
+        self,
+        local_context_window: int,
+        input_size: int,
+        num_heads: int,
+        attention_size: int,
+        intermediate_size: int,
+        compressed_attention_q_size: int,
+        compressed_attention_kv_size: int,
+        dropout_rate: float = 0.0,
+        *,
+        key: PRNGKeyArray,
+    ):
+        local_key, global_key = _split_key(key, 2)
+        self.local_attention = TransformerLayer(
+            context_window=local_context_window,
+            input_size=input_size,
+            attention_size=attention_size,
+            compressed_attention_q_size=compressed_attention_q_size,
+            compressed_attention_kv_size=compressed_attention_kv_size,
+            intermediate_size=intermediate_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            key=local_key,
+        )
+        self.global_attention = TransformerLayer(
+            input_size=input_size,
+            attention_size=attention_size,
+            compressed_attention_q_size=compressed_attention_q_size,
+            compressed_attention_kv_size=compressed_attention_kv_size,
+            intermediate_size=intermediate_size,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+            key=global_key,
+        )
+    
+    def __call__(
+        self,
+        inputs: Float[Array, "seq_len hidden_dim"],
+        rope_freqs: RopeFreqs,
+        *,
+        key: Optional[PRNGKeyArray] = None,
+        enable_dropout: bool = False,
+    ) -> Float[Array, "seq_len hidden_dim"]:
+        global_key, local_key = _split_key(key, 2)
+
+        x = inputs
+        x = self.local_attention(x, rope_freqs, key=local_key, enable_dropout=enable_dropout)
+        x = self.global_attention(x, rope_freqs, key=global_key, enable_dropout=enable_dropout)
+        return x
+
+
 class TransformerStack(eqx.Module):
     layers: list[TransformerLayer]
     num_layers: int = eqx.field(static=True)
@@ -461,7 +631,8 @@ class TransformerStack(eqx.Module):
         self.num_layers = num_layers
 
         def make_layer(layer_key):
-            return TransformerLayer(
+            return AlternatingLocalAndGlobalAttention(
+                local_context_window=16,
                 input_size=input_size,
                 attention_size=attention_size,
                 compressed_attention_q_size=compressed_attention_q_size,

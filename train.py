@@ -101,7 +101,6 @@ def compute_testset_loss_individual(
         loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
         return jnp.sum(loss)
 
-    # @eqx.filter_jit(donate="all-except-first")
     @eqx.filter_jit
     @eqx.filter_vmap(
         in_axes=(eqx.if_array(0), eqx.if_array(0), None, None),
@@ -278,7 +277,7 @@ def train(
         @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         def minibatch_scan_body(carry, batch):
             accumulated_grads, state = carry
-            audio_minibatch, expected_outputs_minibatch = batch
+            audio_minibatch, expected_outputs_minibatch = jax.device_put(batch, batch_sharding)
 
             (scaled_loss, update_state), scaled_grads = compute_loss(
                 model_backward_dtype,
@@ -346,9 +345,6 @@ def train(
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
 
-        # print("Putting data on GPU...")
-        (events, audio) = jax.device_put(batch, batch_sharding)
-
         # Keep the old model state in memory until we are sure the loss is not nan
         # make sure to copy them so we can do donation
         if step % 100 == 0:
@@ -357,6 +353,7 @@ def train(
             recovery_opt_state = copy_pytree(flat_opt_state)
 
         # print(f"Executing step {step}")
+        events, audio = batch
         loss, flat_model, flat_state, flat_opt_state, key, grads_valid, scaled_loss = compute_training_step(
             tx,
             flat_model, 
@@ -681,8 +678,8 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
 
         if layername == "conv_layer":
             return max(acc[0], depth), acc[1]
-        elif layername == "transformer_layer":
-            return acc[0], max(acc[1], depth)
+        # elif layername == "transformer_layer":
+        #     return acc[0], max(acc[1], depth)
         else:
             return acc
     max_conv_depth, max_transformer_depth = jax.tree_util.tree_reduce(
@@ -692,18 +689,44 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     # print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
     print(f"Max conv depth: {max_conv_depth}")
 
-    conv_lr_by_depth = { f"conv_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps) for depth in range(max_conv_depth + 1) }
-    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) }
-    learning_rates_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
+    eps = 1e-3
+    b1 = 0.9
+    b2 = 0.999
+
+    base_cnn_rate = base_learning_rate  # / 10.0
+    conv_lr_by_depth = {
+        f"conv_layer|{depth}": optax.adamw(
+            create_learning_rate_schedule(base_cnn_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps),
+            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+        )
+        for depth in range(max_conv_depth + 1)
+    }
+    # conv_lr_by_depth = {
+    #     f"conv_layer|{depth}": optax.set_to_zero()
+    #     for depth in range(max_conv_depth + 1)
+    # }
+    # transformer_lr_by_depth = {
+    #     f"transformer_layer|{depth}": optax.adamw(
+    #         create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps),
+    #         weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+    #     )
+    #     for depth in range(max_transformer_depth + 1)
+    # }
+    default_lr = {
+        f"default|0": optax.adamw(
+            create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps),
+            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+        )
+    }
+    optimizers_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
     tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3, b1=0.9, b2=0.999)
-        for depth, lr_schedule in learning_rates_by_depth.items()
+        depth: optimizer
+        for depth, optimizer in optimizers_by_depth.items()
     }, depth_extracting_label_fn)
     tx = optax.chain(tx, optax.clip_by_global_norm(1.0))
 
-    return tx, default_lr["default|0"]
+    base_lr_schedule = create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps)
+    return tx, base_lr_schedule
 
 
 def main():
