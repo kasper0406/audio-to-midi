@@ -15,23 +15,29 @@ from pathlib import Path
 
 # Load the existing model with the currently specified architecture
 pretrained_model, pretrained_state = load_newest_checkpoint(
-    "/Volumes/git/ml/audio-to-midi/audio_to_midi_checkpoints",
+    "/home/knielsen/ml/models/audio-to-midi/audio_to_midi_checkpoints",
     ensemble_select=None,
 )
 
 new_config = {
-    "dims": [18, 36, 72, 144, 288, 576, 1152],
-    "depths": [3, 3, 3, 3, 3, 21, 3],
+    "dims": [ 18 * (2 ** i) for i in range(7) ],
+    "depths": [3, 3, 3, 3, 3, 9, 3],
+    "cnn_hidden_expansion": 2.0,
 
-    "num_transformer_layers": 4,
-    "num_transformer_heads": 4,
+    "num_transformer_layers": 12,
+    "num_transformer_heads": 2,
     "attention_size": 64,
     "compressed_attention_q_size": 64,
     "compressed_attention_kv_size": 64,
-    "transformer_dropout_rate": 0.1,
 
-    "sdd_rate": 0.1,
+    "transformer_dropout_rate": 0.1,
+    "transformer_hidden_dim": 256,
+    "transformer_hidden_expansion": 1.5,
+
+    "sdd_rate": 0.05,
 }
+
+
 main_keys = jnp.stack([
     jax.random.key(1),
 ])

@@ -7,7 +7,7 @@ import equinox as eqx
 import jax
 import jax.lib
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Integer, PRNGKeyArray
+from jaxtyping import Array, Float, Integer, PRNGKeyArray, Key
 import einops
 from rope import calculate_rope, RopeFreqs
 
@@ -18,20 +18,23 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [4 * (2 ** i) for i in range(7)],
-    "depths": [3, 3, 3, 3, 3, 21, 3],
+    "dims": [ 4 * (2 ** i) for i in range(8) ],
+    "depths": [2, 2, 2, 2, 2, 2, 2, 2],
     "cnn_hidden_expansion": 2.0,
 
-    "num_transformer_layers": 8,
-    "num_transformer_heads": 4,
+    "num_transformer_layers": 4,
+    "num_transformer_heads": 10,
     "attention_size": 64,
     "compressed_attention_q_size": 64,
     "compressed_attention_kv_size": 64,
+
     "transformer_dropout_rate": 0.1,
+    "transformer_hidden_dim": 640,
     "transformer_hidden_expansion": 2.0,
 
-    "sdd_rate": 0.1,
+    "sdd_rate": 0.02,
 }
+
 
 def get_model_metadata():
     metadata = {
@@ -45,6 +48,48 @@ def _split_key(key, num: int = 2):
         return [ None ] * num
     else:
         return jax.random.split(key, num)
+
+class LayerNorm(eqx.Module, strict=True):
+    channels: int = eqx.field(static=True)
+    eps: float = eqx.field(static=True)
+    axis: int = eqx.field(static=True)
+    weight: Float[Array, "channels"]
+    bias: Float[Array, "channels"]
+
+    def __init__(
+        self,
+        channels: int,
+        eps: float = 1e-5,
+        axis: int = 0,
+    ):
+        self.channels = channels
+        self.eps = eps
+        self.weight = jnp.ones((channels, ))
+        self.bias = jnp.zeros((channels, ))
+        self.axis = axis
+
+    @jax.named_scope("kapper.LayerNorm")
+    def __call__(
+        self,
+        x: Float[Array, "channels ..."],
+        *,
+        key: Key | None = None,
+    ) -> Array | tuple[Array, eqx.nn.State]:
+        orig_dtype = x.dtype
+        with jax.numpy_dtype_promotion("standard"):
+            dtype = jnp.result_type(x.dtype, jnp.float32)
+
+        x = x.astype(dtype)
+        mean = jnp.mean(x, axis=self.axis, keepdims=True)
+        variance = jnp.var(x, axis=self.axis, keepdims=True)
+        variance = jnp.maximum(0.0, variance)
+        inv = jax.lax.rsqrt(variance + self.eps)
+        out = (x - mean) * inv
+
+        broadcast = [slice(None, None), *[jnp.newaxis] * (x.ndim - 1)]
+        out = self.weight.astype(dtype)[*broadcast] * out  # pyright: ignore
+        out = out + self.bias.astype(dtype)[*broadcast]  # pyright: ignore
+        return out.astype(orig_dtype)
 
 class StochasticDepthDropout(eqx.Module, strict=True):
     p: float
@@ -83,7 +128,7 @@ class StochasticDepthDropout(eqx.Module, strict=True):
 
 class Stem(eqx.Module):
     conv: eqx.nn.Conv1d
-    norm: eqx.nn.LayerNorm
+    norm: LayerNorm
 
     def __init__(self, channels: int, kernel_size: int = 5, key: jax.random.PRNGKey = None):
         self.conv = eqx.nn.Conv1d(
@@ -93,15 +138,15 @@ class Stem(eqx.Module):
             stride=kernel_size,
             key=key,
         )
-        self.norm = eqx.nn.LayerNorm(channels)
+        self.norm = LayerNorm(channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
         out = self.conv(x)
-        return jax.vmap(self.norm, in_axes=1, out_axes=1)(out.astype(jnp.float32)).astype(out.dtype)
+        return self.norm(out.astype(jnp.float32)).astype(out.dtype)
 
 class Downsample(eqx.Module):
     conv: eqx.nn.Conv1d
-    norm: eqx.nn.LayerNorm
+    norm: LayerNorm
 
     def __init__(self, in_channels: int, out_channels: int, key: Optional[jax.random.PRNGKey] = None):
         self.conv = eqx.nn.Conv1d(
@@ -111,21 +156,37 @@ class Downsample(eqx.Module):
             stride=2,
             key=key,
         )
-        self.norm = eqx.nn.LayerNorm(in_channels)
+        self.norm = LayerNorm(in_channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(x.astype(jnp.float32)).astype(x.dtype)
+        out = self.norm(x.astype(jnp.float32)).astype(x.dtype)
         return self.conv(out)
+
+class GlobalResponseNorm(eqx.Module, strict=True):
+    gamma: Array
+    beta: Array
+
+    def __init__(self):
+        self.gamma = jnp.zeros((1,))
+        self.beta = jnp.zeros((1,))
+
+    def __call__(self, x):
+        # print(f"x.shape in grn: {x.shape}")
+        gx = jnp.sqrt(jnp.sum(x**2, axis=(1, ), keepdims=True) + 1e-6)
+        # print(f"gx.shape in grn: {gx.shape}")
+        nx = gx / (jnp.mean(gx, axis=-1, keepdims=True) + 1e-6)
+        # jax.debug.print("gamma = {gamma}, beta = {beta}", gamma=self.gamma.value, beta=self.beta.value)
+        return self.gamma * (x * nx) + self.beta + x
 
 class Block(eqx.Module):
     depth_conv: eqx.nn.Conv1d
     point_conv_1: eqx.nn.Conv1d
     point_conv_2: eqx.nn.Conv1d
     stochastic_depth_dropout: StochasticDepthDropout
-    norm: eqx.nn.LayerNorm
-    gamma: Array
+    norm: LayerNorm
+    global_response_norm: GlobalResponseNorm
 
-    def __init__(self, channels: int, hidden_dim: int, sdd_rate: float, kernel_size: int = 7, key: jax.random.PRNGKey = None):
+    def __init__(self, channels: int, hidden_dim: int, sdd_rate: float, kernel_size: int = 3, key: jax.random.PRNGKey = None):
         depth_conv_key, point_conv_1_key, point_conv_2_key = _split_key(key, 3)
 
         self.depth_conv = eqx.nn.Conv1d(
@@ -136,11 +197,11 @@ class Block(eqx.Module):
             key=depth_conv_key,
             padding="SAME",
         )
-        self.norm = eqx.nn.LayerNorm(channels)
+        self.norm = LayerNorm(channels)
 
         self.point_conv_1 = eqx.nn.Conv1d(
             in_channels=channels,
-            out_channels=hidden_dim,
+            out_channels=2 * hidden_dim,
             kernel_size=1,
             key=point_conv_1_key,
         )
@@ -154,16 +215,18 @@ class Block(eqx.Module):
 
         self.stochastic_depth_dropout = StochasticDepthDropout(sdd_rate)
 
-        layer_scale_value = 1e-6
-        self.gamma = jnp.ones(channels) * layer_scale_value
+        self.global_response_norm = GlobalResponseNorm()
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
         out = self.depth_conv(x)
-        out = jax.vmap(self.norm, in_axes=1, out_axes=1)(out.astype(jnp.float32)).astype(out.dtype)
+        out = self.norm(out.astype(jnp.float32)).astype(out.dtype)
         out = self.point_conv_1(out)
-        out = jax.nn.gelu(out)
+        x1, x2 = jnp.split(out, 2, axis=0)
+        out = jax.nn.gelu(x1) * x2
+        # print(f"Out shape: {out.shape}")
+        out = self.global_response_norm(out)
+        # out = jax.nn.relu(out)
         out = self.point_conv_2(out)
-        out = self.gamma[:, None] * out  # Layer scale
         return self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key) + x
 
 class Decoder(eqx.Module):
@@ -238,25 +301,6 @@ class FeedForwardBlock(eqx.Module):
         return output
 
 
-def dot_product_attention(
-    query: Float[Array, "q_seq qk_size"],
-    key_: Float[Array, "kv_seq qk_size"],
-    value: Float[Array, "kv_seq v_size"],
-    dropout: Optional[eqx.nn.Dropout] = None,
-    *,
-    key: Optional[PRNGKeyArray] = None,
-    inference: Optional[bool] = None,
-) -> Float[Array, "q_seq v_size"]:
-    query = query / jnp.sqrt(query.shape[-1])
-    logits = jnp.einsum("sd,Sd->sS", query, key_)
-    weights = jax.nn.softmax(logits.astype(jnp.float32)).astype(logits.dtype)
-
-    if dropout is not None:
-        weights = dropout(weights, key=key, inference=inference)
-    attn = jnp.einsum("sS,Sd->sd", weights, value)
-    return attn
-
-
 class SelfAttention(eqx.Module, strict=True):
     query_down_proj: eqx.nn.Linear | None = None
     query_up_proj: eqx.nn.Linear
@@ -265,6 +309,7 @@ class SelfAttention(eqx.Module, strict=True):
     value_up_proj: eqx.nn.Linear
     output_proj: eqx.nn.Linear
     dropout: eqx.nn.Dropout
+    local_attention_window: int | None = eqx.field(static=True)
 
     num_heads: int = eqx.field(static=True)
 
@@ -278,9 +323,11 @@ class SelfAttention(eqx.Module, strict=True):
         compressed_kv_size: int,
         dropout_rate: float = 0.0,
         inference: bool = False,
+        local_attention_window: int | None = None,
         *,
         key: PRNGKeyArray,
     ):
+        self.local_attention_window = local_attention_window
         q_down_key, q_up_key, kv_down_key, key_up_key, value_up_key, out_key = _split_key(key, 6)
 
         # if compressed_q_size != input_size:
@@ -356,14 +403,15 @@ class SelfAttention(eqx.Module, strict=True):
         key_heads = calculate_rope(self._project(self.key_up_proj, c_kv), rope_freqs)
         value_heads = self._project(self.value_up_proj, c_kv)
 
-        attn_fn = partial(
-            dot_product_attention, dropout=self.dropout, inference=not enable_dropout,
-        )
-        keys = None if key is None else jax.random.split(key, query_heads.shape[1])
-        # Batch `keys` down its 0-th dimension.
-        attn = jax.vmap(attn_fn, in_axes=1, out_axes=1)(
-            query_heads, key_heads, value_heads, key=keys
-        )
+        # TODO: Re-add dropout
+        # print(f"Query heads shape: {query_heads.shape}")
+        attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window, implementation="cudnn")
+        # attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window)
+        attn = attn_fn(query_heads, key_heads, value_heads)
+
+        # attn = jax.vmap(attn_fn, in_axes=1, out_axes=1)(
+        #     query_heads, key_heads, value_heads,
+        # )
         attn = attn.reshape(query_seq_length, -1)
 
         return jax.vmap(self.output_proj)(attn)
@@ -372,103 +420,6 @@ class SelfAttention(eqx.Module, strict=True):
         seq_length, _ = x.shape
         projection = jax.vmap(proj)(x)
         return projection.reshape(seq_length, self.num_heads, -1)
-
-
-class LocalSelfAttention(eqx.Module, strict = True):
-    self_attention: SelfAttention
-    context_length: int = eqx.field(static=True)
-
-    def __init__(
-        self,
-        context_length: int,
-        input_size: int,
-        output_size: int,
-        num_heads: int,
-        head_dim: int,
-        compressed_q_size: int,
-        compressed_kv_size: int,
-        dropout_rate: float = 0.0,
-        inference: bool = False,
-        *,
-        key: PRNGKeyArray,
-    ):
-        self.context_length = context_length
-
-        self.self_attention = SelfAttention(
-            input_size=input_size,
-            output_size=output_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            compressed_q_size=compressed_q_size,
-            compressed_kv_size=compressed_kv_size,
-            dropout_rate=dropout_rate,
-            inference=inference,
-            key=key,
-        )
-    
-    def __call__(
-        self,
-        inputs: Float[Array, "q_seq hidden_dim"],
-        rope_freqs: RopeFreqs,
-        *,
-        key: Optional[PRNGKeyArray] = None,
-        enable_dropout: Optional[bool] = None,
-    ):
-        seq_len, hidden_dim = inputs.shape
-        window_size = self.context_length
-        stride = window_size // 2
-
-        # Pad the inputs to ensure everything is attended over
-        required_padding = stride - (seq_len - window_size) % stride
-        if required_padding != stride:
-            # TODO: Nicer way of doing this?
-            if required_padding % 2 == 0:
-                inputs = jnp.pad(inputs, ((required_padding // 2, required_padding // 2), (0, 0)), mode="constant")
-            else:
-                inputs = jnp.pad(inputs, ((required_padding // 2, required_padding // 2 + 1), (0, 0)), mode="constant")
-
-
-        # Compute number of windows
-        num_windows = (inputs.shape[0] - window_size) // stride + 1
-        start_indices = jnp.arange(num_windows) * stride
-
-        # Extract overlapping windows
-        def get_window(start_idx):
-            return jax.lax.dynamic_slice(inputs, (start_idx, 0), (window_size, hidden_dim))
-
-        input_windows = jax.vmap(get_window)(start_indices)  # (num_windows, window_size, hidden_dim)
-
-        # Apply self-attention to each window
-        def attend_fn(window, key):
-            return self.self_attention(window, rope_freqs, key=key, enable_dropout=enable_dropout)
-
-        if key is None:
-            keys = None
-        else:
-            keys = jnp.stack(_split_key(key, num_windows))
-        output_windows = jax.vmap(attend_fn)(input_windows, keys)  # (num_windows, window_size, hidden_dim)
-
-        # Prepare buffer for averaging overlapping results
-        token_offsets = jnp.arange(window_size)  # shape (window_size,)
-        all_token_indices = start_indices[:, None] + token_offsets[None, :]  # shape (num_windows, window_size)
-
-        # Flatten for scatter
-        flat_indices = all_token_indices.reshape(-1)  # shape (num_windows * window_size,)
-        flat_outputs = output_windows.reshape(-1, hidden_dim)  # shape (num_windows * window_size, hidden_dim)
-
-        # Step 4: Accumulate using scatter_add
-        output = jnp.zeros((seq_len, hidden_dim), dtype=inputs.dtype)
-        count = jnp.zeros((seq_len,), dtype=inputs.dtype)
-
-        output = output.at[flat_indices].add(flat_outputs)
-        count = count.at[flat_indices].add(1)
-
-        # jax.debug.print("output: {o}", o=output)
-        # jax.debug.print("count: {c}", c=count)
-
-        output = output / count[:, None]
-
-        return output
 
 
 class TransformerLayer(eqx.Module):
@@ -490,31 +441,17 @@ class TransformerLayer(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):
         self_attention_key, feed_forward_key = _split_key(key, 2)
-
-        if context_window is not None:
-            self.attention_block = LocalSelfAttention(
-                context_length=context_window,
-                input_size=input_size,
-                output_size=input_size,
-                head_dim=attention_size,
-                num_heads=num_heads,
-                compressed_q_size=compressed_attention_q_size,
-                compressed_kv_size=compressed_attention_kv_size,
-                dropout_rate=dropout_rate,
-                key=self_attention_key,
-            )
-        else:
-            self.attention_block = SelfAttention(
-                input_size=input_size,
-                output_size=input_size,
-                head_dim=attention_size,
-                num_heads=num_heads,
-                compressed_q_size=compressed_attention_q_size,
-                compressed_kv_size=compressed_attention_kv_size,
-                dropout_rate=dropout_rate,
-                key=self_attention_key,
-            )
-
+        self.attention_block = SelfAttention(
+            input_size=input_size,
+            output_size=input_size,
+            head_dim=attention_size,
+            num_heads=num_heads,
+            compressed_q_size=compressed_attention_q_size,
+            compressed_kv_size=compressed_attention_kv_size,
+            dropout_rate=dropout_rate,
+            key=self_attention_key,
+            local_attention_window=context_window,
+        )
 
         self.attention_norm = eqx.nn.LayerNorm(input_size)
 
@@ -557,12 +494,10 @@ class TransformerLayer(eqx.Module):
 
 
 class AlternatingLocalAndGlobalAttention(eqx.Module):
-    local_attention: TransformerLayer
-    global_attention: TransformerLayer
+    attention_layers: List[TransformerLayer]
 
     def __init__(
         self,
-        local_context_window: int,
         input_size: int,
         num_heads: int,
         attention_size: int,
@@ -573,28 +508,23 @@ class AlternatingLocalAndGlobalAttention(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        local_key, global_key = _split_key(key, 2)
-        self.local_attention = TransformerLayer(
-            context_window=local_context_window,
-            input_size=input_size,
-            attention_size=attention_size,
-            compressed_attention_q_size=compressed_attention_q_size,
-            compressed_attention_kv_size=compressed_attention_kv_size,
-            intermediate_size=intermediate_size,
-            num_heads=num_heads,
-            dropout_rate=dropout_rate,
-            key=local_key,
-        )
-        self.global_attention = TransformerLayer(
-            input_size=input_size,
-            attention_size=attention_size,
-            compressed_attention_q_size=compressed_attention_q_size,
-            compressed_attention_kv_size=compressed_attention_kv_size,
-            intermediate_size=intermediate_size,
-            num_heads=num_heads,
-            dropout_rate=dropout_rate,
-            key=global_key,
-        )
+        # attention_windows = [(50, 0), (50, 0), (50, 0), None]
+        attention_windows = [None, None, None]
+        keys = _split_key(key, len(attention_windows))
+
+        self.attention_layers = []
+        for attention_window, key in zip(attention_windows, keys):
+            self.attention_layers.append(TransformerLayer(
+                context_window=attention_window,
+                input_size=input_size,
+                attention_size=attention_size,
+                compressed_attention_q_size=compressed_attention_q_size,
+                compressed_attention_kv_size=compressed_attention_kv_size,
+                intermediate_size=intermediate_size,
+                num_heads=num_heads,
+                dropout_rate=dropout_rate,
+                key=key,
+            ))
     
     def __call__(
         self,
@@ -604,11 +534,12 @@ class AlternatingLocalAndGlobalAttention(eqx.Module):
         key: Optional[PRNGKeyArray] = None,
         enable_dropout: bool = False,
     ) -> Float[Array, "seq_len hidden_dim"]:
-        global_key, local_key = _split_key(key, 2)
-
         x = inputs
-        x = self.local_attention(x, rope_freqs, key=local_key, enable_dropout=enable_dropout)
-        x = self.global_attention(x, rope_freqs, key=global_key, enable_dropout=enable_dropout)
+
+        keys = _split_key(key, len(self.attention_layers))
+        for layer, key in zip(self.attention_layers, keys):
+            x = layer(x, rope_freqs, key=key, enable_dropout=enable_dropout)
+
         return x
 
 
@@ -632,7 +563,6 @@ class TransformerStack(eqx.Module):
 
         def make_layer(layer_key):
             return AlternatingLocalAndGlobalAttention(
-                local_context_window=16,
                 input_size=input_size,
                 attention_size=attention_size,
                 compressed_attention_q_size=compressed_attention_q_size,
@@ -672,7 +602,7 @@ class TransformerStack(eqx.Module):
 
 class OutputSequenceGenerator(eqx.Module):
     layers: list[eqx.nn.Sequential]
-    norm: eqx.nn.LayerNorm
+    norm: LayerNorm
     transformer_projection: eqx.nn.Linear | None = None
     transformer: TransformerStack
     decoder: Decoder
@@ -713,7 +643,8 @@ class OutputSequenceGenerator(eqx.Module):
             ]))
             depth_count += depths[i]
 
-        self.norm = eqx.nn.LayerNorm(dims[-1])
+        self.norm = LayerNorm(dims[-1])
+        # self.decoder = Decoder(dims[-1], key=decoder_key)
 
         transformer_hidden_dim = conf.get("transformer_hidden_dim", dims[-1])
         if transformer_hidden_dim != dims[-1]:
@@ -756,9 +687,9 @@ class OutputSequenceGenerator(eqx.Module):
         h = samples
         for layer, layer_key in zip(self.layers, layer_keys):
             h = layer(h, key=layer_key)
-        h = jax.vmap(self.norm, in_axes=1, out_axes=1)(h.astype(jnp.float32)).astype(h.dtype)
+        h = self.norm(h.astype(jnp.float32)).astype(h.dtype)
 
-        # Compute Transformer layers
+        # # Compute Transformer layers
         h = jnp.transpose(h)
         if self.transformer_projection is not None:
             h = jax.vmap(self.transformer_projection)(h)

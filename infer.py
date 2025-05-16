@@ -101,7 +101,7 @@ def detailed_event_loss(
     to help evaluate how good a prediction is in a more detailed and "closer
     to the music way" than the ordinary loss function.
     """
-    predicted = modelutil.extract_events(np.array(output_probs))
+    predicted = modelutil.extract_events(np.array(output_probs, dtype=np.float32))
     predicted = modelutil.to_frame_events([predicted], output_probs.shape[0])[0]
     expected = expected[:predicted.shape[0]]
 
@@ -315,7 +315,7 @@ def main():
     # Access the input file path from the parsed arguments
     input_file = args.input_file
 
-    model, state = load_newest_checkpoint("/Volumes/git/ml/audio-to-midi/audio_to_midi_checkpoints")  # Assuming this function exists
+    model, state = load_newest_checkpoint("/home/knielsen/ml/models/audio-to-midi/audio_to_midi_checkpoints")  # Assuming this function exists
 
     if args.validation:
         # Calculate and report the validation loss for the directory

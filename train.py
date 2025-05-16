@@ -33,25 +33,31 @@ from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
 
 MODEL_DTYPE = jnp.float32
-FORWARD_DTYPE = jnp.float16
-BACKWARD_DTYPE = jnp.float16
+# FORWARD_DTYPE = jnp.float8_e4m3fn
+# FORWARD_DTYPE = jnp.float8_e4m3fn
+# BACKWARD_DTYPE = jnp.float8_e4m3fn
+FORWARD_DTYPE = jnp.bfloat16
+BACKWARD_DTYPE = jnp.bfloat16
 
 @eqx.filter_jit(donate="all")
 def compute_loss_from_output(logits, expected_output, scale):
     # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=-1.0))(logits, expected_output)
     # jax.debug.print("logits = {l}", l=logits)
-    loss = jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
+    # loss = 10 * jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
+    # loss = jax.vmap(optax.losses.sigmoid_focal_loss)(logits, expected_output)
+    loss = 100 * jax.vmap(partial(optax.sigmoid_focal_loss, gamma=1.0, alpha=0.8))(logits, expected_output)
     scaled_loss = loss * scale
     # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
 
-    return jnp.sum(scaled_loss)
+    return jnp.mean(scaled_loss)
 
 @eqx.filter_jit(donate="all-except-first")
 @eqx.filter_value_and_grad(has_aux=True)
+# @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
 def compute_loss(model_back_precision, state, audio, rope_freqs, expected_outputs, scale, key):
     batch_size = audio.shape[0]
     batched_keys = jax.random.split(key, num=batch_size)
-    model_back_precision = change_fp_precision(model_back_precision, dtype=FORWARD_DTYPE)
+    # model_forward_precision = change_fp_precision(change_fp_precision(model_back_precision, dtype=MODEL_DTYPE), dtype=FORWARD_DTYPE)
     audio = audio.astype(dtype=FORWARD_DTYPE)
     (logits, probs), state = jax.vmap(
         model_back_precision, in_axes=(0, None, None, 0, None), out_axes=(0, None), axis_name="batch",
@@ -61,11 +67,14 @@ def compute_loss(model_back_precision, state, audio, rope_freqs, expected_output
     loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
-@eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0), None))
-def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state, rope_freqs: RopeFreqs):
+@eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0), None, None))
+def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state, rope_freqs: RopeFreqs, batch_sharding: NamedSharding):
+    model = change_fp_precision(model, dtype=FORWARD_DTYPE)
     # TODO(knielsen): Find a better way of doing this
+
+    samples = jax.device_put(jnp.zeros((batch_size, 2, int(sample_rate * audio_duration)), dtype=FORWARD_DTYPE), batch_sharding)
     (find_shape_output_logits, _), _ = jax.vmap(model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(
-        jnp.zeros((batch_size, 2, int(sample_rate * audio_duration))),
+        samples,
         state,
         rope_freqs,
     )
@@ -99,7 +108,7 @@ def compute_testset_loss_individual(
     @eqx.filter_jit(donate="all-except-first")
     def testset_loss_function(logits, expected_output):
         loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
-        return jnp.sum(loss)
+        return jnp.mean(loss)
 
     # @eqx.filter_jit(donate="all-except-first")
     @eqx.filter_jit
@@ -218,7 +227,7 @@ def train(
     opt_state_ensemble: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
     learning_rate_schedule: Callable,
-    device_mesh: [],
+    data_sharding: NamedSharding,
     num_model_output_frames: int,
     rope_freqs: RopeFreqs,
     testset_dirs: Dict[str, Path],
@@ -234,14 +243,6 @@ def train(
         checkpoint_manager.latest_step() + 1
         if checkpoint_manager.latest_step() is not None
         else 1
-    )
-
-    batch_mesh = Mesh(device_mesh, ("batch",))
-    batch_sharding = NamedSharding(
-        batch_mesh,
-        PartitionSpec(
-            "batch",
-        ),
     )
 
     @eqx.filter_vmap
@@ -278,7 +279,9 @@ def train(
         @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         def minibatch_scan_body(carry, batch):
             accumulated_grads, state = carry
-            audio_minibatch, expected_outputs_minibatch = batch
+            audio_minibatch, expected_outputs_minibatch = jax.device_put(batch, data_sharding)
+            # print(f"audio_minibatch shape: {audio_minibatch.shape}")
+            # print(f"expected_outputs_minibatch shape: {expected_outputs_minibatch.shape}")
 
             (scaled_loss, update_state), scaled_grads = compute_loss(
                 model_backward_dtype,
@@ -286,7 +289,7 @@ def train(
                 audio=audio_minibatch,
                 rope_freqs=jax.tree_util.tree_map(lambda x: x, rope_freqs),
                 expected_outputs=expected_outputs_minibatch,
-                scale=jnp.array(grad_scale, dtype=jnp.float16),
+                scale=jnp.array(grad_scale, dtype=jnp.float32),
                 key=key,
             )
 
@@ -308,6 +311,7 @@ def train(
         audio_minibatches = einops.rearrange(audio, "(b m) ... -> b m ...", m=minibatch_size)
         expected_outputs_minibatches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=minibatch_size)
         minibatch_steps = audio_minibatches.shape[0]
+        print(f"Minibatch steps: {minibatch_steps}")
         (accumulated_grads, update_state), losses = jax.lax.scan(
             minibatch_scan_body,
             (zero_grads, state),
@@ -332,6 +336,7 @@ def train(
         loss = scaled_loss / grad_scale
         return loss, update_flat_model, update_update_state, update_flat_opt_state, new_key, grads_valid, scaled_loss
 
+
     def copy_pytree(tree):
         def copy_leaf(x):
             if isinstance(x, jnp.ndarray):
@@ -345,9 +350,7 @@ def train(
     grad_scale = 1.0
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, noise_key = jax.random.split(key, 2)
-
-        # print("Putting data on GPU...")
-        (events, audio) = jax.device_put(batch, batch_sharding)
+        events, audio = batch
 
         # Keep the old model state in memory until we are sure the loss is not nan
         # make sure to copy them so we can do donation
@@ -365,7 +368,7 @@ def train(
             audio,
             events,
             key,
-            jnp.array(grad_scale, dtype=jnp.float16),
+            jnp.array(grad_scale, dtype=jnp.float32),
         )
         # print(f"Finished executing step {step}")
 
@@ -428,7 +431,7 @@ def train(
                     testset_dir,
                     num_model_output_frames,
                     eval_key,
-                    batch_sharding,
+                    data_sharding,
                 )
                 # testset_hitrates[name] = float(hit_rate)
                 print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
@@ -491,7 +494,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
         return leaf.at[index_to_mutate, ...].set(updated_weights)
 
     def recombine(model_ensemble, parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
-        recombination_rate = 0.000001  # 0,0001% chance of recombining
+        recombination_rate = 0.0001  # chance of recombining
 
         recombination_steps = 0
         current_parent_idx = 1  # Always start with parent_a weights (inversed in first recombination_steps sampling)
@@ -574,8 +577,8 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 
 
 def init_model(model, key: jax.random.PRNGKey):
-    head_weight_std = 0.2
-    cnn_weight_std = 0.2
+    head_weight_std = 0.02
+    cnn_weight_std = 0.02
     cnn_bias_std = 0.01
 
     def flatten(lst):
@@ -644,6 +647,10 @@ def init_model(model, key: jax.random.PRNGKey):
     ]
     model = eqx.tree_at(get_cnn_biases, model, new_cnn_biases)
 
+    # Initialize decoder to output 0
+    model = eqx.tree_at(lambda m: m.decoder.decoder_pooling.weight, model, jnp.zeros_like(model.decoder.decoder_pooling.weight))
+    model = eqx.tree_at(lambda m: m.decoder.decoder_pooling.bias, model, jnp.zeros_like(model.decoder.decoder_pooling.bias))
+
     return model
 
 def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, weight_decay: float, warmup_steps: int, num_steps: int):
@@ -681,8 +688,8 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
 
         if layername == "conv_layer":
             return max(acc[0], depth), acc[1]
-        elif layername == "transformer_layer":
-            return acc[0], max(acc[1], depth)
+        # elif layername == "transformer_layer":
+        #     return acc[0], max(acc[1], depth)
         else:
             return acc
     max_conv_depth, max_transformer_depth = jax.tree_util.tree_reduce(
@@ -692,38 +699,66 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     # print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
     print(f"Max conv depth: {max_conv_depth}")
 
-    conv_lr_by_depth = { f"conv_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps) for depth in range(max_conv_depth + 1) }
-    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    # transformer_lr_by_depth = { f"transformer_layer|{depth}": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) for depth in range(max_transformer_depth + 1) }
-    default_lr = { f"default|0": create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps) }
-    learning_rates_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
+    eps = 1e-3
+    b1 = 0.9
+    b2 = 0.999
+
+    base_cnn_rate = base_learning_rate  # / 10.0
+    conv_lr_by_depth = {
+        f"conv_layer|{depth}": optax.adamw(
+            create_learning_rate_schedule(base_cnn_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps),
+            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+        )
+        for depth in range(max_conv_depth + 1)
+    }
+    # conv_lr_by_depth = {
+    #     f"conv_layer|{depth}": optax.set_to_zero()
+    #     for depth in range(max_conv_depth + 1)
+    # }
+    # transformer_lr_by_depth = {
+    #     f"transformer_layer|{depth}": optax.adamw(
+    #         create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps),
+    #         weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+    #     )
+    #     for depth in range(max_transformer_depth + 1)
+    # }
+    default_lr = {
+        f"default|0": optax.adamw(
+            create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps),
+            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
+        )
+    }
+    optimizers_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
     tx = optax.multi_transform({
-        depth: optax.adamw(lr_schedule, weight_decay=weight_decay, eps=1e-3, b1=0.9, b2=0.999)
-        for depth, lr_schedule in learning_rates_by_depth.items()
+        depth: optimizer
+        for depth, optimizer in optimizers_by_depth.items()
     }, depth_extracting_label_fn)
     tx = optax.chain(tx, optax.clip_by_global_norm(1.0))
 
-    return tx, default_lr["default|0"]
+    base_lr_schedule = create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps)
+    return tx, base_lr_schedule
 
 
 def main():
     current_directory = Path(__file__).resolve().parent
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/test/")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6")
+    # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6/logic_dataset_2")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried/")
     testset_dirs = {
-        'validation_set': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set"),
-        'validation_sets_only_yamaha': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        'validation_set_generated': Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_generated"),
+        'validation_set': Path("/home/knielsen/ml/datasets/midi-to-sound/validation_set"),
+        'validation_sets_only_yamaha': Path("/home/knielsen/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
+        'validation_set_generated': Path("/home/knielsen/ml/datasets/midi-to-sound/validation_set_generated"),
     }
 
     num_devices = len(jax.devices())
 
-    batch_size = 64
-    minibatch_size = 8 * num_devices
-    num_steps = 200_000
+    batch_size = 128
+    minibatch_size = 128 * num_devices
+    num_steps = 300_000
     warmup_steps = 1000
-    base_learning_rate = 1 * 1e-4
-    layer_lr_decay = 0.7
-    weight_decay = 0.005
+    base_learning_rate = 1 * 1e-3
+    layer_lr_decay = 0.95
+    weight_decay = 0.0001
     model_init_keys = jnp.stack([
         jax.random.key(1),
         # jax.random.key(2),
@@ -744,9 +779,9 @@ def main():
         label_smoothing_alpha=0.005,
     )
 
-    checkpoint_every = 20
+    checkpoint_every = 1000
     checkpoints_to_keep = 3
-    dataset_num_workers = 3
+    dataset_num_workers = 2
 
     main_key = jax.random.PRNGKey(1234)
     training_key, = jax.random.split(main_key, num=1)
@@ -760,13 +795,13 @@ def main():
     h_params["train/warmup_steps"] = warmup_steps
     summary_writer.add_hparams(h_params, {})
 
-    rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+    rope_freqs = precompute_frequencies(model_config["attention_size"], 250)
 
     @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
     def make_ensemble(key):
         init_key_1, init_key_2 = jax.random.split(key, num=2)
         model, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, init_key_1)
-        # model = init_model(model, key=init_key_2)
+        model = init_model(model, key=init_key_2)
         return model, state
 
     audio_to_midi_ensemble, model_states = make_ensemble(model_init_keys)
@@ -809,8 +844,14 @@ def main():
 
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
-    mesh_replicate_everywhere = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(mesh_replicate_everywhere, PartitionSpec())
+    device_mesh = Mesh(device_mesh, axis_names=("_"))
+    replicate_everywhere = NamedSharding(device_mesh, PartitionSpec())
+    data_sharding = NamedSharding(
+        device_mesh,
+        PartitionSpec(
+            "_",
+        ),
+    )
 
     # TODO(knielsen): Refactor to a function?
     model_params, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_array)
@@ -829,7 +870,7 @@ def main():
 
     sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
     audio_duration = MODEL_AUDIO_LENGTH
-    num_model_output_frames = compute_model_output_frames(minibatch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs)
+    num_model_output_frames = compute_model_output_frames(minibatch_size, sample_rate, audio_duration, audio_to_midi_ensemble, model_states, rope_freqs, data_sharding)
     print(f"Model output frames: {num_model_output_frames}")
 
     print("Setting up dataset loader...")
@@ -855,12 +896,12 @@ def main():
         opt_state_ensemble,
         checkpoint_manager,
         learning_rate_schedule=base_learning_rate_schedule,
-        device_mesh=device_mesh,
+        data_sharding=data_sharding,
         rope_freqs=rope_freqs,
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
         num_steps=num_steps,
-        print_every=10,
+        print_every=5,
         key=training_key,
         testset_loss_every=checkpoint_every,
         minibatch_size=minibatch_size,
@@ -870,18 +911,25 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.9'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
     os.environ['XLA_FLAGS'] = (
         '--xla_gpu_enable_triton_gemm=true '
         '--xla_gpu_enable_latency_hiding_scheduler=true '
         '--xla_gpu_enable_highest_priority_async_stream=true '
         '--xla_gpu_all_reduce_combine_threshold_bytes=51200 '
         '--xla_gpu_graph_level=0 '
+        '--xla_gpu_autotune_level=1 '
+        '--xla_gpu_per_fusion_autotune_cache_dir=xla_autotune_results '
+
+        # '--xla_gpu_strict_conv_algorithm_picker=false '
+
+        # '--xla_dump_to="/home/knielsen/xla_debug" '
     )
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.threefry_partitionable(True)
-    jax.default_matmul_precision("BF16_BF16_BF16")
+    # jax.default_matmul_precision("BF16_BF16_BF16")
+    jax.default_matmul_precision("ANY_F8_ANY_F8_F32")
 
     # with jax.profiler.trace("/tmp/jax-trace"):
     main()
