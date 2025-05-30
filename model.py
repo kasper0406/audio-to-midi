@@ -405,13 +405,9 @@ class SelfAttention(eqx.Module, strict=True):
 
         # TODO: Re-add dropout
         # print(f"Query heads shape: {query_heads.shape}")
-        attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window, implementation="cudnn")
-        # attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window)
+        # attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window, implementation="cudnn")
+        attn_fn = partial(jax.nn.dot_product_attention, local_window_size=self.local_attention_window)
         attn = attn_fn(query_heads, key_heads, value_heads)
-
-        # attn = jax.vmap(attn_fn, in_axes=1, out_axes=1)(
-        #     query_heads, key_heads, value_heads,
-        # )
         attn = attn.reshape(query_seq_length, -1)
 
         return jax.vmap(self.output_proj)(attn)
@@ -508,8 +504,7 @@ class AlternatingLocalAndGlobalAttention(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        # attention_windows = [(50, 0), (50, 0), (50, 0), None]
-        attention_windows = [None, None, None]
+        attention_windows = [50, 50, 50, None]
         keys = _split_key(key, len(attention_windows))
 
         self.attention_layers = []
@@ -574,7 +569,10 @@ class TransformerStack(eqx.Module):
             )
 
         keys = _split_key(key, num=num_layers)
-        self.layers = eqx.filter_vmap(make_layer)(keys)
+        # self.layers = eqx.filter_vmap(make_layer)(keys)
+        self.layers = []
+        for layer_key in keys:
+            self.layers.append(make_layer(layer_key))
 
     def __call__(
         self,
@@ -583,19 +581,26 @@ class TransformerStack(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "seq_len attention_size"]:
-        dynamic_layers, static_layer = eqx.partition(self.layers, eqx.is_inexact_array)
+        # dynamic_layers, static_layer = eqx.partition(self.layers, eqx.is_inexact_array)
 
-        @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
-        def f(x, spec):
-            dynamic_layer, layer_key = spec
-            layer = eqx.combine(dynamic_layer, static_layer)
-            return layer(x, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=layer_key), None
+        # @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+        # def f(x, spec):
+        #     dynamic_layer, layer_key = spec
+        #     layer = eqx.combine(dynamic_layer, static_layer)
+        #     return layer(x, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=layer_key), None
 
-        if key is None:
-            layer_keys = None
-        else:
-            layer_keys = jnp.stack(_split_key(key, num=self.num_layers))
-        output, _ = jax.lax.scan(f, inputs, (dynamic_layers, layer_keys))
+        # if key is None:
+        #     layer_keys = None
+        # else:
+        #     layer_keys = jnp.stack(_split_key(key, num=self.num_layers))
+        # print(f"Dynamic layers: {dynamic_layers}")
+        # print(f"Layer keys: {layer_keys}")
+        # output, _ = jax.lax.scan(f, inputs, (dynamic_layers, layer_keys))
+
+        output = inputs
+        layer_keys = _split_key(key, num=len(self.layers)) if key is not None else [None] * len(self.layers)
+        for layer, layer_key in zip(self.layers, layer_keys):
+            output = layer(output, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=layer_key)
 
         return output
 
@@ -607,11 +612,17 @@ class OutputSequenceGenerator(eqx.Module):
     transformer: TransformerStack
     decoder: Decoder
 
+    recombination_rate: Array
+    mutation_rate: Array
+
     def __init__(
         self,
         conf: Dict[str, any],
         key: Optional[jax.random.PRNGKey] = None,
     ):
+        self.recombination_rate = jnp.array([1e-8], dtype=jnp.float32)
+        self.mutation_rate = jnp.array([1e-7], dtype=jnp.float32)
+
         layers_key, decoder_key, transformer_projection_key, transformer_key = _split_key(key, 4)
 
         dims = conf["dims"]

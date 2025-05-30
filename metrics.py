@@ -6,5 +6,5 @@ def configure_tensorboard() -> SummaryWriter:
     now = datetime.now()
     train_time = now.isoformat(timespec='seconds')
 
-    summary_writer = SummaryWriter(f"runs/{train_time}")
+    summary_writer = SummaryWriter(f"runs/{train_time}", flush_secs=10)
     return summary_writer

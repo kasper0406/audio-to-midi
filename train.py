@@ -14,7 +14,7 @@ import jax.flatten_util
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
@@ -31,21 +31,24 @@ from rope import precompute_frequencies, RopeFreqs
 
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
+from absl import app
 
 MODEL_DTYPE = jnp.float32
 # FORWARD_DTYPE = jnp.float8_e4m3fn
-# FORWARD_DTYPE = jnp.float8_e4m3fn
-# BACKWARD_DTYPE = jnp.float8_e4m3fn
+# FORWARD_DTYPE = jnp.float8_e5m2
+# BACKWARD_DTYPE = jnp.float8_e5m2
 FORWARD_DTYPE = jnp.bfloat16
 BACKWARD_DTYPE = jnp.bfloat16
+# FORWARD_DTYPE = jnp.float32
+# BACKWARD_DTYPE = jnp.float32
 
 @eqx.filter_jit(donate="all")
 def compute_loss_from_output(logits, expected_output, scale):
     # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=-1.0))(logits, expected_output)
     # jax.debug.print("logits = {l}", l=logits)
-    # loss = 10 * jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
+    loss = 10 * jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
     # loss = jax.vmap(optax.losses.sigmoid_focal_loss)(logits, expected_output)
-    loss = 100 * jax.vmap(partial(optax.sigmoid_focal_loss, gamma=1.0, alpha=0.8))(logits, expected_output)
+    # loss = 100 * jax.vmap(partial(optax.sigmoid_focal_loss, gamma=1.0, alpha=0.8))(logits, expected_output)
     scaled_loss = loss * scale
     # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
 
@@ -67,6 +70,7 @@ def compute_loss(model_back_precision, state, audio, rope_freqs, expected_output
     loss = jax.vmap(compute_loss_from_output, in_axes=(0, 0, None))(logits, expected_outputs, scale)
     return jnp.mean(loss), state
 
+@eqx.filter_jit
 @eqx.filter_vmap(in_axes=(None, None, None, eqx.if_array(0), eqx.if_array(0), None, None))
 def compute_model_output_frames(batch_size, sample_rate: int, audio_duration: float, model, state, rope_freqs: RopeFreqs, batch_sharding: NamedSharding):
     model = change_fp_precision(model, dtype=FORWARD_DTYPE)
@@ -99,7 +103,7 @@ def compute_testset_loss_individual(
     testset_dir: Path,
     num_model_output_frames: int,
     key: jax.random.PRNGKey,
-    sharding,
+    sharding: NamedSharding,
     batch_size: int = 32,
 ):
     batches = load_test_set(testset_dir, num_model_output_frames, sharding, batch_size=batch_size)
@@ -107,10 +111,9 @@ def compute_testset_loss_individual(
 
     @eqx.filter_jit(donate="all-except-first")
     def testset_loss_function(logits, expected_output):
-        loss = jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
+        loss = 10 * jax.vmap(optax.sigmoid_binary_cross_entropy)(logits, expected_output)
         return jnp.mean(loss)
 
-    # @eqx.filter_jit(donate="all-except-first")
     @eqx.filter_jit
     @eqx.filter_vmap(
         in_axes=(eqx.if_array(0), eqx.if_array(0), None, None),
@@ -118,19 +121,22 @@ def compute_testset_loss_individual(
     )
     def run_inference_single_model(inference_model, state, audio, midi_events):
         # Compute the full batched model, even though we only compute one audio sample
-        pretend_batch_audio = jnp.zeros((1, *audio.shape))
-        pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio)
+        min_sharding = len(sharding.mesh.devices)
+        pretend_batch_audio = jnp.zeros((min_sharding, *audio.shape), dtype=FORWARD_DTYPE)
+        pretend_batch_audio = pretend_batch_audio.at[0, ...].set(audio.astype(FORWARD_DTYPE))
+        pretend_batch_audio = jax.device_put(pretend_batch_audio, sharding)
 
-        pretend_batch_midi_events = jnp.zeros((1, *midi_events.shape))
+        pretend_batch_midi_events = jnp.zeros((min_sharding, *midi_events.shape), dtype=MODEL_DTYPE)
         pretend_batch_midi_events = pretend_batch_midi_events.at[0, ...].set(midi_events)
 
         (logits, probs), _new_state = jax.vmap(inference_model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch")(pretend_batch_audio, state, rope_freqs)
-        test_losses = jax.vmap(testset_loss_function)(logits, pretend_batch_midi_events)
+        test_losses = jax.vmap(testset_loss_function)(logits.astype(MODEL_DTYPE), pretend_batch_midi_events)
         return logits[0, ...], probs[0, ...], test_losses[0, ...]
 
     generate_visualizations = len(batches) < 30
 
-    inference_model = eqx.nn.inference_mode(model_ensemble)
+    inference_model = change_fp_precision(model_ensemble, dtype=FORWARD_DTYPE)
+    inference_model = eqx.nn.inference_mode(inference_model)
     loss_map = {}
     for sample_name, audios, midi_events in batches:
         logits_all = []
@@ -227,7 +233,10 @@ def train(
     opt_state_ensemble: optax.OptState,
     checkpoint_manager: ocp.CheckpointManager,
     learning_rate_schedule: Callable,
+    device_mesh: Mesh,
+    replicate_everywhere: NamedSharding,
     data_sharding: NamedSharding,
+    model_sharding: NamedSharding,
     num_model_output_frames: int,
     rope_freqs: RopeFreqs,
     testset_dirs: Dict[str, Path],
@@ -245,11 +254,6 @@ def train(
         else 1
     )
 
-    @eqx.filter_vmap
-    def make_loss_sum(models):
-        return jnp.array([0.0], dtype=jnp.float32)
-    loss_sum = make_loss_sum(model_ensemble)
-
     testset_hitrates = {}
     for name in testset_dirs.keys():
         testset_hitrates[name] = sys.float_info.max
@@ -257,12 +261,13 @@ def train(
     flat_model, treedef_model = jax.tree_util.tree_flatten(model_ensemble)
     flat_state, treedef_state = jax.tree_util.tree_flatten(state_ensemble)
     flat_opt_state, treedef_opt_state = jax.tree_util.tree_flatten(opt_state_ensemble)
+    
+    loss_sum = jnp.array([0.0] * flat_model[0].shape[0], dtype=jnp.float32)
 
     @eqx.filter_jit(donate="all-except-first")
-    @eqx.filter_vmap(
-        # TODO: Handle vmap'ed keys
-        in_axes=(None, eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, None, None, None),
-        out_axes=(eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), eqx.if_array(0), None, eqx.if_array(0), eqx.if_array(0)),
+    @partial(jax.vmap,
+        in_axes=(None, 0, 0, 0, None, None, 0, None),
+        out_axes=(0, 0, 0, 0, 0, 0),
     )
     def compute_training_step(
         tx: optax.GradientTransformation,
@@ -273,13 +278,12 @@ def train(
         opt_state = jax.tree_util.tree_unflatten(treedef_opt_state, flat_opt_state)
 
         model_backward_dtype = change_fp_precision(model, dtype=BACKWARD_DTYPE)
-        key, new_key = jax.random.split(key)
 
         # Scan over mini-batches
         @partial(jax.checkpoint, policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
         def minibatch_scan_body(carry, batch):
             accumulated_grads, state = carry
-            audio_minibatch, expected_outputs_minibatch = jax.device_put(batch, data_sharding)
+            audio_minibatch, expected_outputs_minibatch = eqx.filter_shard(batch, data_sharding)
             # print(f"audio_minibatch shape: {audio_minibatch.shape}")
             # print(f"expected_outputs_minibatch shape: {expected_outputs_minibatch.shape}")
 
@@ -293,21 +297,20 @@ def train(
                 key=key,
             )
 
-            scaled_grads_leaves, treedef = jax.tree_util.tree_flatten(scaled_grads)
-            acc_grads_leaves, _ = jax.tree_util.tree_flatten(accumulated_grads)
-            accumulated_grads = [
-                scaled_grad.astype(acc_grad.dtype) + acc_grad
-                for scaled_grad, acc_grad in zip(scaled_grads_leaves, acc_grads_leaves)
-            ]
-            accumulated_grads = treedef.unflatten(accumulated_grads)
+            accumulated_grads = jax.tree.map(
+                lambda scaled_grad, acc_grad: acc_grad + scaled_grad.astype(acc_grad.dtype),
+                scaled_grads,
+                accumulated_grads,
+            )
 
             return (accumulated_grads, update_state), scaled_loss
 
         # Keep the accumulated grads in the same precision as the model
         zero_grads = jax.tree_util.tree_map(
-            lambda x: None if x is None else jnp.zeros_like(x).astype(MODEL_DTYPE),
-            eqx.filter(model, eqx.is_array)
+            lambda x: (x * 0.0).astype(MODEL_DTYPE),
+            eqx.filter(model, eqx.is_inexact_array)
         )
+
         audio_minibatches = einops.rearrange(audio, "(b m) ... -> b m ...", m=minibatch_size)
         expected_outputs_minibatches = einops.rearrange(expected_outputs, "(b m) ... -> b m ...", m=minibatch_size)
         minibatch_steps = audio_minibatches.shape[0]
@@ -334,7 +337,26 @@ def train(
         update_update_state = jax.tree_util.tree_leaves(update_state)
 
         loss = scaled_loss / grad_scale
-        return loss, update_flat_model, update_update_state, update_flat_opt_state, new_key, grads_valid, scaled_loss
+        return loss, update_flat_model, update_update_state, update_flat_opt_state, grads_valid, scaled_loss
+
+    if flat_model[0].shape[0] == 1:
+        compute_trainig_step_wrapper = compute_training_step
+    else:
+        @eqx.filter_jit(donate="all-except-first")
+        @partial(jax.shard_map,
+                in_specs=(None, P("_"), P("_"), P("_"), None, None, P("_"), None),
+                out_specs=(P("_"), P("_"), P("_"), P("_"), P("_"), P("_")),
+                mesh=device_mesh,
+                )
+        def compute_trainig_step_wrapper(
+            tx: optax.GradientTransformation,
+            flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, grad_scale,
+        ):
+            loss, flat_model, flat_state, flat_opt_state, grads_valid, scaled_loss = compute_training_step(
+                tx,
+                flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, grad_scale,
+            )
+            return loss, flat_model, flat_state, flat_opt_state, grads_valid, scaled_loss
 
 
     def copy_pytree(tree):
@@ -349,7 +371,7 @@ def train(
     recovery_opt_state = copy_pytree(flat_opt_state)
     grad_scale = 1.0
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
-        key, noise_key = jax.random.split(key, 2)
+        key, step_key = jax.random.split(key, 2)
         events, audio = batch
 
         # Keep the old model state in memory until we are sure the loss is not nan
@@ -360,16 +382,21 @@ def train(
             recovery_opt_state = copy_pytree(flat_opt_state)
 
         # print(f"Executing step {step}")
-        loss, flat_model, flat_state, flat_opt_state, key, grads_valid, scaled_loss = compute_training_step(
-            tx,
-            flat_model, 
-            flat_state,
-            flat_opt_state,
-            audio,
-            events,
-            key,
-            jnp.array(grad_scale, dtype=jnp.float32),
-        )
+        training_keys = eqx.filter_shard(jax.random.split(step_key, num=flat_model[0].shape[0]), model_sharding)
+
+        device_grad_scale = jax.device_put(jnp.array(grad_scale, dtype=jnp.float32), replicate_everywhere)
+
+        with jax.transfer_guard_device_to_device("disallow"):
+            loss, flat_model, flat_state, flat_opt_state, grads_valid, scaled_loss = compute_trainig_step_wrapper(
+                tx,
+                flat_model, 
+                flat_state,
+                flat_opt_state,
+                audio,
+                events,
+                training_keys,
+                device_grad_scale,
+            )
         # print(f"Finished executing step {step}")
 
         if not np.all(grads_valid) or not np.all(np.isfinite(loss)):
@@ -401,23 +428,9 @@ def train(
 
         loss_sum = loss_sum + loss
 
-        if step % print_every == 0 and step != 0:
-            learning_rate = learning_rate_schedule(step)
-
-            averaged_loss = (loss_sum / print_every)[0]
-
-            print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
-
-            # Pick the average loss of the best model in the ensemble
-            summary_writer.add_scalar("train/loss", jnp.min(averaged_loss), step)
-            summary_writer.add_scalar("train/learning_rate", learning_rate, step)
-            summary_writer.flush()
-
-            model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
-            loss_sum = make_loss_sum(model_ensemble) 
-
         if step % testset_loss_every == 0:
             model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
+            opt_state_ensemble = jax.tree.unflatten(treedef_opt_state, flat_opt_state)
             state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
 
             print("Evaluating test losses...")
@@ -440,16 +453,36 @@ def train(
                 summary_writer.add_scalar(f"train/test-loss-{name}", testset_loss[0], step)
                 for i, visualization in enumerate(visualizations):
                     summary_writer.add_figure(f"train/test-loss-{name}-{i}", visualization, step)
-            summary_writer.flush()
 
             # Recombine
-            # TODO(knielsen): Refactor this! 
-            # TODO: Consider sum of testset losses
-            # TODO: Reset optimizer state?
             recombination_key, key = jax.random.split(key, num=2)
             ensemble_testset_losses = np.mean(np.stack(testset_losses), axis=0)
             print(f"Ensemble scores: {ensemble_testset_losses}")
-            model_ensemble = evolve_model_ensemble(model_ensemble, ensemble_testset_losses, recombination_key)
+            model_ensemble, opt_state_ensemble = evolve_model_ensemble(
+                tx,
+                model_ensemble,
+                opt_state_ensemble,
+                loss_sum / print_every,  # ensemble_testset_losses,
+                recombination_key,
+                model_sharding=model_sharding,
+            )
+
+            flat_model, treedef_model = jax.tree_util.tree_flatten(model_ensemble)
+            flat_opt_state, treedef_opt_state = jax.tree_util.tree_flatten(opt_state_ensemble)
+
+        if step % print_every == 0 and step != 0:
+            learning_rate = learning_rate_schedule(step)
+
+            averaged_loss = loss_sum / print_every
+
+            print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
+
+            # Pick the average loss of the best model in the ensemble
+            summary_writer.add_scalar("train/loss", jnp.min(averaged_loss), step)
+            summary_writer.add_scalar("train/learning_rate", learning_rate, step)
+
+            model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
+            loss_sum = jnp.array([0.0] * flat_model[0].shape[0], dtype=jnp.float32)
 
     model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
     state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
@@ -475,12 +508,12 @@ def score_by_checkpoint_metrics(metrics):
     mean_score = float(np.mean(np.array(list(metrics.values()))))
     return mean_score
 
-def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGKey):
+def evolve_model_ensemble(tx, model_ensemble, opt_state_ensemble, ensemble_scores, key: jax.random.PRNGKey, model_sharding: NamedSharding):
     """
     Genetic algorithm to re-combine models into new models
     """
-    def mutate_leaf(leaf: jax.Array, index_to_mutate: int, key: jax.random.PRNGKey, mutation_rate = 0.0005):
-        if not eqx.is_array(leaf) or leaf.dtype not in (jnp.float16, jnp.float32):
+    def mutate_leaf(leaf: jax.Array, index_to_mutate: int, key: jax.random.PRNGKey, mutation_rate):
+        if not eqx.is_array(leaf) or leaf.dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             # Do not modify non-numpy arrays
             return leaf
 
@@ -488,19 +521,24 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 
         mutation_probs_key, normal_weights_key = jax.random.split(key, 2)
         mutation_probs = jax.random.uniform(mutation_probs_key, weights_to_mutate.shape)
-        normal_weights = jax.random.normal(normal_weights_key, weights_to_mutate.shape, dtype=leaf.dtype)
-        updated_weights = jax.lax.select(mutation_probs < mutation_rate, normal_weights, weights_to_mutate)
+        mutation_weights = jax.random.normal(normal_weights_key, weights_to_mutate.shape, dtype=leaf.dtype) * 0.02
+        updated_weights = jax.lax.select(mutation_probs < mutation_rate, mutation_weights, weights_to_mutate)
+
+        # num_mutations = jnp.count_nonzero(mutation_probs < mutation_rate)
+        # print(f"Introducing {num_mutations} mutations in leaf with shape {leaf.shape} at index {index_to_mutate}")
 
         return leaf.at[index_to_mutate, ...].set(updated_weights)
 
     def recombine(model_ensemble, parent_a_idx: int, parent_b_idx: int, result_idx: int, key: jax.random.PRNGKey):
-        recombination_rate = 0.0001  # chance of recombining
+        recombination_rate = 0.5 * float((model_ensemble.recombination_rate[parent_a_idx] + model_ensemble.recombination_rate[parent_b_idx])[0])
 
         recombination_steps = 0
         current_parent_idx = 1  # Always start with parent_a weights (inversed in first recombination_steps sampling)
+        
+        mutation_rate = 0.5 * float((model_ensemble.mutation_rate[parent_a_idx] + model_ensemble.mutation_rate[parent_b_idx])[0])
 
         def recombine_leaf(leaf, *rest):
-            if not eqx.is_array(leaf) or leaf.dtype not in (jnp.float16, jnp.float32):
+            if not eqx.is_array(leaf) or leaf.dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
                 # Do not modify non-numpy arrays
                 return leaf
 
@@ -521,7 +559,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
                     key, recombination_key = jax.random.split(key, 2)
                     recombination_steps = int(jax.random.geometric(recombination_key, recombination_rate, shape=tuple()))
                     current_parent_idx = (current_parent_idx + 1) % 2
-                    print(f"Recombining after {recombination_steps} steps")
+                    # print(f"Recombining after {recombination_steps} steps")
 
                 # Figure out which parent to copy from
                 current_parent = parent_a_weights
@@ -542,16 +580,29 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
             recombined_leaf = leaf.at[result_idx, ...].set(recombined_weights)
 
             key, mutation_key = jax.random.split(key, 2)
-            return mutate_leaf(recombined_leaf, result_idx, mutation_key)
+            nonlocal mutation_rate
+            return mutate_leaf(recombined_leaf, result_idx, mutation_key, mutation_rate=mutation_rate)
 
         return jax.tree.map(recombine_leaf, model_ensemble)
 
     if ensemble_scores.shape[0] <= 2:
         print("Not recombining due to low population")
-        return model_ensemble
+        return model_ensemble, opt_state_ensemble
 
     recombined_ensemble = model_ensemble
+    recombined_opt_state = opt_state_ensemble
 
+
+    def ensemble_selector(ensemble_select: int):
+        def _ensemble_selector(path, x):
+            if not eqx.is_array(x):
+                # print(f"Skipping at {path} as it is not an array, value: {x}")
+                return x
+
+            # print(f"Selecting at {path} value {x}")
+            return x[ensemble_select, ...]
+        return _ensemble_selector
+    
     # print(f"Ensemble scores: {ensemble_scores}")
     # print(f"Sorted: {np.argsort(ensemble_scores)}")
     sorted_indices = list(np.argsort(ensemble_scores))
@@ -559,7 +610,7 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
     winner_indices = sorted_indices[0:(len(sorted_indices) // 2)]
     result_indices = sorted_indices[(len(sorted_indices) // 2):]
     for result_idx in result_indices:
-        key, winner_key, recombine_key = jax.random.split(key, 3)
+        key, winner_key, recombine_key, mutation_rate_key, recombination_rate_key = jax.random.split(key, 5)
 
         random_integers = jax.random.randint(winner_key, shape=(100,), minval=0, maxval=len(winner_indices))
         parent_a_idx = winner_indices[int(random_integers[0])]
@@ -573,7 +624,29 @@ def evolve_model_ensemble(model_ensemble, ensemble_scores, key: jax.random.PRNGK
 
         recombined_ensemble = recombine(recombined_ensemble, parent_a_idx=parent_a_idx, parent_b_idx=parent_b_idx, result_idx=result_idx, key=recombine_key)
 
-    return recombined_ensemble
+        picked_model = jax.tree.map_with_path(ensemble_selector(result_idx), recombined_ensemble)
+        clean_opt_state = tx.init(eqx.filter(picked_model, eqx.is_inexact_array))
+
+        def update_opt_state_leaf(batched_leaf, single_leaf):
+            return batched_leaf.at[result_idx, ...].set(single_leaf)
+
+        recombined_opt_state = jax.tree_util.tree_map(
+            update_opt_state_leaf,
+            recombined_opt_state,
+            clean_opt_state,
+        )
+
+        new_mutation_rate = jax.random.uniform(mutation_rate_key, shape=(), minval=1e-12, maxval=1e-6)
+        new_mutation_rate = recombined_ensemble.mutation_rate.at[result_idx].set(new_mutation_rate)
+        new_recombination_rate = jax.random.uniform(recombination_rate_key, shape=(), minval=1e-6, maxval=1e-8)
+        new_recombination_rate = recombined_ensemble.recombination_rate.at[result_idx].set(new_recombination_rate)
+        recombined_ensemble = eqx.tree_at(lambda m: m.recombination_rate, recombined_ensemble, new_recombination_rate)
+        recombined_ensemble = eqx.tree_at(lambda m: m.mutation_rate, recombined_ensemble, new_mutation_rate)
+
+    recombined_ensemble = eqx.filter_shard(recombined_ensemble, model_sharding)
+    recombined_opt_state = eqx.filter_shard(recombined_opt_state, model_sharding)
+
+    return recombined_ensemble, recombined_opt_state
 
 
 def init_model(model, key: jax.random.PRNGKey):
@@ -739,7 +812,7 @@ def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, we
     return tx, base_lr_schedule
 
 
-def main():
+def main(args):
     current_directory = Path(__file__).resolve().parent
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6")
     # dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/dataset_2025_random_6/logic_dataset_2")
@@ -752,19 +825,17 @@ def main():
 
     num_devices = len(jax.devices())
 
-    batch_size = 128
-    minibatch_size = 128 * num_devices
-    num_steps = 300_000
+    batch_size = 64
+    # minibatch_size = 64 * num_devices
+    minibatch_size = 64
+    num_steps = 100_000
     warmup_steps = 1000
-    base_learning_rate = 1 * 1e-3
-    layer_lr_decay = 0.95
-    weight_decay = 0.0001
+    base_learning_rate = 5 * 1e-4
+    layer_lr_decay = 1.0
+    weight_decay = 0.00001
     model_init_keys = jnp.stack([
-        jax.random.key(1),
-        # jax.random.key(2),
-        # jax.random.key(3),
-        # jax.random.key(4),
-        # jax.random.key(5),
+        jax.random.key(i)
+        for i in range(2)
     ])
 
     transform_settings = TransformSettings(
@@ -797,7 +868,8 @@ def main():
 
     rope_freqs = precompute_frequencies(model_config["attention_size"], 250)
 
-    @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
+    # @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
+    @partial(jax.vmap, out_axes=(0, 0))
     def make_ensemble(key):
         init_key_1, init_key_2 = jax.random.split(key, num=2)
         model, state = eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, init_key_1)
@@ -806,7 +878,7 @@ def main():
 
     audio_to_midi_ensemble, model_states = make_ensemble(model_init_keys)
     audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
-    print(audio_to_midi_ensemble)
+    # print(audio_to_midi_ensemble)
 
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
     checkpoint_options = ocp.CheckpointManagerOptions(
@@ -845,19 +917,22 @@ def main():
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
     device_mesh = Mesh(device_mesh, axis_names=("_"))
-    replicate_everywhere = NamedSharding(device_mesh, PartitionSpec())
-    data_sharding = NamedSharding(
-        device_mesh,
-        PartitionSpec(
-            "_",
-        ),
-    )
+    if len(model_init_keys) == 1:
+        model_sharding = NamedSharding(device_mesh, P())
+        data_sharding = NamedSharding(
+            device_mesh,
+            P("_"),
+        )
+    else:
+        data_sharding = NamedSharding(device_mesh, P())
+        model_sharding = NamedSharding(
+            device_mesh,
+            P("_"),
+        )
+    replicate_everywhere = NamedSharding(device_mesh, P())
 
-    # TODO(knielsen): Refactor to a function?
-    model_params, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_array)
-    model_params = jax.device_put(model_params, replicate_everywhere)
-    audio_to_midi_ensemble = eqx.combine(model_params, static_model)
-    model_states = jax.device_put(model_states, replicate_everywhere)
+    audio_to_midi_ensemble = eqx.filter_shard(audio_to_midi_ensemble, model_sharding)
+    model_states = eqx.filter_shard(model_states, model_sharding)
 
     print("Setting up optimizers...")
     tx, base_learning_rate_schedule = setup_optimizers(audio_to_midi_ensemble, base_learning_rate, layer_lr_decay, weight_decay, warmup_steps, num_steps)
@@ -867,6 +942,7 @@ def main():
         # The filtering is necessary to have the opt-state flattening working
         return tx.init(eqx.filter(model, eqx.is_inexact_array))
     opt_state_ensemble = make_opt_states(audio_to_midi_ensemble)
+    opt_state_ensemble = eqx.filter_shard(opt_state_ensemble, model_sharding)
 
     sample_rate = AudioToMidiDatasetLoader.SAMPLE_RATE
     audio_duration = MODEL_AUDIO_LENGTH
@@ -896,7 +972,10 @@ def main():
         opt_state_ensemble,
         checkpoint_manager,
         learning_rate_schedule=base_learning_rate_schedule,
+        device_mesh=device_mesh,
+        replicate_everywhere=replicate_everywhere,
         data_sharding=data_sharding,
+        model_sharding=model_sharding,
         rope_freqs=rope_freqs,
         num_model_output_frames=num_model_output_frames, # TODO: Consider getting rid of this
         testset_dirs=testset_dirs,
@@ -911,25 +990,27 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.95'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.90'
     os.environ['XLA_FLAGS'] = (
         '--xla_gpu_enable_triton_gemm=true '
         '--xla_gpu_enable_latency_hiding_scheduler=true '
         '--xla_gpu_enable_highest_priority_async_stream=true '
         '--xla_gpu_all_reduce_combine_threshold_bytes=51200 '
         '--xla_gpu_graph_level=0 '
-        '--xla_gpu_autotune_level=1 '
+        # '--xla_gpu_autotune_level=1 '
         '--xla_gpu_per_fusion_autotune_cache_dir=xla_autotune_results '
 
-        # '--xla_gpu_strict_conv_algorithm_picker=false '
+        '--xla_gpu_strict_conv_algorithm_picker=false '
 
-        # '--xla_dump_to="/home/knielsen/xla_debug" '
+        # '--xla_dump_to="/home/knielsen/xla_cuda_crash" '
     )
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.threefry_partitionable(True)
     # jax.default_matmul_precision("BF16_BF16_BF16")
     jax.default_matmul_precision("ANY_F8_ANY_F8_F32")
-
-    # with jax.profiler.trace("/tmp/jax-trace"):
-    main()
+    
+    # jax.profiler.start_server(34894)
+    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
+   
+    app.run(main)
