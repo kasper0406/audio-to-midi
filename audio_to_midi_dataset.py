@@ -35,7 +35,7 @@ NUM_VELOCITY_CATEGORIES = 10
 SAMPLES_PER_FFT = 2 ** 12
 WINDOW_OVERLAP = 0.97
 COMPRESSION_FACTOR = None
-FREQUENCY_CUTOFF = 8_000
+FREQUENCY_CUTOFF = 16_000
 LINEAR_SCALING = 180
 
 def get_data_prep_config():
@@ -215,8 +215,8 @@ class AudioToMidiDatasetLoader:
 
         # TODO: Consider to do this nicer.
         #       Currently needed because load_samples can return more samples than request for longer audio files.
-        audio_batch = np.zeros((0, 2, int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)))
-        event_batch = np.zeros((0, self.num_model_output_frames, MIDI_EVENT_VOCCAB_SIZE))
+        # audio_batch = np.zeros((0, 2, int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)))
+        # event_batch = np.zeros((0, self.num_model_output_frames, MIDI_EVENT_VOCCAB_SIZE))
         sample_names_batch = []
         while True:
             if self._stop_event.is_set():
@@ -249,16 +249,19 @@ class AudioToMidiDatasetLoader:
             else:
                 midi_events, audio, sample_names = self.load_samples(self.dataset_dir, self.num_model_output_frames, samples_to_load, AudioToMidiDatasetLoader.SAMPLE_RATE, MODEL_AUDIO_LENGTH)
 
-            audio_batch = np.concatenate([ audio_batch, audio ])
-            event_batch = np.concatenate([ event_batch, midi_events ])
-            sample_names_batch.extend(sample_names)
+            # audio_batch = np.concatenate([ audio_batch, audio ])
+            # event_batch = np.concatenate([ event_batch, midi_events ])
+            # sample_names_batch.extend(sample_names)
+            audio_batch = audio
+            event_batch = midi_events
+            sample_names_batch = sample_names
 
             # sample_keys = jax.random.split(batch_key, num=batch_size)
             # selected_audio_frames = jax.vmap(perturb_audio_frames)(frames, sample_keys)
 
-            while audio_batch.shape[0] > batch_size:
-                next_audio = audio_batch[0:batch_size, ...]
-                next_events = event_batch[0:batch_size, ...]
+            while audio_batch.shape[0] >= batch_size:
+                next_audio = audio_batch[0:batch_size, ...].astype(np.float16)
+                next_events = event_batch[0:batch_size, ...].astype(np.float16)
                 next_sample_names = sample_names_batch[0:batch_size]
 
                 audio_batch = audio_batch[batch_size:, ...]
@@ -267,7 +270,7 @@ class AudioToMidiDatasetLoader:
 
                 while len(self.queue) >= self.prefetch_count:
                     # print("Backing off, as the queue is full")
-                    time.sleep(0.05)
+                    time.sleep(0.1)
                 self.queue.append({
                     "audio": next_audio,
                     "events": next_events,
@@ -531,13 +534,13 @@ if __name__ == "__main__":
     dataset_loader = AudioToMidiDatasetLoader(
         num_model_output_frames=150, # Just pick something sort of sensible
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/validation_set_only_yamaha"),
-        dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset_2"),
+        dataset_dir=Path("/home/knielsen/ml/datasets/validation_set"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/debug_logic_no_effects"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/dual_hands"),
         # dataset_dir=Path("/Volumes/git/ml/datasets/midi-to-sound/curated/dataset_v2"),
-        batch_size=1,
+        batch_size=4,
         prefetch_count=1,
         transform_settings=transform_settings,
         key=key,

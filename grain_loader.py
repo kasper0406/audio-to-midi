@@ -65,7 +65,7 @@ class AudioToMidiSource(grain.RandomAccessDataSource):
         self.transform_settings = transform_settings
 
         # Do a deterministic permutation of the sample names
-        rng = np.random.default_rng(0xBEEF)
+        rng = np.random.default_rng(0xBEEFA)
         all_sample_names = np.array(AudioToMidiDatasetLoader.load_sample_names(dataset_dir), dtype=np.object_)
         sample_name_mapping = rng.permutation(len(all_sample_names))
         self.all_sample_names = list(all_sample_names[sample_name_mapping])
@@ -145,15 +145,17 @@ def create_dataset_loader(
 
 
 if __name__ == "__main__":
-    batch_size = 32
+    batch_size = 48
     batches_to_load = 100
-    dataset_dir = Path("/Volumes/git/ml/datasets/midi-to-sound/logic/logic_dataset_2")
+    dataset_dir = Path("/home/knielsen/ml/datasets/midi-to-sound/varried")
 
     iter_dataset = create_dataset_loader(dataset_dir, batch_size, num_workers=4, num_epochs=1)
 
     for element, batch_idx in zip(iter_dataset, range(batches_to_load)):
         events, audio = element
-        print("Events:")
-        pprint.pprint(events)
-        print("Audio:")
-        pprint.pprint(audio)
+        print(f"Num events: {events.shape[0]}")
+        print(f"Num audio: {audio.shape[0]}")
+        # print("Events:")
+        # pprint.pprint(events)
+        # print("Audio:")
+        # pprint.pprint(audio)
