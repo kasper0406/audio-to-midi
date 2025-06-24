@@ -18,6 +18,8 @@ import sys
 import argparse
 import matplotlib
 import optax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from functools import partial
 
 from model import OutputSequenceGenerator, model_config, get_model_metadata
 from audio_to_midi_dataset import NUM_VELOCITY_CATEGORIES, MIDI_EVENT_VOCCAB_SIZE, plot_output_probs, AudioToMidiDatasetLoader, MODEL_AUDIO_LENGTH
@@ -176,7 +178,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
     key = jax.random.PRNGKey(1234)
 
     # Setup model ensemble    
-    @eqx.filter_vmap(out_axes=(eqx.if_array(0), eqx.if_array(0)))
+    @partial(jax.vmap, out_axes=(0, 0))
     def make_ensemble(key):
         return eqx.nn.make_with_state(OutputSequenceGenerator)(model_config, key)
     ensemble_keys = jax.random.split(key, ensemble_size)
@@ -186,7 +188,7 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
     checkpoint_manager = ocp.CheckpointManager(checkpoint_path, item_names=('params', 'state'))
     step_to_restore = checkpoint_manager.latest_step()
     if step_to_restore is None:
-        raise "There is no checkpoint to load! Inference will be useless"
+        raise RuntimeError("There is no checkpoint to load! Inference will be useless")
     else:
         current_metadata = get_model_metadata()
         if current_metadata != checkpoint_manager.metadata():
@@ -194,12 +196,23 @@ def load_newest_checkpoint(checkpoint_path: Path, ensemble_size: int = 1, ensemb
             print(f"Current configuration is {current_metadata}")
 
     print(f"Restoring saved model at step {step_to_restore}")
-    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_array)
+    model_params, static_model = eqx.partition(audio_to_midi, eqx.is_inexact_array)
+
+    abstract_model = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, model_params)
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state)
+
+    device_mesh = Mesh(mesh_utils.create_device_mesh((1,)), axis_names=("_"))
+    replicate_everywhere = NamedSharding(device_mesh, P())
+    def set_sharding(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+        return x.update(sharding=replicate_everywhere)
+    filtered_model_with_sharding = jax.tree_util.tree_map(set_sharding, abstract_model)
+    model_states_with_sharding = jax.tree_util.tree_map(set_sharding, abstract_state)
+
     restored_map = checkpoint_manager.restore(
         step_to_restore,
         args=ocp.args.Composite(
-            params=ocp.args.StandardRestore(model_params),
-            state=ocp.args.StandardRestore(state),
+            params=ocp.args.StandardRestore(filtered_model_with_sharding),
+            state=ocp.args.StandardRestore(model_states_with_sharding),
         ),
     )
     print(f"Read model parameters...")
@@ -320,7 +333,7 @@ def main():
     if args.validation:
         # Calculate and report the validation loss for the directory
         print(f"Calculating validation loss for {input_file}")
-        rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+        rope_freqs = precompute_frequencies(model_config["attention_size"], 250)
         window_size = int(MODEL_AUDIO_LENGTH * AudioToMidiDatasetLoader.SAMPLE_RATE)
         num_model_output_frames = model.predict(state, jnp.zeros((2, window_size), jnp.float32), rope_freqs)[1].shape[0]
         # print(f"Model output frames: {num_model_output_frames}")

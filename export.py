@@ -8,7 +8,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.export import export
 import matplotlib.pyplot as plt
 
-from infer import load_newest_checkpoint
+from infer import load_newest_checkpoint, change_fp_precision
 from model import model_config
 from rope import precompute_frequencies
 
@@ -27,9 +27,9 @@ DURATION = 5.0
 def export_model_to_coreml(model, state):
     context = jax_mlir.make_ir_context()
     input_sample_count = int(DURATION * SAMPLE_RATE)
-    example_samples = jnp.zeros((2, input_sample_count), dtype=jnp.float16)
-
-    rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+    example_samples = jnp.zeros((2, input_sample_count), dtype=jnp.float32)
+    model = change_fp_precision(model, dtype=jnp.float32)
+    rope_freqs = precompute_frequencies(model_config["attention_size"], 250)
 
     @jax.jit
     def infer_fn(samples):
@@ -40,7 +40,7 @@ def export_model_to_coreml(model, state):
 
     pass_pipeline = DEFAULT_HLO_PIPELINE
     pass_pipeline.remove_passes(["common::add_fp16_cast"])  # There are precision issues when fp16 casting intermediate calculations
-    pass_pipeline.remove_passes(["common::const_elimination"])  # Sadly const_elimination currently makes the model fail to run!
+    # pass_pipeline.remove_passes(["common::const_elimination"])  # Sadly const_elimination currently makes the model fail to run!
 
     # pass_pipeline = ct.PassPipeline.EMPTY
     # pass_pipeline.append_pass("common::sanitize_input_output_names")
@@ -92,6 +92,7 @@ def plot_output(output):
 
 if __name__ == "__main__":
     jax.config.update('jax_default_prng_impl', 'unsafe_rbg')
+    jax.default_matmul_precision("F32_F32_F32")
 
     current_directory = Path(__file__).resolve().parent
     checkpoint_path = current_directory / "audio_to_midi_checkpoints"
@@ -100,9 +101,10 @@ if __name__ == "__main__":
         model_replication=False  # Disable model sharding as it is not supported by coremlutils
     )
     
-    test_samples = np.zeros((2, int(DURATION * SAMPLE_RATE)), dtype=np.float16)
-    rope_freqs = precompute_frequencies(model_config["attention_size"], 300)
+    test_samples = np.zeros((2, int(DURATION * SAMPLE_RATE)), dtype=np.float32)
+    rope_freqs = precompute_frequencies(model_config["attention_size"], 250)
     logits, probs = model.predict(state, test_samples, rope_freqs)
+    print("Probs:", probs)
     plot_output(probs)
 
     print("Exporting the model itself...")
@@ -117,4 +119,5 @@ if __name__ == "__main__":
         "samples": test_samples,
     })
     plot_output(prediction["probs"])
+    print("Prediction:", prediction["probs"])
     plt.show(block = True)
