@@ -18,21 +18,21 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [ 4 * (2 ** i) for i in range(8) ],
-    "depths": [2, 2, 2, 2, 2, 2, 2, 2],
+    "dims": [ 6 * (2 ** i) for i in range(8) ],
+    "depths": [3] * 8,
     "cnn_hidden_expansion": 2.0,
 
-    "num_transformer_layers": 4,
-    "num_transformer_heads": 10,
+    "num_transformer_layers": 5,
+    "num_transformer_heads": 12,
     "attention_size": 64,
     "compressed_attention_q_size": 64,
     "compressed_attention_kv_size": 64,
 
     "transformer_dropout_rate": 0.1,
-    "transformer_hidden_dim": 640,
+    "transformer_hidden_dim": 512,
     "transformer_hidden_expansion": 2.0,
 
-    "sdd_rate": 0.02,
+    "sdd_rate": 0.05,
 }
 
 
@@ -504,7 +504,7 @@ class AlternatingLocalAndGlobalAttention(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        attention_windows = [50, 50, 50, None]
+        attention_windows = [20, 40, 60, None]
         keys = _split_key(key, len(attention_windows))
 
         self.attention_layers = []

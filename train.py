@@ -825,17 +825,17 @@ def main(args):
 
     num_devices = len(jax.devices())
 
-    batch_size = 64
+    batch_size = 512
     # minibatch_size = 64 * num_devices
-    minibatch_size = 64
-    num_steps = 100_000
+    minibatch_size = 256
+    num_steps = 500_000
     warmup_steps = 1000
     base_learning_rate = 5 * 1e-4
     layer_lr_decay = 1.0
     weight_decay = 0.00001
     model_init_keys = jnp.stack([
         jax.random.key(i)
-        for i in range(2)
+        for i in range(1)
     ])
 
     transform_settings = TransformSettings(
@@ -893,27 +893,7 @@ def main(args):
         item_names=('params', 'state'),
         metadata=get_model_metadata(),
     )
-
-    # Load latest model
-    step_to_restore = checkpoint_manager.latest_step()
-    if step_to_restore is not None:
-        current_metadata = get_model_metadata()
-        if current_metadata != checkpoint_manager.metadata():
-            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}")
-            print(f"Current configuration is {current_metadata}")
-
-        print(f"Restoring saved model at step {step_to_restore}")
-        filtered_model, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_array)
-        restored_map = checkpoint_manager.restore(
-            step_to_restore,
-            args=ocp.args.Composite(
-                params=ocp.args.StandardRestore(filtered_model),
-                state=ocp.args.StandardRestore(model_states),
-            ),
-        )
-        audio_to_midi_ensemble = eqx.combine(restored_map["params"], static_model)
-        model_states = restored_map["state"]
-
+    
     # Replicate the model on all JAX devices
     device_mesh = mesh_utils.create_device_mesh((num_devices,))
     device_mesh = Mesh(device_mesh, axis_names=("_"))
@@ -930,6 +910,34 @@ def main(args):
             P("_"),
         )
     replicate_everywhere = NamedSharding(device_mesh, P())
+
+    # Load latest model
+    step_to_restore = checkpoint_manager.latest_step()
+    if step_to_restore is not None:
+        current_metadata = get_model_metadata()
+        if current_metadata != checkpoint_manager.metadata():
+            print(f"WARNING: The loaded model has metadata {checkpoint_manager.metadata()}")
+            print(f"Current configuration is {current_metadata}")
+
+        print(f"Restoring saved model at step {step_to_restore}")
+        filtered_model, static_model = eqx.partition(audio_to_midi_ensemble, eqx.is_inexact_array)
+
+        abstract_model = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, filtered_model)
+        abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, model_states)
+
+        def set_sharding(x: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+            return x.update(sharding=model_sharding)
+        filtered_model_with_sharding = jax.tree_util.tree_map(set_sharding, abstract_model)
+        model_states_with_sharding = jax.tree_util.tree_map(set_sharding, abstract_state)
+        restored_map = checkpoint_manager.restore(
+            step_to_restore,
+            args=ocp.args.Composite(
+                params=ocp.args.StandardRestore(filtered_model_with_sharding),
+                state=ocp.args.StandardRestore(model_states_with_sharding),
+            ),
+        )
+        audio_to_midi_ensemble = eqx.combine(restored_map["params"], static_model)
+        model_states = restored_map["state"]
 
     audio_to_midi_ensemble = eqx.filter_shard(audio_to_midi_ensemble, model_sharding)
     model_states = eqx.filter_shard(model_states, model_sharding)
@@ -959,6 +967,7 @@ def main(args):
         duration=audio_duration,
         output_divisions=num_model_output_frames,
         transform_settings=transform_settings,
+        seed=43588,
     )
     dataset_loader_iter = iter(dataset_loader)
 
