@@ -1,9 +1,8 @@
 from functools import partial, lru_cache
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 import os
 import time
-import sys
 from typing import Dict
 import copy
 
@@ -19,7 +18,7 @@ from jaxtyping import Array, Float
 from functools import reduce
 from more_itertools import chunked
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 import einops
 
@@ -28,6 +27,7 @@ from model import OutputSequenceGenerator, model_config, get_model_metadata, Sel
 from infer import detailed_event_loss, change_fp_precision
 from grain_loader import TransformSettings, AudioToMidiSource, create_dataset_loader
 from rope import precompute_frequencies, RopeFreqs
+from optax.contrib._muon import muon, MuonDimensionNumbers
 
 from metrics import configure_tensorboard
 from tensorboardX import SummaryWriter
@@ -42,17 +42,161 @@ BACKWARD_DTYPE = jnp.bfloat16
 # FORWARD_DTYPE = jnp.float32
 # BACKWARD_DTYPE = jnp.float32
 
+
+@dataclass
+class DomainMetrics:
+    loss: float
+    hit_rate: float
+    eventized_diff: float
+    phantom_note_diff: float
+    missed_note_diff: float
+
+
+@dataclass
+class EvalSnapshot:
+    step: int
+    loss_mean: float
+    hit_rate_mean: float
+    generated_vs_real_loss_ratio: float
+
+
+@dataclass
+class AlertFlags:
+    class_collapse_low_gap: float
+    class_collapse_trend: float
+    domain_generalization: float
+    optimization_instability: float
+
+
+@dataclass
+class MonitoringConfig:
+    eps: float = 1e-7
+    collapse_persist_n: int = 3
+    instability_persist_m: int = 5
+    trend_window_k: int = 8
+    separation_gap_threshold: float = 0.05
+    generated_hit_rate_ratio_threshold: float = 0.7
+    generated_loss_ratio_threshold: float = 2.0
+    train_loss_cv_threshold: float = 0.08
+
+
+@dataclass
+class MonitoringState:
+    train_loss_history: deque
+    diag_history: deque
+    eval_history: deque
+
+
+@dataclass
+class DiagMetrics:
+    pos_loss: float
+    neg_loss: float
+    pos_frac: float
+    mean_pos_pred: float
+    mean_neg_pred: float
+    separation_gap: float
+    loss_ratio: float
+
+
+class TrainingMetricsLogger:
+    def __init__(self, summary_writer: SummaryWriter):
+        self.summary_writer = summary_writer
+
+    def log_domain_metrics(self, step: int, domain_name: str, metrics: DomainMetrics):
+        self.summary_writer.add_scalar(f"train/test-loss-{domain_name}", metrics.loss, step)
+        self.summary_writer.add_scalar(f"eval/{domain_name}/loss", metrics.loss, step)
+        self.summary_writer.add_scalar(f"eval/{domain_name}/hit_rate", metrics.hit_rate, step)
+        self.summary_writer.add_scalar(f"eval/{domain_name}/eventized_diff", metrics.eventized_diff, step)
+        self.summary_writer.add_scalar(f"eval/{domain_name}/phantom_note_diff", metrics.phantom_note_diff, step)
+        self.summary_writer.add_scalar(f"eval/{domain_name}/missed_note_diff", metrics.missed_note_diff, step)
+
+    def log_eval_visualizations(self, step: int, domain_name: str, visualizations: list[Any]):
+        for i, visualization in enumerate(visualizations):
+            self.summary_writer.add_figure(f"train/test-loss-{domain_name}-{i}", visualization, step)
+
+    def log_drift(self, step: int, generated_vs_real_loss_ratio: float, generated_vs_yamaha_hit_rate_delta: float):
+        self.summary_writer.add_scalar("eval/drift/generated_vs_real_loss_ratio", generated_vs_real_loss_ratio, step)
+        self.summary_writer.add_scalar("eval/drift/generated_vs_yamaha_hit_rate_delta", generated_vs_yamaha_hit_rate_delta, step)
+
+    def log_eval_trends(self, step: int, loss_slope: float, hit_rate_slope: float, drift_slope: float):
+        self.summary_writer.add_scalar("eval/trends/loss_mean_slope", loss_slope, step)
+        self.summary_writer.add_scalar("eval/trends/hit_rate_mean_slope", hit_rate_slope, step)
+        self.summary_writer.add_scalar("eval/trends/generated_vs_real_loss_ratio_slope", drift_slope, step)
+
+    def log_diag(self, step: int, diag: DiagMetrics):
+        self.summary_writer.add_scalar("diag/pos_loss", diag.pos_loss, step)
+        self.summary_writer.add_scalar("diag/neg_loss", diag.neg_loss, step)
+        self.summary_writer.add_scalar("diag/pos_frac", diag.pos_frac, step)
+        self.summary_writer.add_scalar("diag/mean_pos_pred", diag.mean_pos_pred, step)
+        self.summary_writer.add_scalar("diag/mean_neg_pred", diag.mean_neg_pred, step)
+        self.summary_writer.add_scalar("diag/separation_gap", diag.separation_gap, step)
+        self.summary_writer.add_scalar("diag/loss_ratio", diag.loss_ratio, step)
+
+    def log_train_step(self, step: int, train_loss: float, learning_rate: float):
+        self.summary_writer.add_scalar("train/loss", train_loss, step)
+        self.summary_writer.add_scalar("train/learning_rate", learning_rate, step)
+
+    def log_alerts(self, step: int, flags: AlertFlags):
+        self.summary_writer.add_scalar("alerts/class_collapse_low_gap", flags.class_collapse_low_gap, step)
+        self.summary_writer.add_scalar("alerts/class_collapse_trend", flags.class_collapse_trend, step)
+        self.summary_writer.add_scalar("alerts/domain_generalization", flags.domain_generalization, step)
+        self.summary_writer.add_scalar("alerts/optimization_instability", flags.optimization_instability, step)
+
+def _auto_weighted_bce(logits, targets, pos_weight):
+    """Per-element weighted BCE with auto-balanced pos_weight."""
+    # Stable log-sigmoid: log(sigma(x)) = -softplus(-x), log(1-sigma(x)) = -softplus(x)
+    pos_term = -targets * jax.nn.softplus(-logits)
+    neg_term = -(1 - targets) * jax.nn.softplus(logits)
+    bce = -(pos_term + neg_term)  # positive per-element BCE
+
+    class_weight = targets * pos_weight + (1 - targets) * 1.0
+    return class_weight * bce
+
 @eqx.filter_jit(donate="all")
 def compute_loss_from_output(logits, expected_output, scale):
-    # loss = jax.vmap(partial(optax.losses.poly_loss_cross_entropy, epsilon=-1.0))(logits, expected_output)
-    # jax.debug.print("logits = {l}", l=logits)
-    loss = 10 * jax.vmap(optax.losses.sigmoid_binary_cross_entropy)(logits, expected_output)
-    # loss = jax.vmap(optax.losses.sigmoid_focal_loss)(logits, expected_output)
-    # loss = 100 * jax.vmap(partial(optax.sigmoid_focal_loss, gamma=1.0, alpha=0.8))(logits, expected_output)
+    pos_weight = 25.0  # Fixed: ~4% positive fraction → (1-0.04)/0.04 = 24
+    loss = jax.vmap(lambda l, t: _auto_weighted_bce(l, t, pos_weight))(logits, expected_output)
     scaled_loss = loss * scale
-    # jax.debug.print("loss = {l}, scaled_loss = {sl}", l=loss, sl=scaled_loss)
-
     return jnp.mean(scaled_loss)
+
+
+@eqx.filter_jit
+def compute_pos_neg_diagnostic(model, state, audio, expected_outputs, rope_freqs):
+    """Run a forward pass on a small batch and compute per-class loss diagnostics."""
+    model = change_fp_precision(model, dtype=FORWARD_DTYPE)
+    model = eqx.nn.inference_mode(model)
+    audio = audio.astype(dtype=FORWARD_DTYPE)
+    (logits, probs), _ = jax.vmap(
+        model, in_axes=(0, None, None), out_axes=(0, None), axis_name="batch",
+    )(audio, state, rope_freqs)
+    probs = probs.astype(jnp.float32)
+    targets = expected_outputs.astype(jnp.float32)
+
+    eps = 1e-7
+    pos_mask = targets > 0.5
+    neg_mask = ~pos_mask
+
+    pos_count = jnp.sum(pos_mask)
+    neg_count = jnp.sum(neg_mask)
+    total = pos_count + neg_count
+    pos_frac = pos_count / jnp.maximum(total, 1.0)
+
+    # Mean -log(p) for positive targets, mean -log(1-p) for negative targets
+    pos_loss = jnp.where(
+        pos_count > 0,
+        -jnp.sum(jnp.where(pos_mask, jnp.log(probs + eps), 0.0)) / jnp.maximum(pos_count, 1.0),
+        0.0,
+    )
+    neg_loss = jnp.where(
+        neg_count > 0,
+        -jnp.sum(jnp.where(neg_mask, jnp.log(1.0 - probs + eps), 0.0)) / jnp.maximum(neg_count, 1.0),
+        0.0,
+    )
+
+    mean_pos_pred = jnp.where(pos_count > 0, jnp.sum(jnp.where(pos_mask, probs, 0.0)) / jnp.maximum(pos_count, 1.0), 0.0)
+    mean_neg_pred = jnp.where(neg_count > 0, jnp.sum(jnp.where(neg_mask, probs, 0.0)) / jnp.maximum(neg_count, 1.0), 0.0)
+
+    return pos_loss, neg_loss, pos_frac, mean_pos_pred, mean_neg_pred
 
 @eqx.filter_jit(donate="all-except-first")
 @eqx.filter_value_and_grad(has_aux=True)
@@ -212,6 +356,8 @@ def compute_testset_loss(
     test_loss = np.zeros_like(list(per_sample_map.values())[0]["loss"])
     hit_rate = np.zeros_like(list(per_sample_map.values())[0]["hit_rate"])
     eventized_diff = np.zeros_like(list(per_sample_map.values())[0]["eventized_diff"])
+    phantom_note_diff = np.zeros_like(list(per_sample_map.values())[0]["phantom_note_diff"])
+    missed_note_diff = np.zeros_like(list(per_sample_map.values())[0]["missed_note_diff"])
     visualizations = []
 
     count = 0
@@ -219,10 +365,214 @@ def compute_testset_loss(
         test_loss += losses["loss"]
         hit_rate += losses["hit_rate"]
         eventized_diff += losses["eventized_diff"]
+        phantom_note_diff += losses["phantom_note_diff"]
+        missed_note_diff += losses["missed_note_diff"]
         visualizations += losses["visualizations"]
         count += 1
 
-    return (test_loss / count), (hit_rate / count), (eventized_diff / count), visualizations
+    return (
+        (test_loss / count),
+        (hit_rate / count),
+        (eventized_diff / count),
+        (phantom_note_diff / count),
+        (missed_note_diff / count),
+        visualizations,
+    )
+
+
+def _slope(values: list[float], eps: float):
+    if len(values) < 2:
+        return 0.0
+    xs = np.arange(len(values), dtype=np.float32)
+    ys = np.asarray(values, dtype=np.float32)
+    x_centered = xs - np.mean(xs)
+    y_centered = ys - np.mean(ys)
+    denom = np.sum(x_centered * x_centered) + eps
+    return float(np.sum(x_centered * y_centered) / denom)
+
+
+def compute_drift_metrics(per_domain_metrics: dict[str, DomainMetrics], config: MonitoringConfig):
+    generated_vs_real_loss_ratio = 0.0
+    generated_vs_yamaha_hit_rate_delta = 0.0
+    if "validation_set_generated" in per_domain_metrics and "validation_set" in per_domain_metrics:
+        generated_vs_real_loss_ratio = (
+            per_domain_metrics["validation_set_generated"].loss
+            / (per_domain_metrics["validation_set"].loss + config.eps)
+        )
+    if "validation_set_generated" in per_domain_metrics and "validation_sets_only_yamaha" in per_domain_metrics:
+        generated_vs_yamaha_hit_rate_delta = (
+            per_domain_metrics["validation_set_generated"].hit_rate
+            - per_domain_metrics["validation_sets_only_yamaha"].hit_rate
+        )
+    return generated_vs_real_loss_ratio, generated_vs_yamaha_hit_rate_delta
+
+
+def update_eval_history_and_compute_slopes(
+    monitoring_state: MonitoringState,
+    step: int,
+    per_domain_metrics: dict[str, DomainMetrics],
+    generated_vs_real_loss_ratio: float,
+    config: MonitoringConfig,
+):
+    if len(per_domain_metrics) > 0:
+        monitoring_state.eval_history.append(EvalSnapshot(
+            step=step,
+            loss_mean=float(np.mean([m.loss for m in per_domain_metrics.values()])),
+            hit_rate_mean=float(np.mean([m.hit_rate for m in per_domain_metrics.values()])),
+            generated_vs_real_loss_ratio=float(generated_vs_real_loss_ratio),
+        ))
+
+    if len(monitoring_state.eval_history) < 2:
+        return None
+
+    eval_tail = list(monitoring_state.eval_history)[-config.trend_window_k:]
+    return (
+        _slope([x.loss_mean for x in eval_tail], config.eps),
+        _slope([x.hit_rate_mean for x in eval_tail], config.eps),
+        _slope([x.generated_vs_real_loss_ratio for x in eval_tail], config.eps),
+    )
+
+
+def compute_alert_flags(
+    monitoring_state: MonitoringState,
+    per_domain_metrics: dict[str, DomainMetrics],
+    config: MonitoringConfig,
+):
+    flags = AlertFlags(
+        class_collapse_low_gap=0.0,
+        class_collapse_trend=0.0,
+        domain_generalization=0.0,
+        optimization_instability=0.0,
+    )
+    warning_messages = []
+
+    if len(monitoring_state.diag_history) >= config.collapse_persist_n:
+        recent_diag = list(monitoring_state.diag_history)[-config.collapse_persist_n:]
+        low_gap = all(x["separation_gap"] < config.separation_gap_threshold for x in recent_diag)
+        trend_drop = all(
+            recent_diag[i]["mean_pos_pred"] < recent_diag[i - 1]["mean_pos_pred"]
+            and recent_diag[i]["mean_neg_pred"] < recent_diag[i - 1]["mean_neg_pred"]
+            and recent_diag[i]["pos_loss"] > recent_diag[i - 1]["pos_loss"]
+            for i in range(1, len(recent_diag))
+        )
+        flags.class_collapse_low_gap = float(low_gap)
+        flags.class_collapse_trend = float(trend_drop)
+        if low_gap:
+            warning_messages.append("WARNING: Class-collapse risk: separation_gap persisted below 0.05.")
+        if trend_drop:
+            warning_messages.append("WARNING: Class-collapse risk: pos/neg predictions trending down while pos_loss rises.")
+
+    if "validation_set_generated" in per_domain_metrics and "validation_set" in per_domain_metrics:
+        generated = per_domain_metrics["validation_set_generated"]
+        real = per_domain_metrics["validation_set"]
+        low_generated_hit = False
+        if real.hit_rate > config.eps:
+            low_generated_hit = generated.hit_rate < (config.generated_hit_rate_ratio_threshold * real.hit_rate)
+        high_generated_loss = generated.loss > (config.generated_loss_ratio_threshold * real.loss)
+        flags.domain_generalization = float(high_generated_loss or low_generated_hit)
+        if flags.domain_generalization > 0.0:
+            warning_messages.append(
+                "WARNING: Domain-generalization risk: generated set underperforming real validation set."
+            )
+
+    if (
+        len(monitoring_state.eval_history) >= config.instability_persist_m
+        and len(monitoring_state.train_loss_history) >= config.instability_persist_m
+    ):
+        recent_eval = list(monitoring_state.eval_history)[-config.instability_persist_m:]
+        recent_train_loss = np.asarray(list(monitoring_state.train_loss_history)[-config.instability_persist_m:], dtype=np.float32)
+        train_loss_cv = float(np.std(recent_train_loss) / (np.mean(recent_train_loss) + config.eps))
+        eval_not_improving = recent_eval[-1].loss_mean >= min(x.loss_mean for x in recent_eval[:-1])
+        flags.optimization_instability = float(train_loss_cv > config.train_loss_cv_threshold and eval_not_improving)
+        if flags.optimization_instability > 0.0:
+            warning_messages.append("WARNING: Optimization instability: oscillating train loss without eval improvement.")
+
+    return flags, warning_messages
+
+
+def run_periodic_eval(
+    step: int,
+    key: jax.random.PRNGKey,
+    model_ensemble,
+    state_ensemble,
+    rope_freqs: RopeFreqs,
+    testset_dirs: Dict[str, Path],
+    num_model_output_frames: int,
+    data_sharding: NamedSharding,
+    logger: TrainingMetricsLogger,
+):
+    print("Evaluating test losses...")
+    testset_losses = []
+    per_domain_metrics: dict[str, DomainMetrics] = {}
+    for (name, testset_dir) in testset_dirs.items():
+        eval_key, key = jax.random.split(key, num=2)
+        testset_loss, hit_rate, eventized_diff, phantom_note_diff, missed_note_diff, visualizations = compute_testset_loss(
+            model_ensemble,
+            state_ensemble,
+            rope_freqs,
+            testset_dir,
+            num_model_output_frames,
+            eval_key,
+            data_sharding,
+        )
+        print(
+            f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}, "
+            f"phantom_note_diff = {phantom_note_diff}, missed_note_diff = {missed_note_diff}"
+        )
+        testset_losses.append(testset_loss)
+
+        domain_metrics = DomainMetrics(
+            loss=float(np.mean(testset_loss)),
+            hit_rate=float(np.mean(hit_rate)),
+            eventized_diff=float(np.mean(eventized_diff)),
+            phantom_note_diff=float(np.mean(phantom_note_diff)),
+            missed_note_diff=float(np.mean(missed_note_diff)),
+        )
+        per_domain_metrics[name] = domain_metrics
+        logger.log_domain_metrics(step, name, domain_metrics)
+        logger.log_eval_visualizations(step, name, visualizations)
+    return per_domain_metrics, testset_losses, key
+
+
+def compute_and_record_diag(
+    step: int,
+    flat_model,
+    treedef_model,
+    flat_state,
+    treedef_state,
+    audio,
+    events,
+    rope_freqs: RopeFreqs,
+    monitoring_state: MonitoringState,
+    config: MonitoringConfig,
+):
+    diag_model = jax.tree.unflatten(treedef_model, flat_model)
+    diag_state = jax.tree.unflatten(treedef_state, flat_state)
+    if hasattr(diag_model, "recombination_rate") and diag_model.recombination_rate.ndim > 1:
+        diag_model = jax.tree.map(lambda x: x[0] if hasattr(x, "shape") and x.ndim > 0 else x, diag_model)
+        diag_state = jax.tree.map(lambda x: x[0] if hasattr(x, "shape") and x.ndim > 0 else x, diag_state)
+    diag_n = min(8, audio.shape[0])
+    pos_loss, neg_loss, pos_frac, mean_pos_pred, mean_neg_pred = compute_pos_neg_diagnostic(
+        diag_model, diag_state, audio[:diag_n], events[:diag_n], rope_freqs,
+    )
+    separation_gap = float(mean_pos_pred - mean_neg_pred)
+    loss_ratio = float(pos_loss / (neg_loss + config.eps))
+    monitoring_state.diag_history.append({
+        "step": step,
+        "pos_loss": float(pos_loss),
+        "mean_pos_pred": float(mean_pos_pred),
+        "mean_neg_pred": float(mean_neg_pred),
+        "separation_gap": separation_gap,
+    })
+    return DiagMetrics(
+        pos_loss=float(pos_loss),
+        neg_loss=float(neg_loss),
+        pos_frac=float(pos_frac),
+        mean_pos_pred=float(mean_pos_pred),
+        mean_neg_pred=float(mean_neg_pred),
+        separation_gap=separation_gap,
+        loss_ratio=loss_ratio,
+    )
 
 def train(
     summary_writer: SummaryWriter,
@@ -254,9 +604,13 @@ def train(
         else 1
     )
 
-    testset_hitrates = {}
-    for name in testset_dirs.keys():
-        testset_hitrates[name] = sys.float_info.max
+    logger = TrainingMetricsLogger(summary_writer)
+    monitoring_config = MonitoringConfig()
+    monitoring_state = MonitoringState(
+        train_loss_history=deque(maxlen=100),
+        diag_history=deque(maxlen=32),
+        eval_history=deque(maxlen=64),
+    )
 
     flat_model, treedef_model = jax.tree_util.tree_flatten(model_ensemble)
     flat_state, treedef_state = jax.tree_util.tree_flatten(state_ensemble)
@@ -340,7 +694,7 @@ def train(
         return loss, update_flat_model, update_update_state, update_flat_opt_state, grads_valid, scaled_loss
 
     if flat_model[0].shape[0] == 1:
-        compute_trainig_step_wrapper = compute_training_step
+        compute_training_step_wrapper = compute_training_step
     else:
         @eqx.filter_jit(donate="all-except-first")
         @partial(jax.shard_map,
@@ -348,7 +702,7 @@ def train(
                 out_specs=(P("_"), P("_"), P("_"), P("_"), P("_"), P("_")),
                 mesh=device_mesh,
                 )
-        def compute_trainig_step_wrapper(
+        def compute_training_step_wrapper(
             tx: optax.GradientTransformation,
             flat_model, flat_state, flat_opt_state, audio, expected_outputs, key, grad_scale,
         ):
@@ -387,7 +741,7 @@ def train(
         device_grad_scale = jax.device_put(jnp.array(grad_scale, dtype=jnp.float32), replicate_everywhere)
 
         with jax.transfer_guard_device_to_device("disallow"):
-            loss, flat_model, flat_state, flat_opt_state, grads_valid, scaled_loss = compute_trainig_step_wrapper(
+            loss, flat_model, flat_state, flat_opt_state, grads_valid, scaled_loss = compute_training_step_wrapper(
                 tx,
                 flat_model, 
                 flat_state,
@@ -409,8 +763,8 @@ def train(
             flat_opt_state = recovery_opt_state
             continue
 
-        if (scaled_loss < 10_000).all(): # TODO: Make this configurable
-            new_grad_scale = grad_scale * 2
+        if (scaled_loss < 500).all() and grad_scale < 65536.0:
+            new_grad_scale = min(grad_scale * 2, 65536.0)
             print(f"Grad scale: {grad_scale} -> {new_grad_scale}")
             grad_scale = new_grad_scale
 
@@ -432,27 +786,36 @@ def train(
             model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
             opt_state_ensemble = jax.tree.unflatten(treedef_opt_state, flat_opt_state)
             state_ensemble = jax.tree.unflatten(treedef_state, flat_state)
-
-            print("Evaluating test losses...")
-            testset_losses = []
-            for (name, testset_dir) in testset_dirs.items():
-                eval_key, key = jax.random.split(key, num=2)
-                testset_loss, hit_rate, eventized_diff, visualizations = compute_testset_loss(
-                    model_ensemble,
-                    state_ensemble,
-                    rope_freqs,
-                    testset_dir,
-                    num_model_output_frames,
-                    eval_key,
-                    data_sharding,
-                )
-                # testset_hitrates[name] = float(hit_rate)
-                print(f"Test loss {name}: {testset_loss}, hit_rate = {hit_rate}, eventized_diff = {eventized_diff}")
-                testset_losses.append(testset_loss)
-
-                summary_writer.add_scalar(f"train/test-loss-{name}", testset_loss[0], step)
-                for i, visualization in enumerate(visualizations):
-                    summary_writer.add_figure(f"train/test-loss-{name}-{i}", visualization, step)
+            per_domain_metrics, testset_losses, key = run_periodic_eval(
+                step=step,
+                key=key,
+                model_ensemble=model_ensemble,
+                state_ensemble=state_ensemble,
+                rope_freqs=rope_freqs,
+                testset_dirs=testset_dirs,
+                num_model_output_frames=num_model_output_frames,
+                data_sharding=data_sharding,
+                logger=logger,
+            )
+            generated_vs_real_loss_ratio, generated_vs_yamaha_hit_rate_delta = compute_drift_metrics(
+                per_domain_metrics, monitoring_config
+            )
+            logger.log_drift(step, generated_vs_real_loss_ratio, generated_vs_yamaha_hit_rate_delta)
+            trend_slopes = update_eval_history_and_compute_slopes(
+                monitoring_state,
+                step,
+                per_domain_metrics,
+                generated_vs_real_loss_ratio,
+                monitoring_config,
+            )
+            if trend_slopes is not None:
+                logger.log_eval_trends(step, trend_slopes[0], trend_slopes[1], trend_slopes[2])
+            alert_flags, warning_messages = compute_alert_flags(
+                monitoring_state, per_domain_metrics, monitoring_config
+            )
+            for warning_message in warning_messages:
+                print(warning_message)
+            logger.log_alerts(step, alert_flags)
 
             # Recombine
             recombination_key, key = jax.random.split(key, num=2)
@@ -477,9 +840,28 @@ def train(
 
             print(f"Step {step}/{num_steps}, Loss: {averaged_loss}, LR = {learning_rate}")
 
+            # Pos/neg loss diagnostic on a small slice of the current batch
+            try:
+                diag_metrics = compute_and_record_diag(
+                    step=step,
+                    flat_model=flat_model,
+                    treedef_model=treedef_model,
+                    flat_state=flat_state,
+                    treedef_state=treedef_state,
+                    audio=audio,
+                    events=events,
+                    rope_freqs=rope_freqs,
+                    monitoring_state=monitoring_state,
+                    config=monitoring_config,
+                )
+                logger.log_diag(step, diag_metrics)
+            except Exception as e:
+                print(f"  Diagnostic failed: {e}")
+
             # Pick the average loss of the best model in the ensemble
-            summary_writer.add_scalar("train/loss", jnp.min(averaged_loss), step)
-            summary_writer.add_scalar("train/learning_rate", learning_rate, step)
+            train_loss = float(jnp.min(averaged_loss))
+            logger.log_train_step(step, train_loss, float(learning_rate))
+            monitoring_state.train_loss_history.append(train_loss)
 
             model_ensemble = jax.tree.unflatten(treedef_model, flat_model)
             loss_sum = jnp.array([0.0] * flat_model[0].shape[0], dtype=jnp.float32)
@@ -726,86 +1108,47 @@ def init_model(model, key: jax.random.PRNGKey):
 
     return model
 
-def setup_optimizers(model, base_learning_rate: float, layer_lr_decay: float, weight_decay: float, warmup_steps: int, num_steps: int):
-    # Implement layer learning-rate decay by figuring out the depth from the PyTree path and adjusting the optimizer to the depth
-    def depth_extracting_label_fn(tree):
-        def map_fn(path, value):
-            if path[0].name == "layers":
-                # We are inside our Conv-blocks
-                conv_depth = path[1].idx
-                layer_depth = path[3].idx
+def setup_optimizers(
+    model,
+    base_learning_rate: float,
+    layer_lr_decay: float,
+    weight_decay: float,
+    warmup_steps: int,
+    num_steps: int,
+    muon_lr_multiplier: float = 40.0,
+    adam_lr_multiplier: float = 2.0,
+):
+    def get_muon_dimension_numbers(params):
+        """Generate MuonDimensionNumbers for each parameter leaf.
 
-                # Compute the prefix sum, and add the current layer depth
-                computed_depth = 0
-                for i in range(conv_depth):
-                    computed_depth += model_config["depths"][i]
-                computed_depth += layer_depth
+        Assigns Muon optimizer to weight matrices and AdamW to everything else:
+        - 2D weights (Linear layers): Muon with reduction over in_features
+        - 3D conv weights with in_channels > 1: Muon with reduction over (in_ch, kernel)
+        - 1D params (biases, norms), depthwise convs, scalars: AdamW fallback
+        """
+        def assign(leaf):
+            if leaf.ndim == 2 and min(leaf.shape) > 1:
+                # Linear weight (out_features, in_features) in Equinox
+                return MuonDimensionNumbers((-1,), (0,))
+            elif leaf.ndim == 3 and leaf.shape[1] > 1:
+                # Conv weight (out_ch, in_ch, kernel) - non-depthwise
+                return MuonDimensionNumbers((-2, -1), (0,))
+            return None
+        return jax.tree.map(assign, params)
 
-                # print(f"Conv path {path} at depth {computed_depth}")
-                return f"conv_layer|{computed_depth}"
-            # elif path[0].name == "transformer":
-            #     print(path)
-            #     seq_nr = path[2].idx
-            #     # We are inside the transformer stack
-            #     # print(f"Transformer path {path} at depth {seq_nr}")
-            #     return f"transformer_layer|{seq_nr}"
-            else:
-                return f"default|0"
+    muon_lr = base_learning_rate * muon_lr_multiplier
+    adam_lr = base_learning_rate * adam_lr_multiplier
 
-        return jax.tree_util.tree_map_with_path(map_fn, tree)
+    muon_schedule = create_learning_rate_schedule(muon_lr, warmup_steps, num_steps)
+    adam_schedule = create_learning_rate_schedule(adam_lr, warmup_steps, num_steps)
 
-    def max_depth(acc, value: str):
-        # print(f"Value: {value}, acc: {acc}")
-        layername, depth = value.split("|")
-        depth = int(depth)
-
-        if layername == "conv_layer":
-            return max(acc[0], depth), acc[1]
-        # elif layername == "transformer_layer":
-        #     return acc[0], max(acc[1], depth)
-        else:
-            return acc
-    max_conv_depth, max_transformer_depth = jax.tree_util.tree_reduce(
-        max_depth,
-        depth_extracting_label_fn(model), (0, 0),
+    tx = muon(
+        learning_rate=muon_schedule,
+        adam_learning_rate=adam_schedule,
+        weight_decay=weight_decay,
+        adam_weight_decay=weight_decay,
+        muon_weight_dimension_numbers=get_muon_dimension_numbers,
     )
-    # print(f"Max conv depth: {max_conv_depth}, max transformer depth: {max_transformer_depth}")
-    print(f"Max conv depth: {max_conv_depth}")
-
-    eps = 1e-3
-    b1 = 0.9
-    b2 = 0.999
-
-    base_cnn_rate = base_learning_rate  # / 10.0
-    conv_lr_by_depth = {
-        f"conv_layer|{depth}": optax.adamw(
-            create_learning_rate_schedule(base_cnn_rate * (layer_lr_decay ** (max_conv_depth - depth)), warmup_steps, num_steps),
-            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
-        )
-        for depth in range(max_conv_depth + 1)
-    }
-    # conv_lr_by_depth = {
-    #     f"conv_layer|{depth}": optax.set_to_zero()
-    #     for depth in range(max_conv_depth + 1)
-    # }
-    # transformer_lr_by_depth = {
-    #     f"transformer_layer|{depth}": optax.adamw(
-    #         create_learning_rate_schedule(base_learning_rate * (layer_lr_decay ** (max_transformer_depth - depth)), warmup_steps, num_steps),
-    #         weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
-    #     )
-    #     for depth in range(max_transformer_depth + 1)
-    # }
-    default_lr = {
-        f"default|0": optax.adamw(
-            create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps),
-            weight_decay=weight_decay, eps=eps, b1=b1, b2=b2,
-        )
-    }
-    optimizers_by_depth = conv_lr_by_depth | default_lr  # | transformer_lr_by_depth
-    tx = optax.multi_transform({
-        depth: optimizer
-        for depth, optimizer in optimizers_by_depth.items()
-    }, depth_extracting_label_fn)
     tx = optax.chain(tx, optax.clip_by_global_norm(1.0))
 
     base_lr_schedule = create_learning_rate_schedule(base_learning_rate, warmup_steps, num_steps)
@@ -825,14 +1168,16 @@ def main(args):
 
     num_devices = len(jax.devices())
 
-    batch_size = 512
+    batch_size = 64
     # minibatch_size = 64 * num_devices
-    minibatch_size = 256
-    num_steps = 500_000
+    minibatch_size = 16
+    num_steps = 150_000
     warmup_steps = 1000
-    base_learning_rate = 5 * 1e-4
+    base_learning_rate = 1.0 * 1e-4
+    muon_lr_multiplier = 40.0
+    adam_lr_multiplier = 2.0
     layer_lr_decay = 1.0
-    weight_decay = 0.00001
+    weight_decay = 0.0001
     model_init_keys = jnp.stack([
         jax.random.key(i)
         for i in range(1)
@@ -844,14 +1189,14 @@ def main(args):
         cut_probability=0.4,
         rotate_probability=0.9,
         random_erasing_probability=0.3,
-        mixup_probability=0.6,
+        mixup_probability=0.3,
         gain_probability=0.8,
         noise_probability=0.8,
         label_smoothing_alpha=0.005,
     )
 
     checkpoint_every = 1000
-    checkpoints_to_keep = 3
+    checkpoints_to_keep = 10
     dataset_num_workers = 2
 
     main_key = jax.random.PRNGKey(1234)
@@ -943,7 +1288,16 @@ def main(args):
     model_states = eqx.filter_shard(model_states, model_sharding)
 
     print("Setting up optimizers...")
-    tx, base_learning_rate_schedule = setup_optimizers(audio_to_midi_ensemble, base_learning_rate, layer_lr_decay, weight_decay, warmup_steps, num_steps)
+    tx, base_learning_rate_schedule = setup_optimizers(
+        audio_to_midi_ensemble,
+        base_learning_rate,
+        layer_lr_decay,
+        weight_decay,
+        warmup_steps,
+        num_steps,
+        muon_lr_multiplier=muon_lr_multiplier,
+        adam_lr_multiplier=adam_lr_multiplier,
+    )
 
     @eqx.filter_vmap
     def make_opt_states(model):
@@ -1013,6 +1367,11 @@ if __name__ == "__main__":
 
         # '--xla_dump_to="/home/knielsen/xla_cuda_crash" '
     )
+
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
 
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.threefry_partitionable(True)

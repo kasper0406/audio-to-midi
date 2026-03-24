@@ -18,21 +18,22 @@ def identity(arg):
     return arg
 
 model_config = {
-    "dims": [ 6 * (2 ** i) for i in range(8) ],
-    "depths": [3] * 8,
+    "dims": [96, 192, 384, 384, 512, 512],
+    "depths": [3, 4, 9, 9, 3, 3],
     "cnn_hidden_expansion": 2.0,
+    "cnn_kernel_size": 7,
 
-    "num_transformer_layers": 5,
-    "num_transformer_heads": 12,
-    "attention_size": 64,
-    "compressed_attention_q_size": 64,
-    "compressed_attention_kv_size": 64,
-
-    "transformer_dropout_rate": 0.1,
-    "transformer_hidden_dim": 512,
-    "transformer_hidden_expansion": 2.0,
+    "seq_hidden_dim": 512,
+    "d_geom": 32,
+    "num_geometric_layers": 16,
+    "geometric_product": "grassmann",  # "grassmann" or "clifford"
+    "geometric_shift_pattern": [1, 2, 4, 8, 16, 32],
 
     "sdd_rate": 0.05,
+    "num_fpn_stages": 4,
+
+    # Kept for rope_freqs compatibility in train/infer/export
+    "attention_size": 64,
 }
 
 
@@ -538,6 +539,166 @@ class AlternatingLocalAndGlobalAttention(eqx.Module):
         return x
 
 
+# --- Grassmann / Clifford Geometric Flow ---
+
+class GeometricProduct:
+    """Base class for geometric interaction strategies."""
+    def get_output_dim(self, d_geom: int) -> int:
+        raise NotImplementedError
+
+    def __call__(self, u_prev, u_curr):
+        raise NotImplementedError
+
+
+class GrassmannProduct(GeometricProduct):
+    """
+    Exterior Product (Wedge): u ^ v
+    Output: Bivectors representing area and orientation.
+    """
+    def get_output_dim(self, d_geom: int) -> int:
+        return (d_geom * (d_geom - 1)) // 2
+
+    def __call__(self, u_prev, u_curr):
+        # u_prev, u_curr: (seq_len, d_geom)
+        outer = u_prev[..., None] * u_curr[..., None, :]
+        wedge_matrix = outer - jnp.transpose(outer, (0, 2, 1))
+        d = u_prev.shape[-1]
+        tri_indices = jnp.triu_indices(d, k=1)
+        return wedge_matrix[..., tri_indices[0], tri_indices[1]]
+
+
+class CliffordProduct(GeometricProduct):
+    """
+    Full Geometric Product: uv = u . v + u ^ v
+    Output: Scalar (dot product) + Bivectors (wedge product).
+    """
+    def get_output_dim(self, d_geom: int) -> int:
+        return 1 + (d_geom * (d_geom - 1)) // 2
+
+    def __call__(self, u_prev, u_curr):
+        # Scalar part (dot product)
+        dot = jnp.sum(u_prev * u_curr, axis=-1, keepdims=True)
+        # Bivector part (wedge product)
+        outer = u_prev[..., None] * u_curr[..., None, :]
+        wedge_matrix = outer - jnp.transpose(outer, (0, 2, 1))
+        d = u_prev.shape[-1]
+        tri_indices = jnp.triu_indices(d, k=1)
+        wedge = wedge_matrix[..., tri_indices[0], tri_indices[1]]
+        return jnp.concatenate([dot, wedge], axis=-1)
+
+
+def _get_geometric_product(name: str) -> GeometricProduct:
+    if name == "grassmann":
+        return GrassmannProduct()
+    elif name == "clifford":
+        return CliffordProduct()
+    else:
+        raise ValueError(f"Unknown geometric product: {name}")
+
+
+class GeometricMixer(eqx.Module, strict=True):
+    proj_in: eqx.nn.Linear
+    mixer_up: eqx.nn.Linear
+    mixer_down: eqx.nn.Linear
+    proj_out: eqx.nn.Linear
+    gate: eqx.nn.Linear
+    norm: eqx.nn.LayerNorm
+    product_impl: GeometricProduct = eqx.field(static=True)
+    inter_dim: int = eqx.field(static=True)
+    shift_amount: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        d_model: int,
+        d_geom: int,
+        product_impl: GeometricProduct,
+        shift_amount: int = 1,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        proj_in_key, mixer_up_key, mixer_down_key, proj_out_key, gate_key = _split_key(key, 5)
+
+        self.product_impl = product_impl
+        self.inter_dim = product_impl.get_output_dim(d_geom)
+        self.shift_amount = shift_amount
+
+        self.proj_in = eqx.nn.Linear(d_model, d_geom, key=proj_in_key)
+        self.mixer_up = eqx.nn.Linear(self.inter_dim, self.inter_dim * 2, key=mixer_up_key)
+        self.mixer_down = eqx.nn.Linear(self.inter_dim * 2, self.inter_dim, key=mixer_down_key)
+        self.proj_out = eqx.nn.Linear(self.inter_dim, d_model, key=proj_out_key)
+        self.gate = eqx.nn.Linear(d_model, d_model, key=gate_key)
+        self.norm = eqx.nn.LayerNorm(d_model)
+
+    @jax.named_scope("kapper.GeometricMixer")
+    def __call__(
+        self,
+        x: Float[Array, "seq_len d_model"],
+        *,
+        key: Optional[jax.random.PRNGKey] = None,
+        enable_dropout: bool = False,
+    ) -> Float[Array, "seq_len d_model"]:
+        # Pre-norm
+        h = jax.vmap(self.norm)(x.astype(jnp.float32)).astype(x.dtype)
+
+        # Project to geometric space
+        u = jax.vmap(self.proj_in)(h)  # (seq_len, d_geom)
+
+        # Create causal pairs with multi-scale shift
+        s = self.shift_amount
+        u_prev = jnp.pad(u[:-s, :], ((s, 0), (0, 0)))
+        u_curr = u
+
+        # Compute geometric product
+        geometry = self.product_impl(u_prev, u_curr)  # (seq_len, inter_dim)
+
+        # MLP on the manifold
+        flow_out = jax.vmap(self.mixer_up)(geometry)
+        flow_out = jax.nn.gelu(flow_out)
+        flow_out = jax.vmap(self.mixer_down)(flow_out)
+
+        # Project back
+        out = jax.vmap(self.proj_out)(flow_out)  # (seq_len, d_model)
+
+        # Gating
+        gate_score = jax.nn.sigmoid(jax.vmap(self.gate)(h))
+
+        return x + (out * gate_score)
+
+
+class GeometricMixerStack(eqx.Module):
+    layers: list[GeometricMixer]
+    num_layers: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        d_model: int,
+        d_geom: int,
+        num_layers: int,
+        product_impl: GeometricProduct,
+        shift_pattern: list[int] | None = None,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        self.num_layers = num_layers
+        if shift_pattern is None:
+            shift_pattern = [1]
+        keys = _split_key(key, num_layers)
+        self.layers = [
+            GeometricMixer(d_model, d_geom, product_impl, shift_amount=shift_pattern[i % len(shift_pattern)], key=k)
+            for i, k in enumerate(keys)
+        ]
+
+    def __call__(
+        self,
+        inputs: Float[Array, "seq_len d_model"],
+        enable_dropout: bool = False,
+        key: Optional[jax.random.PRNGKey] = None,
+    ) -> Float[Array, "seq_len d_model"]:
+        output = inputs
+        layer_keys = _split_key(key, num=len(self.layers)) if key is not None else [None] * len(self.layers)
+        for layer, layer_key in zip(self.layers, layer_keys):
+            output = layer(output, key=layer_key, enable_dropout=enable_dropout)
+        return output
+
+
 class TransformerStack(eqx.Module):
     layers: list[TransformerLayer]
     num_layers: int = eqx.field(static=True)
@@ -605,15 +766,70 @@ class TransformerStack(eqx.Module):
         return output
 
 
+class MultiScaleFusion(eqx.Module):
+    """Fuses features from multiple CNN stages at the coarsest resolution.
+
+    Each stage's features are projected to a common channel dimension via 1x1
+    convolutions, downsampled to match the deepest (coarsest) stage's temporal
+    resolution, and summed together.  A final LayerNorm is applied.
+    """
+    lateral_projections: list[eqx.nn.Conv1d]
+    norm: LayerNorm
+    fusion_dim: int = eqx.field(static=True)
+    downsample_factors: list[int] = eqx.field(static=True)
+
+    def __init__(
+        self,
+        stage_dims: list[int],
+        fusion_dim: int,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        self.fusion_dim = fusion_dim
+        num_stages = len(stage_dims)
+        # Last stage has factor 1, each earlier stage doubles
+        self.downsample_factors = [2 ** (num_stages - 1 - i) for i in range(num_stages)]
+
+        keys = _split_key(key, num_stages)
+        self.lateral_projections = [
+            eqx.nn.Conv1d(dim, fusion_dim, kernel_size=1, key=k)
+            for dim, k in zip(stage_dims, keys)
+        ]
+        self.norm = LayerNorm(fusion_dim)
+
+    @jax.named_scope("kapper.MultiScaleFusion")
+    def __call__(
+        self,
+        features: list,
+        *,
+        key: Optional[jax.random.PRNGKey] = None,
+    ):
+        """Fuse a list of (channels_i, seq_len_i) feature maps."""
+        target_len = features[-1].shape[-1]  # Coarsest resolution
+
+        fused = jnp.zeros((self.fusion_dim, target_len), dtype=features[-1].dtype)
+        for feat, proj, ds_factor in zip(features, self.lateral_projections, self.downsample_factors):
+            projected = proj(feat)  # (fusion_dim, seq_len_i)
+            if ds_factor > 1:
+                usable_len = (projected.shape[-1] // ds_factor) * ds_factor
+                projected = projected[:, :usable_len].reshape(
+                    self.fusion_dim, -1, ds_factor
+                ).mean(axis=-1)
+                projected = projected[:, :target_len]
+            fused = fused + projected
+
+        return self.norm(fused.astype(jnp.float32)).astype(fused.dtype)
+
+
 class OutputSequenceGenerator(eqx.Module):
     layers: list[eqx.nn.Sequential]
-    norm: LayerNorm
-    transformer_projection: eqx.nn.Linear | None = None
-    transformer: TransformerStack
+    multi_scale_fusion: MultiScaleFusion
+    geometric_mixer: GeometricMixerStack
     decoder: Decoder
 
     recombination_rate: Array
     mutation_rate: Array
+
+    num_fpn_stages: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -623,11 +839,12 @@ class OutputSequenceGenerator(eqx.Module):
         self.recombination_rate = jnp.array([1e-8], dtype=jnp.float32)
         self.mutation_rate = jnp.array([1e-7], dtype=jnp.float32)
 
-        layers_key, decoder_key, transformer_projection_key, transformer_key = _split_key(key, 4)
+        layers_key, decoder_key, fusion_key, mixer_key = _split_key(key, 4)
 
         dims = conf["dims"]
         hidden_dims = [int(d * conf["cnn_hidden_expansion"]) for d in dims]
         depths = conf["depths"]
+        cnn_kernel_size = conf.get("cnn_kernel_size", 3)
 
         self.layers = []
 
@@ -648,36 +865,36 @@ class OutputSequenceGenerator(eqx.Module):
             self.layers.append(eqx.nn.Sequential([
                 downsample_layer,
                 *[
-                    Block(dims[i], hidden_dims[i], sdd_rate=sdd_rates[depth_count + j], key=block_key)
+                    Block(dims[i], hidden_dims[i], sdd_rate=sdd_rates[depth_count + j], kernel_size=cnn_kernel_size, key=block_key)
                     for j, block_key in enumerate(block_keys)
                 ],
             ]))
             depth_count += depths[i]
 
-        self.norm = LayerNorm(dims[-1])
-        # self.decoder = Decoder(dims[-1], key=decoder_key)
-
-        transformer_hidden_dim = conf.get("transformer_hidden_dim", dims[-1])
-        if transformer_hidden_dim != dims[-1]:
-            self.transformer_projection = eqx.nn.Linear(
-                dims[-1],
-                transformer_hidden_dim,
-                key=transformer_projection_key,
-            )
-
-        self.transformer = TransformerStack(
-            input_size=transformer_hidden_dim,
-            num_layers=conf["num_transformer_layers"],
-            attention_size=conf["attention_size"],
-            compressed_attention_q_size=conf["compressed_attention_q_size"],
-            compressed_attention_kv_size=conf["compressed_attention_kv_size"],
-            intermediate_size=int(transformer_hidden_dim * conf["transformer_hidden_expansion"]),
-            num_heads=conf["num_transformer_heads"],
-            dropout_rate=conf["transformer_dropout_rate"],
-            key=transformer_key,
+        # Multi-scale feature fusion (FPN)
+        num_fpn_stages = conf.get("num_fpn_stages", 1)
+        self.num_fpn_stages = num_fpn_stages
+        seq_hidden_dim = conf.get("seq_hidden_dim", dims[-1])
+        fpn_stage_dims = dims[-num_fpn_stages:]
+        self.multi_scale_fusion = MultiScaleFusion(
+            stage_dims=fpn_stage_dims,
+            fusion_dim=seq_hidden_dim,
+            key=fusion_key,
         )
 
-        self.decoder = Decoder(transformer_hidden_dim, key=decoder_key)
+        # Geometric mixer with multi-scale shift pattern
+        shift_pattern = conf.get("geometric_shift_pattern", None)
+        product_impl = _get_geometric_product(conf["geometric_product"])
+        self.geometric_mixer = GeometricMixerStack(
+            d_model=seq_hidden_dim,
+            d_geom=conf["d_geom"],
+            num_layers=conf["num_geometric_layers"],
+            product_impl=product_impl,
+            shift_pattern=shift_pattern,
+            key=mixer_key,
+        )
+
+        self.decoder = Decoder(seq_hidden_dim, key=decoder_key)
 
     def __call__(
         self,
@@ -687,24 +904,28 @@ class OutputSequenceGenerator(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ):
-        # samples = samples.astype(jnp.float16)
-
         print(f"Enable dropout? {enable_dropout}")
         print(f"Sample shape: {samples.shape}")
         resnext_key, transformer_key = _split_key(key, 2)
         layer_keys = _split_key(resnext_key, num=len(self.layers))
 
-        # Compute ConvNext layers
+        # Compute ConvNext layers, collecting intermediates for FPN
         h = samples
-        for layer, layer_key in zip(self.layers, layer_keys):
+        intermediates = []
+        fpn_start = len(self.layers) - self.num_fpn_stages
+        for i, (layer, layer_key) in enumerate(zip(self.layers, layer_keys)):
             h = layer(h, key=layer_key)
-        h = self.norm(h.astype(jnp.float32)).astype(h.dtype)
+            if i >= fpn_start:
+                intermediates.append(h)
 
-        # # Compute Transformer layers
+        # Multi-scale feature fusion
+        h = self.multi_scale_fusion(intermediates)
+
+        # Transpose to (seq_len, channels)
         h = jnp.transpose(h)
-        if self.transformer_projection is not None:
-            h = jax.vmap(self.transformer_projection)(h)
-        h = self.transformer(h, rope_freqs=rope_freqs, enable_dropout=enable_dropout, key=transformer_key)
+
+        # Compute Geometric Mixer layers
+        h = self.geometric_mixer(h, enable_dropout=enable_dropout, key=transformer_key)
 
         # Decode the result
         logits, probs = self.decoder(h)

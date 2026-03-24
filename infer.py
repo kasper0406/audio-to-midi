@@ -134,9 +134,10 @@ def detailed_event_loss(
         norm = plt.Normalize(vmin=0.0, vmax=1.0)
         fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1)
 
+        output_probs_np = np.asarray(output_probs, dtype=np.float32)
         X = jnp.linspace(0.0, predicted.shape[0], predicted.shape[0])
         Y = jnp.arange(MIDI_EVENT_VOCCAB_SIZE)
-        c = ax1.pcolor(X, Y, jnp.transpose(output_probs), cmap=cmap, norm=norm)
+        c = ax1.pcolor(X, Y, np.transpose(output_probs_np), cmap=cmap, norm=norm)
         ax1.set(
             ylabel="Inferred events",
         )
@@ -287,7 +288,7 @@ def compute_testset_loss(
             probs_all.append(probs)
             test_losses_all.append(test_losses)
 
-        stitched_probs = np.concatenate(probs, axis=0)
+        stitched_probs = np.concatenate(probs_all, axis=0)
         stitched_events = np.concatenate(midi_events, axis=0)
 
         # TODO(knielsen): Consider exposing more information
