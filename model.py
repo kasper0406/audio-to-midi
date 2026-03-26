@@ -17,6 +17,10 @@ from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 # with C/groups < 16.  This dtype is used to upcast around those ops.
 _CONV_FALLBACK_DTYPE = jnp.bfloat16
 
+# FP8 e4m3fn max representable value.  There is NO infinity in e4m3fn —
+# any overflow goes straight to NaN, so we must clamp before casting.
+_FP8_MAX = 448.0
+
 def _conv_in_fallback_dtype(conv_module, x):
     """Run a conv in bfloat16 regardless of the model's current precision."""
     conv_bf16 = jax.tree_util.tree_map(
@@ -25,6 +29,16 @@ def _conv_in_fallback_dtype(conv_module, x):
         conv_module,
     )
     return conv_bf16(x.astype(_CONV_FALLBACK_DTYPE))
+
+def _safe_cast_to_fp8(x):
+    """Cast to FP8 e4m3fn with clamping to avoid NaN from overflow.
+    
+    FP8 e4m3fn has no infinity — values > 448 become NaN.
+    We clamp in float32 first, then cast.
+    """
+    if x.dtype == jnp.float8_e4m3fn:
+        return x
+    return jnp.clip(x.astype(jnp.float32), -_FP8_MAX, _FP8_MAX).astype(jnp.float8_e4m3fn)
 
 @jax.jit
 def identity(arg):
@@ -242,13 +256,18 @@ class Block(eqx.Module):
         out = self.norm(out.astype(jnp.float32)).astype(orig_dtype)
         out = self.point_conv_1(out)
         x1, x2 = jnp.split(out, 2, axis=0)
-        # GELU in float32: cubic term in GELU overflows FP8 for |x| > ~7.
-        out = (jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)).astype(orig_dtype)
-        # print(f"Out shape: {out.shape}")
+        # GELU*gate in float32: product can exceed FP8 max (448).
+        # Keep in float32 through GRN (which also works in float32).
+        out = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
         out = self.global_response_norm(out)
-        # out = jax.nn.relu(out)
+        # GRN output can exceed FP8 max due to the x + gamma*(x*nx) term.
+        # Clamp before casting to avoid NaN (FP8 has no infinity).
+        out = _safe_cast_to_fp8(out) if orig_dtype == jnp.float8_e4m3fn else out.astype(orig_dtype)
         out = self.point_conv_2(out)
-        return self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key) + x
+        # Residual add in float32: residual accumulation can exceed FP8 max (448).
+        # FP8 e4m3fn has no infinity, so overflow → NaN.  Clamp before casting.
+        residual = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key).astype(jnp.float32) + x.astype(jnp.float32)
+        return _safe_cast_to_fp8(residual) if orig_dtype == jnp.float8_e4m3fn else residual.astype(orig_dtype)
 
 class Decoder(eqx.Module):
     decoder_pooling: eqx.nn.Linear
@@ -690,7 +709,9 @@ class GeometricMixer(eqx.Module, strict=True):
         gate_input = jax.vmap(self.gate)(h)
         gate_score = jax.nn.sigmoid(gate_input.astype(jnp.float32)).astype(x.dtype)
 
-        return x + (out * gate_score)
+        # Residual add — safe for FP8 (no infinity, overflow → NaN).
+        result = x.astype(jnp.float32) + (out * gate_score).astype(jnp.float32)
+        return _safe_cast_to_fp8(result) if x.dtype == jnp.float8_e4m3fn else result.astype(x.dtype)
 
 
 class GeometricMixerStack(eqx.Module):
@@ -835,7 +856,8 @@ class MultiScaleFusion(eqx.Module):
         """Fuse a list of (channels_i, seq_len_i) feature maps."""
         target_len = features[-1].shape[-1]  # Coarsest resolution
 
-        fused = jnp.zeros((self.fusion_dim, target_len), dtype=features[-1].dtype)
+        # Accumulate in float32 to avoid FP8 overflow when summing projections.
+        fused = jnp.zeros((self.fusion_dim, target_len), dtype=jnp.float32)
         for feat, proj, ds_factor in zip(features, self.lateral_projections, self.downsample_factors):
             projected = proj(feat)  # (fusion_dim, seq_len_i)
             if ds_factor > 1:
@@ -844,9 +866,9 @@ class MultiScaleFusion(eqx.Module):
                     self.fusion_dim, -1, ds_factor
                 ).mean(axis=-1)
                 projected = projected[:, :target_len]
-            fused = fused + projected
+            fused = fused + projected.astype(jnp.float32)
 
-        return self.norm(fused.astype(jnp.float32)).astype(fused.dtype)
+        return self.norm(fused).astype(features[-1].dtype)
 
 
 class OutputSequenceGenerator(eqx.Module):
