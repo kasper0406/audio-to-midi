@@ -34,10 +34,13 @@ from tensorboardX import SummaryWriter
 from absl import app
 
 MODEL_DTYPE = jnp.float32
-FORWARD_DTYPE = jnp.float8_e4m3fn
-BACKWARD_DTYPE = jnp.float8_e4m3fn
-# FORWARD_DTYPE = jnp.bfloat16
-# BACKWARD_DTYPE = jnp.bfloat16
+# FP8 training is not viable without per-tensor dynamic scaling (NVIDIA TE approach).
+# FP8 backward gradient overflow starts at ~6 matmul layers; our model has ~142.
+# See session plan for full analysis.  Keep bf16 for training stability.
+# FORWARD_DTYPE = jnp.float8_e4m3fn
+# BACKWARD_DTYPE = jnp.float8_e4m3fn
+FORWARD_DTYPE = jnp.bfloat16
+BACKWARD_DTYPE = jnp.bfloat16
 # FORWARD_DTYPE = jnp.float32
 # BACKWARD_DTYPE = jnp.float32
 
