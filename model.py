@@ -13,6 +13,19 @@ from rope import calculate_rope, RopeFreqs
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
 
+# cuDNN has no FP8 support for depthwise convs (C/groups=1) or convs
+# with C/groups < 16.  This dtype is used to upcast around those ops.
+_CONV_FALLBACK_DTYPE = jnp.bfloat16
+
+def _conv_in_fallback_dtype(conv_module, x):
+    """Run a conv in bfloat16 regardless of the model's current precision."""
+    conv_bf16 = jax.tree_util.tree_map(
+        lambda leaf: leaf.astype(_CONV_FALLBACK_DTYPE)
+                     if eqx.is_inexact_array(leaf) else leaf,
+        conv_module,
+    )
+    return conv_bf16(x.astype(_CONV_FALLBACK_DTYPE))
+
 @jax.jit
 def identity(arg):
     return arg
@@ -142,8 +155,11 @@ class Stem(eqx.Module):
         self.norm = LayerNorm(channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        out = self.conv(x)
-        return self.norm(out.astype(jnp.float32)).astype(out.dtype)
+        # Stem has in_channels=2 (C/groups=2) — no FP8 cuDNN support.
+        # Run conv in bfloat16 (both weights and activations).
+        orig_dtype = x.dtype
+        out = _conv_in_fallback_dtype(self.conv, x)
+        return self.norm(out.astype(jnp.float32)).astype(orig_dtype)
 
 class Downsample(eqx.Module):
     conv: eqx.nn.Conv1d
@@ -219,8 +235,11 @@ class Block(eqx.Module):
         self.global_response_norm = GlobalResponseNorm()
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
-        out = self.depth_conv(x)
-        out = self.norm(out.astype(jnp.float32)).astype(out.dtype)
+        # Depthwise conv (C/groups=1) has no FP8 cuDNN support.
+        # Run in bfloat16 (both weights and activations), then back to orig dtype.
+        orig_dtype = x.dtype
+        out = _conv_in_fallback_dtype(self.depth_conv, x).astype(orig_dtype)
+        out = self.norm(out.astype(jnp.float32)).astype(orig_dtype)
         out = self.point_conv_1(out)
         x1, x2 = jnp.split(out, 2, axis=0)
         out = jax.nn.gelu(x1) * x2
