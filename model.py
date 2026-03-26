@@ -188,12 +188,12 @@ class GlobalResponseNorm(eqx.Module, strict=True):
         self.beta = jnp.zeros((1,))
 
     def __call__(self, x):
-        # print(f"x.shape in grn: {x.shape}")
-        gx = jnp.sqrt(jnp.sum(x**2, axis=(1, ), keepdims=True) + 1e-6)
-        # print(f"gx.shape in grn: {gx.shape}")
+        # Upcast to float32: x² overflows FP8 for |x| > 21 (448 max).
+        orig_dtype = x.dtype
+        x_f32 = x.astype(jnp.float32)
+        gx = jnp.sqrt(jnp.sum(x_f32**2, axis=(1, ), keepdims=True) + 1e-6)
         nx = gx / (jnp.mean(gx, axis=-1, keepdims=True) + 1e-6)
-        # jax.debug.print("gamma = {gamma}, beta = {beta}", gamma=self.gamma.value, beta=self.beta.value)
-        return self.gamma * (x * nx) + self.beta + x
+        return (self.gamma.astype(jnp.float32) * (x_f32 * nx) + self.beta.astype(jnp.float32) + x_f32).astype(orig_dtype)
 
 class Block(eqx.Module):
     depth_conv: eqx.nn.Conv1d
@@ -242,7 +242,8 @@ class Block(eqx.Module):
         out = self.norm(out.astype(jnp.float32)).astype(orig_dtype)
         out = self.point_conv_1(out)
         x1, x2 = jnp.split(out, 2, axis=0)
-        out = jax.nn.gelu(x1) * x2
+        # GELU in float32: cubic term in GELU overflows FP8 for |x| > ~7.
+        out = (jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)).astype(orig_dtype)
         # print(f"Out shape: {out.shape}")
         out = self.global_response_norm(out)
         # out = jax.nn.relu(out)
@@ -273,7 +274,8 @@ class Decoder(eqx.Module):
         output = jax.vmap(self.norm)(x.astype(jnp.float32)).astype(x.dtype)
 
         logits = jax.vmap(self.decoder_pooling)(output)
-        probs = jax.nn.sigmoid(logits)
+        # Sigmoid in float32: avoids exp overflow/underflow in FP8.
+        probs = jax.nn.sigmoid(logits.astype(jnp.float32))
 
         return (
             logits,
@@ -579,6 +581,9 @@ class GrassmannProduct(GeometricProduct):
 
     def __call__(self, u_prev, u_curr):
         # u_prev, u_curr: (seq_len, d_geom)
+        # Upcast: outer products lose precision and can overflow in FP8.
+        u_prev = u_prev.astype(jnp.float32)
+        u_curr = u_curr.astype(jnp.float32)
         outer = u_prev[..., None] * u_curr[..., None, :]
         wedge_matrix = outer - jnp.transpose(outer, (0, 2, 1))
         d = u_prev.shape[-1]
@@ -596,6 +601,9 @@ class CliffordProduct(GeometricProduct):
 
     def __call__(self, u_prev, u_curr):
         # Scalar part (dot product)
+        # Upcast: outer products and accumulation lose precision in FP8.
+        u_prev = u_prev.astype(jnp.float32)
+        u_curr = u_curr.astype(jnp.float32)
         dot = jnp.sum(u_prev * u_curr, axis=-1, keepdims=True)
         # Bivector part (wedge product)
         outer = u_prev[..., None] * u_curr[..., None, :]
@@ -666,19 +674,21 @@ class GeometricMixer(eqx.Module, strict=True):
         u_prev = jnp.pad(u[:-s, :], ((s, 0), (0, 0)))
         u_curr = u
 
-        # Compute geometric product
+        # Compute geometric product (upcasts to float32 internally)
         geometry = self.product_impl(u_prev, u_curr)  # (seq_len, inter_dim)
+        geometry = geometry.astype(x.dtype)  # back to model dtype for matmuls
 
         # MLP on the manifold
         flow_out = jax.vmap(self.mixer_up)(geometry)
-        flow_out = jax.nn.gelu(flow_out)
+        flow_out = jax.nn.gelu(flow_out.astype(jnp.float32)).astype(x.dtype)
         flow_out = jax.vmap(self.mixer_down)(flow_out)
 
         # Project back
         out = jax.vmap(self.proj_out)(flow_out)  # (seq_len, d_model)
 
-        # Gating
-        gate_score = jax.nn.sigmoid(jax.vmap(self.gate)(h))
+        # Gating — sigmoid in float32 to avoid exp overflow in FP8.
+        gate_input = jax.vmap(self.gate)(h)
+        gate_score = jax.nn.sigmoid(gate_input.astype(jnp.float32)).astype(x.dtype)
 
         return x + (out * gate_score)
 
