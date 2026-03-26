@@ -12,32 +12,7 @@ import einops
 from rope import calculate_rope, RopeFreqs
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
-
-# cuDNN has no FP8 support for depthwise convs (C/groups=1) or convs
-# with C/groups < 16.  This dtype is used to upcast around those ops.
-_CONV_FALLBACK_DTYPE = jnp.bfloat16
-
-# FP8 e4m3fn max representable value.  There is NO infinity in e4m3fn —
-# any overflow goes straight to NaN, so we must clamp before casting.
-_FP8_MAX = 448.0
-
-def _conv_in_fallback_dtype(conv_module, x):
-    """Run a conv in bfloat16 regardless of the model's current precision."""
-    conv_bf16 = jax.tree_util.tree_map(
-        lambda leaf: leaf.astype(_CONV_FALLBACK_DTYPE)
-                     if eqx.is_inexact_array(leaf) else leaf,
-        conv_module,
-    )
-    return conv_bf16(x.astype(_CONV_FALLBACK_DTYPE))
-
-def _safe_cast_to_fp8(x):
-    """Cast to FP8 e4m3fn with clamping to avoid NaN from overflow.
-
-    FP8 e4m3fn has no infinity — values > 448 become NaN.
-    We clamp in float32 first, then cast.  The backward naturally
-    flows through clip (zeroing out-of-range grads) and astype.
-    """
-    return jnp.clip(x.astype(jnp.float32), -_FP8_MAX, _FP8_MAX).astype(jnp.float8_e4m3fn)
+from fp8_ops import fp8_linear_call, fp8_conv1d_call
 
 @jax.jit
 def identity(arg):
@@ -172,12 +147,10 @@ class Stem(eqx.Module):
         self.norm = LayerNorm(channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        # Stem has in_channels=2 (C/groups=2) — no FP8 cuDNN support.
-        # Run conv in bfloat16 (both weights and activations).
         orig_dtype = x.dtype
-        out = _conv_in_fallback_dtype(self.conv, x)
+        out = fp8_conv1d_call(self.conv, x)
         out = self.norm(out.astype(jnp.float32))
-        return _safe_cast_to_fp8(out) if orig_dtype == jnp.float8_e4m3fn else out.astype(orig_dtype)
+        return out.astype(orig_dtype)
 
 class Downsample(eqx.Module):
     conv: eqx.nn.Conv1d
@@ -194,10 +167,8 @@ class Downsample(eqx.Module):
         self.norm = LayerNorm(in_channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        orig_dtype = x.dtype
-        out = self.norm(x).astype(jnp.float32)
-        out = _safe_cast_to_fp8(out) if orig_dtype == jnp.float8_e4m3fn else out.astype(orig_dtype)
-        return self.conv(out)
+        out = self.norm(x).astype(jnp.float32).astype(x.dtype)
+        return fp8_conv1d_call(self.conv, out)
 
 class GlobalResponseNorm(eqx.Module, strict=True):
     gamma: Array
@@ -208,13 +179,12 @@ class GlobalResponseNorm(eqx.Module, strict=True):
         self.beta = jnp.zeros((1,))
 
     def __call__(self, x):
-        # Upcast to float32: x² overflows FP8 for |x| > 21 (448 max).
         orig_dtype = x.dtype
         x_f32 = x.astype(jnp.float32)
         gx = jnp.sqrt(jnp.sum(x_f32**2, axis=(1, ), keepdims=True) + 1e-6)
         nx = gx / (jnp.mean(gx, axis=-1, keepdims=True) + 1e-6)
         out = self.gamma.astype(jnp.float32) * (x_f32 * nx) + self.beta.astype(jnp.float32) + x_f32
-        return _safe_cast_to_fp8(out) if orig_dtype == jnp.float8_e4m3fn else out.astype(orig_dtype)
+        return out.astype(orig_dtype)
 
 class Block(eqx.Module):
     depth_conv: eqx.nn.Conv1d
@@ -256,28 +226,16 @@ class Block(eqx.Module):
         self.global_response_norm = GlobalResponseNorm()
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
-        # Depthwise conv (C/groups=1) has no FP8 cuDNN support.
-        # Run in bfloat16 (both weights and activations), then back to orig dtype.
         orig_dtype = x.dtype
-        is_fp8 = (orig_dtype == jnp.float8_e4m3fn)
-        out = _conv_in_fallback_dtype(self.depth_conv, x)
-        out = _safe_cast_to_fp8(out) if is_fp8 else out.astype(orig_dtype)
-        out = self.norm(out).astype(jnp.float32)
-        out = _safe_cast_to_fp8(out) if is_fp8 else out.astype(orig_dtype)
-        out = self.point_conv_1(out)
+        out = fp8_conv1d_call(self.depth_conv, x)
+        out = self.norm(out).astype(jnp.float32).astype(orig_dtype)
+        out = fp8_conv1d_call(self.point_conv_1, out)
         x1, x2 = jnp.split(out, 2, axis=0)
-        # GELU*gate in float32: product can exceed FP8 max (448).
-        # Keep in float32 through GRN (which also works in float32).
         out = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
         out = self.global_response_norm(out)
-        # GRN output can exceed FP8 max due to the x + gamma*(x*nx) term.
-        # Clamp before casting to avoid NaN (FP8 has no infinity).
-        out = _safe_cast_to_fp8(out) if is_fp8 else out.astype(orig_dtype)
-        out = self.point_conv_2(out)
-        # Residual add in float32: residual accumulation can exceed FP8 max (448).
-        # FP8 e4m3fn has no infinity, so overflow → NaN.  Clamp before casting.
+        out = fp8_conv1d_call(self.point_conv_2, out.astype(orig_dtype))
         residual = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key).astype(jnp.float32) + x.astype(jnp.float32)
-        return _safe_cast_to_fp8(residual) if is_fp8 else residual.astype(orig_dtype)
+        return residual.astype(orig_dtype)
 
 class Decoder(eqx.Module):
     decoder_pooling: eqx.nn.Linear
@@ -301,12 +259,10 @@ class Decoder(eqx.Module):
         key: Optional[jax.random.PRNGKey] = None,
     ):  # Probability distribution over the midi events
         orig_dtype = x.dtype
-        is_fp8 = (orig_dtype == jnp.float8_e4m3fn)
         output = jax.vmap(self.norm)(x.astype(jnp.float32))
-        output = _safe_cast_to_fp8(output) if is_fp8 else output.astype(orig_dtype)
+        output = output.astype(orig_dtype)
 
-        logits = jax.vmap(self.decoder_pooling)(output)
-        # Sigmoid in float32: avoids exp overflow/underflow in FP8.
+        logits = jax.vmap(lambda xi: fp8_linear_call(self.decoder_pooling, xi))(output)
         probs = jax.nn.sigmoid(logits.astype(jnp.float32))
 
         return (
@@ -346,11 +302,12 @@ class FeedForwardBlock(eqx.Module):
         enable_dropout: bool = False,
         key: Optional[jax.random.PRNGKey] = None,
     ) -> Float[Array, "attention_size"]:
-        x = self.attention_to_intermediate_proj(inputs)
+        x = fp8_linear_call(self.attention_to_intermediate_proj, inputs)
         x1, x2 = jnp.split(x, 2, axis=-1)
-        h = jax.nn.gelu(x1) * x2  # GLU-like activation with gelu instead of silu
+        h = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
+        h = h.astype(inputs.dtype)
 
-        output = self.intermediate_to_attention_proj(h)
+        output = fp8_linear_call(self.intermediate_to_attention_proj, h)
         output = self.dropout(output, inference=not enable_dropout, key=key)
         return output
 
@@ -450,10 +407,10 @@ class SelfAttention(eqx.Module, strict=True):
 
         c_q = inputs
         if self.query_down_proj:
-            c_q = jax.vmap(self.query_down_proj)(inputs)
+            c_q = jax.vmap(lambda xi: fp8_linear_call(self.query_down_proj, xi))(inputs)
         query_heads = calculate_rope(self._project(self.query_up_proj, c_q), rope_freqs)
 
-        c_kv = jax.vmap(self.kv_down_proj)(inputs)
+        c_kv = jax.vmap(lambda xi: fp8_linear_call(self.kv_down_proj, xi))(inputs)
         key_heads = calculate_rope(self._project(self.key_up_proj, c_kv), rope_freqs)
         value_heads = self._project(self.value_up_proj, c_kv)
 
@@ -464,11 +421,11 @@ class SelfAttention(eqx.Module, strict=True):
         attn = attn_fn(query_heads, key_heads, value_heads)
         attn = attn.reshape(query_seq_length, -1)
 
-        return jax.vmap(self.output_proj)(attn)
+        return jax.vmap(lambda xi: fp8_linear_call(self.output_proj, xi))(attn)
 
     def _project(self, proj, x):
         seq_length, _ = x.shape
-        projection = jax.vmap(proj)(x)
+        projection = jax.vmap(lambda xi: fp8_linear_call(proj, xi))(x)
         return projection.reshape(seq_length, self.num_heads, -1)
 
 
@@ -695,13 +652,13 @@ class GeometricMixer(eqx.Module, strict=True):
         key: Optional[jax.random.PRNGKey] = None,
         enable_dropout: bool = False,
     ) -> Float[Array, "seq_len d_model"]:
-        is_fp8 = (x.dtype == jnp.float8_e4m3fn)
+        orig_dtype = x.dtype
         # Pre-norm
         h = jax.vmap(self.norm)(x.astype(jnp.float32))
-        h = _safe_cast_to_fp8(h) if is_fp8 else h.astype(x.dtype)
+        h = h.astype(orig_dtype)
 
         # Project to geometric space
-        u = jax.vmap(self.proj_in)(h)  # (seq_len, d_geom)
+        u = jax.vmap(lambda xi: fp8_linear_call(self.proj_in, xi))(h)
 
         # Create causal pairs with multi-scale shift
         s = self.shift_amount
@@ -709,26 +666,23 @@ class GeometricMixer(eqx.Module, strict=True):
         u_curr = u
 
         # Compute geometric product (upcasts to float32 internally)
-        geometry = self.product_impl(u_prev, u_curr)  # (seq_len, inter_dim)
-        geometry = _safe_cast_to_fp8(geometry) if is_fp8 else geometry.astype(x.dtype)
+        geometry = self.product_impl(u_prev, u_curr).astype(orig_dtype)
 
         # MLP on the manifold
-        flow_out = jax.vmap(self.mixer_up)(geometry)
-        flow_out = jax.nn.gelu(flow_out.astype(jnp.float32))
-        flow_out = _safe_cast_to_fp8(flow_out) if is_fp8 else flow_out.astype(x.dtype)
-        flow_out = jax.vmap(self.mixer_down)(flow_out)
+        flow_out = jax.vmap(lambda xi: fp8_linear_call(self.mixer_up, xi))(geometry)
+        flow_out = jax.nn.gelu(flow_out.astype(jnp.float32)).astype(orig_dtype)
+        flow_out = jax.vmap(lambda xi: fp8_linear_call(self.mixer_down, xi))(flow_out)
 
         # Project back
-        out = jax.vmap(self.proj_out)(flow_out)  # (seq_len, d_model)
+        out = jax.vmap(lambda xi: fp8_linear_call(self.proj_out, xi))(flow_out)
 
-        # Gating — sigmoid in float32 to avoid exp overflow in FP8.
-        gate_input = jax.vmap(self.gate)(h)
-        gate_score = jax.nn.sigmoid(gate_input.astype(jnp.float32))
-        gate_score = _safe_cast_to_fp8(gate_score) if is_fp8 else gate_score.astype(x.dtype)
+        # Gating — sigmoid in float32 to avoid exp overflow
+        gate_input = jax.vmap(lambda xi: fp8_linear_call(self.gate, xi))(h)
+        gate_score = jax.nn.sigmoid(gate_input.astype(jnp.float32)).astype(orig_dtype)
 
-        # Residual add — safe for FP8 (no infinity, overflow → NaN).
+        # Residual add
         result = x.astype(jnp.float32) + (out * gate_score).astype(jnp.float32)
-        return _safe_cast_to_fp8(result) if is_fp8 else result.astype(x.dtype)
+        return result.astype(orig_dtype)
 
 
 class GeometricMixerStack(eqx.Module):
@@ -873,10 +827,10 @@ class MultiScaleFusion(eqx.Module):
         """Fuse a list of (channels_i, seq_len_i) feature maps."""
         target_len = features[-1].shape[-1]  # Coarsest resolution
 
-        # Accumulate in float32 to avoid FP8 overflow when summing projections.
+        # Accumulate in float32 to avoid overflow when summing projections.
         fused = jnp.zeros((self.fusion_dim, target_len), dtype=jnp.float32)
         for feat, proj, ds_factor in zip(features, self.lateral_projections, self.downsample_factors):
-            projected = proj(feat)  # (fusion_dim, seq_len_i)
+            projected = fp8_conv1d_call(proj, feat)  # (fusion_dim, seq_len_i)
             if ds_factor > 1:
                 usable_len = (projected.shape[-1] // ds_factor) * ds_factor
                 projected = projected[:, :usable_len].reshape(
@@ -886,9 +840,8 @@ class MultiScaleFusion(eqx.Module):
             fused = fused + projected.astype(jnp.float32)
 
         orig_dtype = features[-1].dtype
-        is_fp8 = (orig_dtype == jnp.float8_e4m3fn)
         out = self.norm(fused)
-        return _safe_cast_to_fp8(out) if is_fp8 else out.astype(orig_dtype)
+        return out.astype(orig_dtype)
 
 
 class OutputSequenceGenerator(eqx.Module):
