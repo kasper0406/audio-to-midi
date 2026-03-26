@@ -5,12 +5,12 @@ use std::fmt;
 use std::str::EncodeUtf16;
 use std::env;
 
-use numpy::{ PyArray2, PyArray3, PyReadonlyArray2 };
+use numpy::{ PyArray2, PyArray3, PyReadonlyArray2, PyArrayMethods };
 use numpy::ToPyArray;
 use numpy::IntoPyArray;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyModule};
 use pyo3::exceptions::PyTypeError;
 
 use tokio::fs::File;
@@ -86,9 +86,9 @@ async fn get_events_from_file(path: &str, duration_per_frame: f32) -> Result<Mid
     Ok(events)
 }
 
-fn get_sample_files(py: Python, dataset_dir: String, sample_names: &PyList) -> Result<Vec<String>, PyErr> {
+fn get_sample_files(_py: Python, dataset_dir: String, sample_names: &Bound<'_, PyList>) -> Result<Vec<String>, PyErr> {
     let mut sample_files = vec![];
-    for maybe_sample_name in sample_names {
+    for maybe_sample_name in sample_names.iter() {
         match maybe_sample_name.extract::<String>() {
             Ok(sample_name) => {
                 let sample_csv_file = format!("{}/{}", dataset_dir, sample_name);
@@ -390,7 +390,7 @@ fn load_full_audio(py: Python, file: String, sample_rate: u32) -> PyResult<Py<Py
     }).unwrap();
 
     let samples_vec = vec![left_samples, right_samples];
-    Ok(PyArray2::from_vec2(py, &samples_vec)?.to_owned())
+    Ok(PyArray2::from_vec2(py, &samples_vec)?.unbind())
 }
 
 async fn file_exists(file: &str) -> bool {
@@ -548,18 +548,18 @@ fn audio_and_samples_to_python(py: Python, events_and_audio: EventsAndAudio) -> 
         .map(|((((a, b), c), d))| (a, b, c, d));
     for (left_samples, right_samples, events_by_frame, sample_name) in iter {
         let samples_vec = vec![left_samples, right_samples];
-        let audio_array = PyArray2::from_vec2(py, &samples_vec)?.to_owned();
+        let audio_array = PyArray2::from_vec2(py, &samples_vec)?.unbind();
         audio_results.push(audio_array);
 
-        let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.to_owned();
+        let converted_events_by_frame: Py<PyArray2<f32>> = PyArray2::from_vec2(py, &events_by_frame)?.unbind();
         events_by_frame_results.push(converted_events_by_frame);
 
         sample_name_results.push(sample_name);
     }
     Ok((
-        PyList::new(py, &audio_results).into(),
-        PyList::new(py, &events_by_frame_results).into(),
-        PyList::new(py, &sample_name_results).into()
+        PyList::new(py, &audio_results)?.unbind(),
+        PyList::new(py, &events_by_frame_results)?.unbind(),
+        PyList::new(py, &sample_name_results)?.unbind(),
     ))
 }
 
@@ -932,7 +932,7 @@ fn transform_for_training(mut events_and_audio: &mut EventsAndAudio, settings: &
 }
 
 #[pyfunction]
-fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, settings: DatasetTransfromSettings, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, sample_names: &Bound<'_, PyList>, sample_rate: u32, model_duration: f32, num_model_outputs: i32, settings: DatasetTransfromSettings, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let events_and_audio = py.allow_threads(move || {
@@ -947,7 +947,7 @@ fn load_events_and_audio_with_transformations(py: Python, dataset_dir: String, s
 }
 
 #[pyfunction]
-fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
+fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &Bound<'_, PyList>, sample_rate: u32, model_duration: f32, num_model_outputs: i32, skip_cache: bool) -> PyResult<(Py<PyList>, Py<PyList>, Py<PyList>)> {
     let sample_files = get_sample_files(py, dataset_dir, sample_names)?;
 
     let events_and_audio = py.allow_threads(move || {
@@ -961,28 +961,30 @@ fn load_events_and_audio(py: Python, dataset_dir: String, sample_names: &PyList,
 
 #[pyfunction]
 fn stitch_probs(py: Python, py_probs: Py<PyArray3<f32>>, overlap: f64, duration_per_frame: f64) -> PyResult<Py<PyArray2<f32>>> {
-    let array = py_probs.as_ref(py).readonly();
+    let bound = py_probs.bind(py);
+    let array = bound.readonly();
     let probs = array.as_array();
 
     let stitched_probs = crate::common::stitch_probs(&probs, overlap, duration_per_frame);
-    Ok(stitched_probs.into_pyarray_bound(py).into())
+    Ok(stitched_probs.into_pyarray_bound(py).unbind())
 }
 
 #[pyfunction]
 fn extract_events(py: Python, py_probs: Py<PyArray2<f32>>) -> PyResult<Py<PyList>> {
-    let array = py_probs.as_ref(py).readonly();
+    let bound = py_probs.bind(py);
+    let array = bound.readonly();
     let probs = array.as_array();
     
     let events = crate::common::extract_events(&probs);
-    Ok(PyList::new(py, &events).into())
+    Ok(PyList::new(py, &events)?.unbind())
 }
 
 #[pyfunction]
 fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyResult<Py<PyList>> {
-    let all_events: Vec<_> = py_events.as_ref(py).iter()
+    let all_events: Vec<_> = py_events.bind(py).iter()
         .map(|element| {
             let mut events = vec![];
-            for event in element.iter().unwrap() {
+            for event in element.try_iter().unwrap() {
                 let event = event.unwrap();
                 if let Ok((attack_time, key, duration, velocity)) = event.extract() {
                     events.push((attack_time, key, duration, velocity))
@@ -997,15 +999,15 @@ fn to_frame_events(py: Python, py_events: Py<PyList>, frame_count: usize) -> PyR
     let converted: Vec<_> = all_events.iter()
         .map(|events| {
             let rust_converted = convert_to_frame_events(&events, frame_count as i32, 0, frame_count as i32);
-            PyArray2::from_vec2(py, &rust_converted).unwrap().to_owned()
+            PyArray2::from_vec2(py, &rust_converted).unwrap().unbind()
         })
         .collect();
 
-    Ok(PyList::new(py, &converted).into())
+    Ok(PyList::new(py, &converted)?.unbind())
 }
 
 #[pymodule]
-fn modelutil(_py: Python, m: &PyModule) -> PyResult<()> {
+fn modelutil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     env_logger::init();
 
     m.add_class::<DatasetTransfromSettings>()?;

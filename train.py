@@ -34,11 +34,10 @@ from tensorboardX import SummaryWriter
 from absl import app
 
 MODEL_DTYPE = jnp.float32
-# FORWARD_DTYPE = jnp.float8_e4m3fn
-# FORWARD_DTYPE = jnp.float8_e5m2
-# BACKWARD_DTYPE = jnp.float8_e5m2
-FORWARD_DTYPE = jnp.bfloat16
-BACKWARD_DTYPE = jnp.bfloat16
+FORWARD_DTYPE = jnp.float8_e4m3fn
+BACKWARD_DTYPE = jnp.float8_e4m3fn
+# FORWARD_DTYPE = jnp.bfloat16
+# BACKWARD_DTYPE = jnp.bfloat16
 # FORWARD_DTYPE = jnp.float32
 # BACKWARD_DTYPE = jnp.float32
 
@@ -1359,13 +1358,16 @@ if __name__ == "__main__":
         '--xla_gpu_enable_latency_hiding_scheduler=true '
         '--xla_gpu_enable_highest_priority_async_stream=true '
         '--xla_gpu_all_reduce_combine_threshold_bytes=51200 '
-        '--xla_gpu_graph_level=0 '
-        # '--xla_gpu_autotune_level=1 '
+        '--xla_gpu_autotune_level=0 '
         '--xla_gpu_per_fusion_autotune_cache_dir=xla_autotune_results '
 
         '--xla_gpu_strict_conv_algorithm_picker=false '
 
-        # '--xla_dump_to="/home/knielsen/xla_cuda_crash" '
+        '--xla_dump_to="/tmp/xla_fp8_dump" '
+        '--xla_dump_hlo_as_text=true '
+        '--xla_dump_hlo_as_proto=true '
+        '--xla_dump_hlo_pass_re=.* '
+        '--xla_dump_hlo_module_re=jit_compute_training_step '
     )
 
     jax.config.update("jax_compilation_cache_dir", "./jax_cache")
