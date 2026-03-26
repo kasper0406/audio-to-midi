@@ -1378,7 +1378,10 @@ if __name__ == "__main__":
     # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
     jax.threefry_partitionable(True)
     # jax.default_matmul_precision("BF16_BF16_BF16")
-    jax.default_matmul_precision("ANY_F8_ANY_F8_F32")
+    # ANY_F8_ANY_F8_F32 requires BOTH inputs to be fp8, but the backward pass
+    # has mixed dtypes (f32 gradients × fp8 weights). Use default precision
+    # to let JAX pick the best algorithm for each op's actual dtypes.
+    # jax.default_matmul_precision("ANY_F8_ANY_F8_F32")
     
     # jax.profiler.start_server(34894)
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
