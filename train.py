@@ -726,6 +726,8 @@ def train(
     recovery_state = copy_pytree(flat_state)
     recovery_opt_state = copy_pytree(flat_opt_state)
     grad_scale = 1.0
+    import time as _time
+    _step_start = _time.time()
     for step, batch in zip(range(start_step, num_steps + 1), data_loader):
         key, step_key = jax.random.split(key, 2)
         events, audio = batch
@@ -754,6 +756,9 @@ def train(
                 device_grad_scale,
             )
         # print(f"Finished executing step {step}")
+        if step == start_step:
+            _elapsed = _time.time() - _step_start
+            print(f"First step (compile+run) took {_elapsed:.1f}s", flush=True)
 
         if not np.all(grads_valid) or not np.all(np.isfinite(loss)):
             new_grad_scale = grad_scale / 2
@@ -1327,7 +1332,7 @@ def main(args):
     )
     dataset_loader_iter = iter(dataset_loader)
 
-    print("Starting training...")
+    print("Starting training...", flush=True)
     audio_to_midi_ensemble, model_states, opt_state = train(
         summary_writer,
         audio_to_midi_ensemble,
@@ -1365,12 +1370,6 @@ if __name__ == "__main__":
         '--xla_gpu_per_fusion_autotune_cache_dir=xla_autotune_results '
 
         '--xla_gpu_strict_conv_algorithm_picker=false '
-
-        '--xla_dump_to="/tmp/xla_fp8_dump" '
-        '--xla_dump_hlo_as_text=true '
-        '--xla_dump_hlo_as_proto=true '
-        '--xla_dump_hlo_pass_re=.* '
-        '--xla_dump_hlo_module_re=jit_compute_training_step '
     )
 
     jax.config.update("jax_compilation_cache_dir", "./jax_cache")

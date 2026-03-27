@@ -12,7 +12,7 @@ import einops
 from rope import calculate_rope, RopeFreqs
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
-from fp8_ops import fp8_linear_call, fp8_conv1d_call
+from fp8_ops import fp8_linear_call
 
 @jax.jit
 def identity(arg):
@@ -148,7 +148,7 @@ class Stem(eqx.Module):
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
         orig_dtype = x.dtype
-        out = fp8_conv1d_call(self.conv, x)
+        out = self.conv(x)
         out = self.norm(out.astype(jnp.float32))
         return out.astype(orig_dtype)
 
@@ -168,7 +168,7 @@ class Downsample(eqx.Module):
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
         out = self.norm(x).astype(jnp.float32).astype(x.dtype)
-        return fp8_conv1d_call(self.conv, out)
+        return self.conv(out)
 
 class GlobalResponseNorm(eqx.Module, strict=True):
     gamma: Array
@@ -227,13 +227,13 @@ class Block(eqx.Module):
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
         orig_dtype = x.dtype
-        out = fp8_conv1d_call(self.depth_conv, x)
+        out = self.depth_conv(x)
         out = self.norm(out).astype(jnp.float32).astype(orig_dtype)
-        out = fp8_conv1d_call(self.point_conv_1, out)
+        out = self.point_conv_1(out)
         x1, x2 = jnp.split(out, 2, axis=0)
         out = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
         out = self.global_response_norm(out)
-        out = fp8_conv1d_call(self.point_conv_2, out.astype(orig_dtype))
+        out = self.point_conv_2(out.astype(orig_dtype))
         residual = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key).astype(jnp.float32) + x.astype(jnp.float32)
         return residual.astype(orig_dtype)
 
@@ -830,7 +830,7 @@ class MultiScaleFusion(eqx.Module):
         # Accumulate in float32 to avoid overflow when summing projections.
         fused = jnp.zeros((self.fusion_dim, target_len), dtype=jnp.float32)
         for feat, proj, ds_factor in zip(features, self.lateral_projections, self.downsample_factors):
-            projected = fp8_conv1d_call(proj, feat)  # (fusion_dim, seq_len_i)
+            projected = proj(feat)  # (fusion_dim, seq_len_i)
             if ds_factor > 1:
                 usable_len = (projected.shape[-1] // ds_factor) * ds_factor
                 projected = projected[:, :usable_len].reshape(
