@@ -262,7 +262,7 @@ class Decoder(eqx.Module):
         output = jax.vmap(self.norm)(x.astype(jnp.float32))
         output = output.astype(orig_dtype)
 
-        logits = jax.vmap(lambda xi: fp8_linear_call(self.decoder_pooling, xi))(output)
+        logits = fp8_linear_call(self.decoder_pooling, output)
         probs = jax.nn.sigmoid(logits.astype(jnp.float32))
 
         return (
@@ -407,10 +407,10 @@ class SelfAttention(eqx.Module, strict=True):
 
         c_q = inputs
         if self.query_down_proj:
-            c_q = jax.vmap(lambda xi: fp8_linear_call(self.query_down_proj, xi))(inputs)
+            c_q = fp8_linear_call(self.query_down_proj, inputs)
         query_heads = calculate_rope(self._project(self.query_up_proj, c_q), rope_freqs)
 
-        c_kv = jax.vmap(lambda xi: fp8_linear_call(self.kv_down_proj, xi))(inputs)
+        c_kv = fp8_linear_call(self.kv_down_proj, inputs)
         key_heads = calculate_rope(self._project(self.key_up_proj, c_kv), rope_freqs)
         value_heads = self._project(self.value_up_proj, c_kv)
 
@@ -421,11 +421,11 @@ class SelfAttention(eqx.Module, strict=True):
         attn = attn_fn(query_heads, key_heads, value_heads)
         attn = attn.reshape(query_seq_length, -1)
 
-        return jax.vmap(lambda xi: fp8_linear_call(self.output_proj, xi))(attn)
+        return fp8_linear_call(self.output_proj, attn)
 
     def _project(self, proj, x):
         seq_length, _ = x.shape
-        projection = jax.vmap(lambda xi: fp8_linear_call(proj, xi))(x)
+        projection = fp8_linear_call(proj, x)
         return projection.reshape(seq_length, self.num_heads, -1)
 
 
@@ -658,7 +658,7 @@ class GeometricMixer(eqx.Module, strict=True):
         h = h.astype(orig_dtype)
 
         # Project to geometric space
-        u = jax.vmap(lambda xi: fp8_linear_call(self.proj_in, xi))(h)
+        u = fp8_linear_call(self.proj_in, h)
 
         # Create causal pairs with multi-scale shift
         s = self.shift_amount
@@ -669,15 +669,15 @@ class GeometricMixer(eqx.Module, strict=True):
         geometry = self.product_impl(u_prev, u_curr).astype(orig_dtype)
 
         # MLP on the manifold
-        flow_out = jax.vmap(lambda xi: fp8_linear_call(self.mixer_up, xi))(geometry)
+        flow_out = fp8_linear_call(self.mixer_up, geometry)
         flow_out = jax.nn.gelu(flow_out.astype(jnp.float32)).astype(orig_dtype)
-        flow_out = jax.vmap(lambda xi: fp8_linear_call(self.mixer_down, xi))(flow_out)
+        flow_out = fp8_linear_call(self.mixer_down, flow_out)
 
         # Project back
-        out = jax.vmap(lambda xi: fp8_linear_call(self.proj_out, xi))(flow_out)
+        out = fp8_linear_call(self.proj_out, flow_out)
 
         # Gating — sigmoid in float32 to avoid exp overflow
-        gate_input = jax.vmap(lambda xi: fp8_linear_call(self.gate, xi))(h)
+        gate_input = fp8_linear_call(self.gate, h)
         gate_score = jax.nn.sigmoid(gate_input.astype(jnp.float32)).astype(orig_dtype)
 
         # Residual add
