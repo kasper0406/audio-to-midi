@@ -168,24 +168,18 @@ class Downsample(eqx.Module):
         self.norm = LayerNorm(in_channels)
     
     def __call__(self, x, key: Optional[jax.random.PRNGKey] = None):
-        out = self.norm(x).astype(jnp.float32).astype(x.dtype)
+        out = self.norm(x)
         return self.conv(out)
 
-class GlobalResponseNorm(eqx.Module, strict=True):
+class LayerScale(eqx.Module, strict=True):
+    """Per-channel learnable scale. Cheaper replacement for GlobalResponseNorm."""
     gamma: Array
-    beta: Array
 
-    def __init__(self):
-        self.gamma = jnp.zeros((1,))
-        self.beta = jnp.zeros((1,))
+    def __init__(self, channels: int, init_value: float = 1e-6):
+        self.gamma = jnp.full((channels, 1), init_value)
 
     def __call__(self, x):
-        orig_dtype = x.dtype
-        x_f32 = x.astype(jnp.float32)
-        gx = jnp.sqrt(jnp.sum(x_f32**2, axis=(1, ), keepdims=True) + 1e-6)
-        nx = gx / (jnp.mean(gx, axis=-1, keepdims=True) + 1e-6)
-        out = self.gamma.astype(jnp.float32) * (x_f32 * nx) + self.beta.astype(jnp.float32) + x_f32
-        return out.astype(orig_dtype)
+        return x * self.gamma
 
 class Block(eqx.Module):
     depth_conv: eqx.nn.Conv1d
@@ -193,7 +187,7 @@ class Block(eqx.Module):
     point_conv_2: eqx.nn.Conv1d
     stochastic_depth_dropout: StochasticDepthDropout
     norm: LayerNorm
-    global_response_norm: GlobalResponseNorm
+    layer_scale: LayerScale
 
     def __init__(self, channels: int, hidden_dim: int, sdd_rate: float, kernel_size: int = 3, key: jax.random.PRNGKey = None):
         depth_conv_key, point_conv_1_key, point_conv_2_key = _split_key(key, 3)
@@ -224,19 +218,18 @@ class Block(eqx.Module):
 
         self.stochastic_depth_dropout = StochasticDepthDropout(sdd_rate)
 
-        self.global_response_norm = GlobalResponseNorm()
+        self.layer_scale = LayerScale(channels)
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
-        orig_dtype = x.dtype
         out = self.depth_conv(x)
         out = self.norm(out)
         out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_1, out)
-        x1, x2 = jnp.split(out, 2, axis=0)
-        out = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
-        out = self.global_response_norm(out)
-        out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_2, out.astype(orig_dtype))
-        residual = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key).astype(jnp.float32) + x.astype(jnp.float32)
-        return residual.astype(orig_dtype)
+        half = out.shape[0] // 2
+        out = jax.nn.gelu(out[:half]) * out[half:]
+        out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_2, out)
+        out = self.layer_scale(out)
+        out = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key)
+        return (out + x.astype(out.dtype)).astype(x.dtype)
 
 class Decoder(eqx.Module):
     decoder_pooling: eqx.nn.Linear
