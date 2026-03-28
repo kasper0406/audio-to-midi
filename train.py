@@ -1232,7 +1232,7 @@ def main(args):
     audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
     # print(audio_to_midi_ensemble)
 
-    checkpoint_path = current_directory / "audio_to_midi_checkpoints_stride10_exp3_ls"
+    checkpoint_path = current_directory / "audio_to_midi_checkpoints_exp4_mix12"
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=checkpoints_to_keep,
         save_interval_steps=checkpoint_every,

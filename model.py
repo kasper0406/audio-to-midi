@@ -21,13 +21,13 @@ def identity(arg):
 model_config = {
     "dims": [96, 192, 384, 384, 512, 512],
     "depths": [2, 2, 4, 4, 2, 2],
-    "cnn_hidden_expansion": 3.0,
+    "cnn_hidden_expansion": 4.0,
     "cnn_kernel_size": 5,
     "stem_stride": 10,
 
     "seq_hidden_dim": 512,
     "d_geom": 32,
-    "num_geometric_layers": 8,
+    "num_geometric_layers": 12,
     "geometric_product": "grassmann",  # "grassmann" or "clifford"
     "geometric_shift_pattern": [1, 2, 4, 8, 16, 32],
 
