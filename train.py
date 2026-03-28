@@ -1175,9 +1175,9 @@ def main(args):
 
     num_devices = len(jax.devices())
 
-    batch_size = 64
+    batch_size = 128
     # minibatch_size = 64 * num_devices
-    minibatch_size = 16
+    minibatch_size = 32
     num_steps = 150_000
     warmup_steps = 1000
     base_learning_rate = 1.0 * 1e-4
@@ -1232,7 +1232,7 @@ def main(args):
     audio_to_midi_ensemble = change_fp_precision(audio_to_midi_ensemble, dtype=MODEL_DTYPE)
     # print(audio_to_midi_ensemble)
 
-    checkpoint_path = current_directory / "audio_to_midi_checkpoints"
+    checkpoint_path = current_directory / "audio_to_midi_checkpoints_stride10_exp3"
     checkpoint_options = ocp.CheckpointManagerOptions(
         max_to_keep=checkpoints_to_keep,
         save_interval_steps=checkpoint_every,

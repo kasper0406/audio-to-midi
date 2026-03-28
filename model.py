@@ -12,7 +12,7 @@ import einops
 from rope import calculate_rope, RopeFreqs
 
 from audio_to_midi_dataset import MIDI_EVENT_VOCCAB_SIZE, get_data_prep_config
-from fp8_ops import fp8_linear_call
+from fp8_ops import fp8_linear_call, fp8_fixed_scale_pointwise_conv_call
 
 @jax.jit
 def identity(arg):
@@ -20,13 +20,14 @@ def identity(arg):
 
 model_config = {
     "dims": [96, 192, 384, 384, 512, 512],
-    "depths": [3, 4, 9, 9, 3, 3],
-    "cnn_hidden_expansion": 2.0,
-    "cnn_kernel_size": 7,
+    "depths": [2, 2, 4, 4, 2, 2],
+    "cnn_hidden_expansion": 3.0,
+    "cnn_kernel_size": 5,
+    "stem_stride": 10,
 
     "seq_hidden_dim": 512,
     "d_geom": 32,
-    "num_geometric_layers": 16,
+    "num_geometric_layers": 8,
     "geometric_product": "grassmann",  # "grassmann" or "clifford"
     "geometric_shift_pattern": [1, 2, 4, 8, 16, 32],
 
@@ -136,12 +137,12 @@ class Stem(eqx.Module):
     conv: eqx.nn.Conv1d
     norm: LayerNorm
 
-    def __init__(self, channels: int, kernel_size: int = 5, key: jax.random.PRNGKey = None):
+    def __init__(self, channels: int, kernel_size: int = 10, stride: int = 10, key: jax.random.PRNGKey = None):
         self.conv = eqx.nn.Conv1d(
             in_channels=2,
             out_channels=channels,
             kernel_size=kernel_size,
-            stride=kernel_size,
+            stride=stride,
             key=key,
         )
         self.norm = LayerNorm(channels)
@@ -228,12 +229,12 @@ class Block(eqx.Module):
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
         orig_dtype = x.dtype
         out = self.depth_conv(x)
-        out = self.norm(out).astype(jnp.float32).astype(orig_dtype)
-        out = self.point_conv_1(out)
+        out = self.norm(out)
+        out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_1, out)
         x1, x2 = jnp.split(out, 2, axis=0)
         out = jax.nn.gelu(x1.astype(jnp.float32)) * x2.astype(jnp.float32)
         out = self.global_response_norm(out)
-        out = self.point_conv_2(out.astype(orig_dtype))
+        out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_2, out.astype(orig_dtype))
         residual = self.stochastic_depth_dropout(out, inference=not enable_dropout, key=key).astype(jnp.float32) + x.astype(jnp.float32)
         return residual.astype(orig_dtype)
 
@@ -830,7 +831,7 @@ class MultiScaleFusion(eqx.Module):
         # Accumulate in float32 to avoid overflow when summing projections.
         fused = jnp.zeros((self.fusion_dim, target_len), dtype=jnp.float32)
         for feat, proj, ds_factor in zip(features, self.lateral_projections, self.downsample_factors):
-            projected = proj(feat)  # (fusion_dim, seq_len_i)
+            projected = fp8_fixed_scale_pointwise_conv_call(proj, feat)  # (fusion_dim, seq_len_i)
             if ds_factor > 1:
                 usable_len = (projected.shape[-1] // ds_factor) * ds_factor
                 projected = projected[:, :usable_len].reshape(
@@ -869,6 +870,7 @@ class OutputSequenceGenerator(eqx.Module):
         hidden_dims = [int(d * conf["cnn_hidden_expansion"]) for d in dims]
         depths = conf["depths"]
         cnn_kernel_size = conf.get("cnn_kernel_size", 3)
+        stem_stride = conf.get("stem_stride", 5)
 
         self.layers = []
 
@@ -880,7 +882,7 @@ class OutputSequenceGenerator(eqx.Module):
 
             downsample_layer = None
             if i == 0:
-                downsample_layer = Stem(dims[0], key=downsample_key)
+                downsample_layer = Stem(dims[0], kernel_size=stem_stride, stride=stem_stride, key=downsample_key)
             else:
                 downsample_layer = Downsample(dims[i - 1], dims[i], key=downsample_key)
 
