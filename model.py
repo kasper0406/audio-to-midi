@@ -221,8 +221,20 @@ class Block(eqx.Module):
         self.layer_scale = LayerScale(channels)
     
     def __call__(self, x, enable_dropout: bool = False, key: Optional[jax.random.PRNGKey] = None):
-        out = self.depth_conv(x)
+        # Fused depthwise conv + layernorm: express conv as shifted elementwise ops
+        # so XLA can fuse both into a single kernel (avoids slow cuDNN depthwise dispatch)
+        C, L = x.shape
+        w = self.depth_conv.weight[:, 0, :]  # (C, K)
+        K = w.shape[1]
+        pad = K // 2
+        x_padded = jnp.pad(x, ((0, 0), (pad, pad)), mode='constant')
+        out = x_padded[:, 0:L] * w[:, 0:1]
+        for k in range(1, K):
+            out = out + x_padded[:, k:k+L] * w[:, k:k+1]
+        if self.depth_conv.use_bias:
+            out = out + self.depth_conv.bias
         out = self.norm(out)
+        
         out = fp8_fixed_scale_pointwise_conv_call(self.point_conv_1, out)
         half = out.shape[0] // 2
         out = jax.nn.gelu(out[:half]) * out[half:]
